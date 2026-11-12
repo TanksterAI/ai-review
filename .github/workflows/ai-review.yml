@@ -30,9 +30,10 @@ jobs:
       pull-requests: write
       id-token: write
     uses: ./.github/workflows/review.yml
-    # Dispatch inputs arrive as strings ("2", "false") whatever their declared
-    # type, and review.yml's typed inputs refuse a string at startup, so both
-    # are converted here.
+    # A dispatched number input arrives as a string ('2'), which review.yml's
+    # typed number input refuses at startup; fromJSON converts it. force goes
+    # through fromJSON too, which accepts a boolean or the string
+    # 'true'/'false' (an API dispatch may send either).
     with:
-      pr-number: ${{ fromJSON(inputs.pr) }}
+      pr-number: ${{ fromJSON(inputs.pr || '0') }}
       force: ${{ fromJSON(inputs.force || 'false') }}
