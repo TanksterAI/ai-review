@@ -40,6 +40,11 @@ jobs:
       id-token: write
     # main until a v1 tag is cut; the Worker trusts both and nothing else.
     uses: TanksterAI/ai-review/.github/workflows/review.yml@main
+    # A dispatched number input arrives as a string ('2'), which review.yml's
+    # typed number input refuses at startup; fromJSON converts it. force goes
+    # through fromJSON too, which accepts a boolean or the string
+    # 'true'/'false'. On pull_request events both are empty: the || defaults
+    # keep fromJSON('') from failing every automatic review.
     with:
-      pr-number: ${{ inputs.pr || 0 }}
-      force: ${{ inputs.force || false }}
+      pr-number: ${{ fromJSON(inputs.pr || '0') }}
+      force: ${{ fromJSON(inputs.force || 'false') }}
