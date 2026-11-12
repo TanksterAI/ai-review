@@ -68,22 +68,24 @@ GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Obj
   - PRs from forks, outside authors and bots wait until someone with write access comments `@tankster-ai-review review`.
 - **Failures and retries.** The Durable Object performs one side effect per alarm. An item stays stored until its effect succeeds, and is retried up to five times.
 - **Rate limits.** Replies to people without write access, and `help`, go out at most once an hour per person. Text that is not a command gets no reply.
-- **What the App needs.**
-  - Repository permissions:
-    - Metadata: read;
-    - Pull requests: read and write;
-    - Issues: read (for `issue_comment` events);
-    - Actions: read and write (to start `runner.yml`);
-    - Contents: read.
-  - Events: `pull_request`, `issue_comment`, `pull_request_review_comment`.
-  - Also held, for later phases:
-    - Issues: write (on top of read), for chat and issue links;
-    - Checks: read and write, for pre-merge checks;
-    - Commit statuses: read and write.
+- **What the App needs.** The manifest asks only for what P1 uses:
+  - repository permissions: Metadata read, Contents read, Pull requests read and write, Issues read (for `issue_comment` events), and Actions read and write (to start `runner.yml`);
+  - events: `pull_request`, `issue_comment`, `pull_request_review_comment`.
 
-    The Worker never asks for them in a token yet.
+  Later phases add permissions, and GitHub asks the owner to approve each addition.
 - **Commands.** `review`, `full review`, `pause`, `resume` and `help`. Everything except `help` needs write access, checked through the API.
-- **Secrets.** The Worker needs `GITHUB_APP_PRIVATE_KEY` (the App's `.pem`, pasted as downloaded) and `GITHUB_WEBHOOK_SECRET`. Only the owner sets them, as Worker secrets.
+- **Secrets: nobody handles them.** The App is created once, from a manifest:
+  - Open `https://tankster-ai-review.rishi-tank.workers.dev/v1/setup/github-app` and press the button. GitHub creates the App in TanksterAI.
+  - GitHub hands its id, slug, private key and webhook secret straight to the Worker (`POST /app-manifests/{code}/conversions`). The Worker keeps them in the `AppSecrets` Durable Object, which no route exposes.
+  - The page then links to installing the App.
+  - The flow is guarded:
+    - its state is valid for an hour, until setup succeeds;
+    - an App owned by anyone else, or one that comes back incomplete, is refused;
+    - once an App is stored, setup is closed.
+  - If GitHub fails to convert the code, the same callback link can be reloaded within the hour. If an App ends up created without stored keys, the page names it and links to deleting it.
+  - **Where the keys live.** Unlike Worker secrets, which cannot be read back, Durable Object storage can be browsed in the Cloudflare dashboard (Data Studio). So anyone with dashboard access to the account can read the stored key. The client id and secret are not kept.
+  - **Recovery.** Setup cannot be reopened once it has succeeded. If the key leaks or the App is deleted, set the Worker secrets `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_WEBHOOK_SECRET` (and `GITHUB_APP_SLUG` if it changed); they win over the stored App. Otherwise reopen setup with a code change. Each isolate caches the App's config for up to 5 minutes.
+- **Mentions.** The App's slug decides how it is mentioned (`@<slug>`), its login (`<slug>[bot]`) and the commands its replies name. `@tankster-ai-review` above assumes the default slug.
 
 ## Releasing v1
 
@@ -108,9 +110,9 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 |---|---|
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
-| Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `GITHUB_APP_ID`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`) |
-| Secrets | `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET` (set by the owner in the dashboard) |
+| Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`) |
+| Secrets | None needed. Optional: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
 `GET /healthz` shows the model and today's spend.
 
@@ -118,11 +120,11 @@ Deploy only what is on `main`.
 
 - **With wrangler:** `npx wrangler deploy -c worker/wrangler.jsonc`.
 - **Through the Cloudflare API** (what Claude sessions use, via the Cloudflare connector):
-  - Upload all eight modules in `worker/src`: `index.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js` and `effects.js`.
+  - Upload all nine modules in `worker/src`: `index.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js`, `effects.js` and `setup.js`.
   - Set `main_module: "index.js"` and include the bindings and settings from `wrangler.jsonc`.
-  - Add the Durable Object binding `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}`.
+  - Add the Durable Object bindings `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}` and `{type: "durable_object_namespace", name: "APP_SECRETS", class_name: "AppSecrets"}`.
   - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
-  - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState"]}`.
+  - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState", "AppSecrets"]}`.
 
 ## Limits worth knowing
 
@@ -144,6 +146,7 @@ This runs the following, against stand-ins:
 - the budget, and the prompt and review building;
 - the HTTP handlers;
 - v2's App authentication, again with a real PKCS#1 key;
+- the one-time manifest setup, including its guards;
 - webhook signatures and normalisation;
 - the PR Durable Object, including outbox retries, rate limits and job claims;
 - the GitHub side effects;
