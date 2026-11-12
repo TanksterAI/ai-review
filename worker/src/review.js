@@ -104,26 +104,30 @@ export function prepareFiles(files, limits = {}) {
     if (SKIP.some((re) => re.test(path))) { omitted.push({ path, reason: "generated or lockfile" }); continue; }
     if (f.patch_omitted === true) { omitted.push({ path, reason: "over the size budget" }); continue; }
     if (typeof f.patch !== "string" || f.patch.length === 0) { omitted.push({ path, reason: "binary or no textual diff" }); continue; }
-    // Workers Free allows 10 ms of CPU a request: once the budget is nearly
-    // full, and for the part of a long patch that could never be shown, do
-    // no work at all.
-    if (maxChars - used < 400) { omitted.push({ path, reason: "over the size budget" }); continue; }
+    // Workers Free allows 10 ms of CPU a request, so the patch is cut to the
+    // room left before it is annotated: no file is annotated and then thrown
+    // away. Annotation adds about 8 characters a line, so the cut leaves a
+    // margin, and anything still too long is trimmed again below.
+    const room = Math.min(maxFileChars, maxChars - used - 200);
+    if (room < 400) { omitted.push({ path, reason: "over the size budget" }); continue; }
     let raw = f.patch;
     let truncated = false;
-    if (raw.length > maxFileChars) {
-      const cut = raw.lastIndexOf("\n", maxFileChars);
-      raw = raw.slice(0, cut > 0 ? cut : maxFileChars);
+    const rawRoom = Math.floor(room * 0.8);
+    if (raw.length > rawRoom) {
+      const cut = raw.lastIndexOf("\n", rawRoom);
+      raw = raw.slice(0, cut > 0 ? cut : rawRoom);
       truncated = true;
     }
     const { text, lines } = annotatePatch(raw);
     let body = text;
-    if (body.length > maxFileChars) {
-      body = body.slice(0, maxFileChars);
+    if (body.length > room) {
+      body = body.slice(0, room);
       body = body.slice(0, body.lastIndexOf("\n") > 0 ? body.lastIndexOf("\n") : body.length);
       truncated = true;
     }
     const header = `### ${path} (${f.status ?? "modified"}, +${f.additions ?? "?"} -${f.deletions ?? "?"})${truncated ? " [truncated]" : ""}`;
     const block = `${header}\n${body}\n`;
+    // Cannot trigger after the cuts above; kept as a guard on the budget.
     if (used + block.length > maxChars) { omitted.push({ path, reason: "over the size budget" }); continue; }
     used += block.length;
     blocks.push(block);
@@ -168,14 +172,16 @@ export function buildPrompt({ repository, title, body, prepared, tag }) {
     '   "title": "at most 100 characters", "body": "the problem, why it matters, and the fix; at most 800 characters"}]}',
     `At most ${MAX_FINDINGS} findings, most severe first.`,
   ].join("\n");
-  const omittedNote = prepared.omitted.length
-    ? `Files not shown (${prepared.omitted.length}): ${prepared.omitted.slice(0, 40).map((o) => `${o.path} (${o.reason})`).join("; ")}`
+  // File names are chosen by the PR author, so the list of skipped files is
+  // data too: fenced, one JSON string per line.
+  const skipped = prepared.omitted.length
+    ? fence("FILES NOT SHOWN", tag, prepared.omitted.slice(0, 40).map((o) => `${JSON.stringify(o.path)} (${o.reason})`).join("\n"))
     : "All changed files are shown.";
   const input = [
     `Repository: ${repository}`,
     fence("PR TITLE", tag, String(title ?? "").slice(0, 300)),
     fence("PR DESCRIPTION", tag, String(body ?? "").slice(0, 3000)),
-    omittedNote,
+    skipped,
     fence("DIFF", tag, prepared.text),
   ].join("\n\n");
   return { instructions, input };
@@ -214,13 +220,21 @@ export function parseAnswer(text) {
   }
 }
 
-// Model text is untrusted: no @mentions (they would notify people), no HTML
-// comments (they could forge our marker), bounded length.
+// Model text is untrusted. A zero-width space is put where it defuses
+// markup without changing what a reader sees, even inside code spans:
+//   - after @ before a name, so nobody is notified;
+//   - after < before a letter, !, / or ?, so there are no HTML tags and no
+//     HTML comments (which could forge our marker). One pass is enough:
+//     nothing is removed, so no new tag can be spliced together;
+//   - in ![ and ](, so there are no images (tracking) and no links.
+// Length is bounded.
 export function sanitize(text, max) {
   let s = String(text ?? "")
-    .replace(/<!--|-->/g, "")
-    .replace(/@(?=[A-Za-z0-9-])/g, `@${ZWSP}`)
     .replace(/\r/g, "")
+    .replace(/@(?=[A-Za-z0-9-])/g, `@${ZWSP}`)
+    .replace(/<(?=[A-Za-z!/?])/g, `<${ZWSP}`)
+    .replace(/!\[/g, `!${ZWSP}[`)
+    .replace(/\]\(/g, `]${ZWSP}(`)
     .trim();
   if (s.length > max) s = `${s.slice(0, max - 1)}…`;
   return s;
@@ -260,6 +274,11 @@ export function classifyFindings(answer, commentable) {
 
 const LABEL = { critical: "Critical", major: "Major", minor: "Minor" };
 
+// A path inside a code span: no backticks to break out of it, no newlines.
+function codeSpan(text) {
+  return sanitize(String(text ?? "").replace(/[`\n]/g, "'"), 200);
+}
+
 export function renderReview({ answer, classified, prepared, meta }) {
   const comments = classified.inline.map((f) => ({
     path: f.path,
@@ -276,12 +295,12 @@ export function renderReview({ answer, classified, prepared, meta }) {
     lines.push(`${total} finding${total === 1 ? "" : "s"}: ${classified.inline.length} inline${classified.general.length ? `, ${classified.general.length} below` : ""}.`, "");
   }
   for (const f of classified.general) {
-    const where = f.path ? `\`${sanitize(f.path, 200)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general";
+    const where = f.path ? `\`${codeSpan(f.path)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general";
     lines.push(`- **${LABEL[f.severity]} (${f.category}): ${f.title}** (${where})  `, `  ${f.body.replace(/\n/g, "\n  ")}`);
   }
   if (classified.general.length) lines.push("");
   const omitted = prepared.omitted.length
-    ? `Not reviewed (${prepared.omitted.length}): ${prepared.omitted.slice(0, 20).map((o) => `\`${sanitize(o.path, 200)}\` (${o.reason})`).join(", ")}${prepared.omitted.length > 20 ? ", …" : ""}.`
+    ? `Not reviewed (${prepared.omitted.length}): ${prepared.omitted.slice(0, 20).map((o) => `\`${codeSpan(o.path)}\` (${o.reason})`).join(", ")}${prepared.omitted.length > 20 ? ", …" : ""}.`
     : "Every changed file was reviewed.";
   lines.push(
     "<details><summary>About this review</summary>",
