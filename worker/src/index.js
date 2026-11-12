@@ -20,6 +20,7 @@ import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
+const CAPACITY_RETRY_MS = 3000;
 const jwks = createJwksCache();
 
 function json(status, body) {
@@ -63,6 +64,7 @@ function randomTag() {
 export async function handleReview(request, env, deps = {}) {
   const cfg = config(env);
   const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   const ledger = createLedger(env.LEDGER, now);
 
   const auth = request.headers.get("authorization") || "";
@@ -150,7 +152,7 @@ export async function handleReview(request, env, deps = {}) {
 
   const started = now();
   // Up to two model calls:
-  //   - out of capacity (3040): try once more at once;
+  //   - out of capacity (3040): try once more after a 3 s pause;
   //   - an answer cut short (status "incomplete", reasoning used the room):
   //     try once more with low reasoning effort, if the budget allows.
   // The account's daily allocation used up (3036) is a deferral, like our cap.
@@ -171,15 +173,19 @@ export async function handleReview(request, env, deps = {}) {
     } catch (e) {
       const message = String(e?.message ?? e);
       log({ ev: "model_error", repository, pr, attempt, error: message.slice(0, 200) });
-      if (/\b3036\b|daily free allocation|neurons? limit/i.test(message)) {
+      if (/\b3036\b|daily free allocation/i.test(message)) {
         return json(429, {
           status: "deferred",
           reason: "the account's free Workers AI allocation for today is used up",
           resets_at: nextUtcMidnight(now()),
         });
       }
-      if (/\b3040\b|capacity/i.test(message)) {
-        if (attempt < 2) continue;
+      if (/\b3040\b|capacity temporarily exceeded/i.test(message)) {
+        if (attempt < 2) {
+          // A pause, not CPU: waiting on a timer costs nothing on Workers.
+          await sleep(CAPACITY_RETRY_MS);
+          continue;
+        }
         return json(503, { status: "unavailable", reason: "Workers AI is out of capacity; try again later" });
       }
       return json(502, { status: "failed", reason: "the model call failed; try again later" });
