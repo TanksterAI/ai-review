@@ -34,6 +34,9 @@ function env(over = {}) {
     RUNNER_REFS: `${RUNNER}@refs/heads/main`,
     DAILY_NEURON_CAP: "6000",
     GITHUB_WEBHOOK_SECRET: SECRET,
+    // Effects are faked; appConfig only needs all three to be present.
+    GITHUB_APP_ID: "1",
+    GITHUB_APP_PRIVATE_KEY: "unused-in-tests",
     LEDGER: memoryKv(),
     PR_STATE: namespace(fx),
     AI: { async run() { return responsesResult(JSON.stringify({ summary: "Adds y.", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." }] })); } },

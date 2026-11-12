@@ -7,16 +7,17 @@
 //   - performs side effects (dispatch a runner, post a comment) from its alarm,
 //     after the webhook has been acknowledged.
 
-import { MENTION } from "./webhook.js";
+import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
+import { appConfig } from "./setup.js";
 import { createEffects } from "./effects.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
 const COMMANDS = ["full review", "review", "pause", "resume", "help"];
 
-export function helpText() {
+export function helpText(slug = DEFAULT_SLUG) {
   return [
-    "**Tankster AI Review commands**: mention `@tankster-ai-review` followed by:",
+    `**Tankster AI Review commands**: mention \`@${slug}\` followed by:`,
     "",
     "| Command | What it does |",
     "|---|---|",
@@ -30,8 +31,8 @@ export function helpText() {
   ].join("\n");
 }
 
-export function parseCommand(text) {
-  const after = String(text).split(MENTION).pop() ?? "";
+export function parseCommand(text, slug = DEFAULT_SLUG) {
+  const after = String(text).split(mentionOf(slug)).pop() ?? "";
   const line = after.trim().split("\n")[0].toLowerCase().replace(/\s+/g, " ").trim();
   return COMMANDS.find((c) => line === c || line.startsWith(`${c} `) || line.startsWith(`${c}.`)) ?? null;
 }
@@ -62,8 +63,9 @@ const MAX_ATTEMPTS = 5;
 const REPLY_WINDOW_MS = 3600_000;
 const DELETE_CHUNK = 128; // a Durable Object deletes at most 128 keys per call
 
-const NEEDS_APPROVAL =
-  "This pull request comes from a fork or from an author without write access, so it is not reviewed automatically. Someone with write access can comment `@tankster-ai-review review` to start one.";
+export function needsApproval(slug = DEFAULT_SLUG) {
+  return `This pull request comes from a fork or from an author without write access, so it is not reviewed automatically. Someone with write access can comment \`@${slug} review\` to start one.`;
+}
 
 function randomId() {
   const r = new Uint8Array(8);
@@ -174,7 +176,7 @@ export class PrState {
       if (ev.fork) {
         await this.ctx.storage.put("state", st);
         if (opening && (await this.mayReply(ev.author.login, "note"))) {
-          await this.outbox({ type: "comment", body: NEEDS_APPROVAL, replyTo: { login: ev.author.login, kind: "note" } });
+          await this.outbox({ type: "comment", template: "needs_approval", replyTo: { login: ev.author.login, kind: "note" } });
         }
         return { action: "needs_approval" };
       }
@@ -190,18 +192,18 @@ export class PrState {
     }
 
     if (ev.kind === "command") {
-      const cmd = parseCommand(ev.text);
+      const cmd = parseCommand(ev.text, ev.slug);
       // P1 has no chat: anything that is not a command gets no reply.
       if (!cmd) return { action: "not_a_command" };
       if (cmd === "help") {
         if (await this.mayReply(ev.sender.login, "help")) {
-          await this.outbox({ type: "comment", body: helpText(), replyTo: { login: ev.sender.login, kind: "help" } });
+          await this.outbox({ type: "comment", body: helpText(ev.slug), replyTo: { login: ev.sender.login, kind: "help" } });
         }
         return { action: "help" };
       }
       // Everything else needs write access, checked through the API by the
       // alarm before it takes effect.
-      await this.outbox({ type: "command", cmd, login: ev.sender.login, repo: ev.repo, pr: ev.pr });
+      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr });
       return { action: "command", cmd };
     }
     return { action: "ignored" };
@@ -243,14 +245,18 @@ export class PrState {
   }
 
   async perform(item) {
-    const fx = this.effects ?? createEffects(this.env);
+    // No App configured yet: throw, so the item is kept and retried.
+    const cfg = this.effects ? null : await appConfig(this.env);
+    const fx = this.effects ?? createEffects(this.env, { config: cfg });
+    // Replies name the App by its own slug, so mentions people copy work.
+    const slug = item.slug ?? cfg?.slug ?? DEFAULT_SLUG;
     const key = await this.ctx.storage.get("key");
     if (item.type === "dispatch") return fx.dispatch(item.jobId);
     if (item.type === "comment") {
       if (!key) return undefined;
       // Re-checked here: several may have been queued before the first posted.
       if (item.replyTo && !(await this.mayReply(item.replyTo.login, item.replyTo.kind))) return undefined;
-      await fx.comment(key.repo, key.pr, item.body);
+      await fx.comment(key.repo, key.pr, item.template === "needs_approval" ? needsApproval(slug) : item.body);
       if (item.replyTo) await this.replied(item.replyTo.login, item.replyTo.kind);
       return undefined;
     }
@@ -263,7 +269,7 @@ export class PrState {
         return fx.dispatch(item.jobId);
       }
       if (item.opening && (await this.mayReply(item.login, "note"))) {
-        await fx.comment(item.repo.full, item.pr, NEEDS_APPROVAL);
+        await fx.comment(item.repo.full, item.pr, needsApproval(slug));
         await this.replied(item.login, "note");
       }
       return undefined;
@@ -281,12 +287,12 @@ export class PrState {
       if (item.cmd === "pause") {
         st.paused = true;
         await this.ctx.storage.put("state", st);
-        return fx.comment(item.repo.full, item.pr, "Automatic reviews are paused on this pull request. Comment `@tankster-ai-review resume` to start them again.");
+        return fx.comment(item.repo.full, item.pr, `Automatic reviews are paused on this pull request. Comment \`@${slug} resume\` to start them again.`);
       }
       if (item.cmd === "resume") {
         st.paused = false;
         await this.ctx.storage.put("state", st);
-        return fx.comment(item.repo.full, item.pr, "Automatic reviews are back on. I'll review the next push, or comment `@tankster-ai-review review` now.");
+        return fx.comment(item.repo.full, item.pr, `Automatic reviews are back on. I'll review the next push, or comment \`@${slug} review\` now.`);
       }
       // review / full review
       await this.keepJobOnItem(item, st, { full: item.cmd === "full review", requestedBy: item.login });
