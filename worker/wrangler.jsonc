@@ -1,0 +1,27 @@
+// The tankster-ai-review Worker. Deployed from main only: see README.md.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "tankster-ai-review",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "ai": { "binding": "AI" },
+  "kv_namespaces": [
+    // ai-review-ledger: daily neuron spend and reviewed commits.
+    { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
+  ],
+  "vars": {
+    // TanksterAI's numeric organisation id: the OIDC token must carry it.
+    "OWNER_ID": "259206056",
+    "AUDIENCE": "tankster-ai-review",
+    // Only this repository's reusable workflow may call, at any ref.
+    "WORKFLOW_PREFIX": "TanksterAI/ai-review/.github/workflows/review.yml@",
+    "MODEL": "@cf/openai/gpt-oss-120b",
+    "REASONING_EFFORT": "medium",
+    // Of the account's 10,000 free neurons a day; the rest stays for other Workers.
+    "DAILY_NEURON_CAP": "6000",
+    "MAX_DIFF_CHARS": "90000",
+    "MAX_OUTPUT_TOKENS": "6000"
+  },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}
