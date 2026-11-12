@@ -2,7 +2,11 @@
 # following main. Run by hand (Actions -> release-v1 -> Run workflow, on main)
 # after a change to review.yml or the Worker has been merged and deployed.
 # The Worker trusts review.yml at v1 and at main and nothing else, so moving
-# v1 never widens what it trusts.
+# v1 never widens what it trusts. It only ever moves v1 forward along main:
+# rolling it back is refused, so an older review.yml cannot be re-trusted
+# by a click. (Anyone who can run this can already push to main, so the
+# trust boundary is write access to this repository, as the README says.)
+# The ancestry check, not the API's force flag, is what keeps it forward-only.
 name: release-v1
 
 on:
@@ -44,6 +48,19 @@ jobs:
             if (before === sha) {
               core.notice(`v1 is already at ${sha.slice(0, 7)}.`);
             } else if (before) {
+              // Forward only: v1 may move to a descendant of where it is,
+              // never back to an older review.yml (one with a fixed hole)
+              // or sideways onto a commit main never had.
+              const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${before}...${sha}`,
+              });
+              if (cmp.status !== "ahead") {
+                core.setFailed(
+                  `Refusing to move v1: main (${sha.slice(0, 7)}) is ${cmp.status} of v1 ` +
+                  `(${before.slice(0, 7)}), not ahead. Moving v1 back needs the owner, by hand.`,
+                );
+                return;
+              }
               await github.rest.git.updateRef({ owner, repo, ref: "tags/v1", sha, force: true });
               core.notice(`v1 moved from ${before.slice(0, 7)} to ${sha.slice(0, 7)}.`);
             } else {
