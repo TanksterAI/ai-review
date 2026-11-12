@@ -44,7 +44,7 @@ jobs:
             const { owner, repo } = context.repo;
             const short = (x) => x.slice(0, 7);
             const byHand =
-              `Move v1 by hand instead: git push --force origin ${sha}:refs/tags/v1`;
+              `Move v1 by hand instead: git fetch origin main && git push --force origin ${sha}:refs/tags/v1`;
             // GitHub refuses a GITHUB_TOKEN ref update whose range changes
             // .github/workflows (that needs the "workflows" permission, which
             // a job token can never have). Say so plainly instead of a bare 403.
@@ -55,8 +55,8 @@ jobs:
               } catch (e) {
                 if (e.status !== 403) throw e;
                 core.setFailed(
-                  `GitHub refused to create or move v1 (403: ${e.message}). This happens when ` +
-                  `the commits since v1 change .github/workflows. ${byHand}`,
+                  `GitHub refused to create or move v1 (403: ${e.message}). A job token cannot ` +
+                  `write a ref whose commits change .github/workflows. ${byHand}`,
                 );
                 return false;
               }
