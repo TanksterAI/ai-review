@@ -1,0 +1,45 @@
+# Copy to .github/workflows/ai-review.yml in any TanksterAI repository.
+#
+# Reviews a pull request when it is opened, reopened or marked ready, and
+# when the `ai-review` label is added (after new pushes: each commit is
+# reviewed once, so a label on an already-reviewed commit does nothing). Run it
+# by hand (Actions -> ai-review -> Run workflow) to review any open pull
+# request by number, with force to review the same commit again.
+# Free and secretless: see TanksterAI/ai-review's README.
+name: ai-review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, labeled]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+      force:
+        description: Review again even if this commit was already reviewed
+        type: boolean
+        default: false
+
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action != 'labeled' && !github.event.pull_request.draft) ||
+      github.event.label.name == 'ai-review'
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    # main until a v1 tag is cut; the Worker trusts both and nothing else.
+    uses: TanksterAI/ai-review/.github/workflows/review.yml@main
+    with:
+      pr-number: ${{ inputs.pr || 0 }}
+      force: ${{ inputs.force || false }}

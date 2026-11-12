@@ -1,0 +1,30 @@
+// The tankster-ai-review Worker. Deployed from main only: see README.md.
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "tankster-ai-review",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": true,
+  "ai": { "binding": "AI" },
+  "kv_namespaces": [
+    // ai-review-ledger: daily neuron spend and reviewed commits.
+    { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
+  ],
+  "vars": {
+    // TanksterAI's numeric organisation id: the OIDC token must carry it.
+    "OWNER_ID": "259206056",
+    "AUDIENCE": "tankster-ai-review",
+    // Only this repository's reusable workflow, at v1 or main, may call.
+    // Comma-separated; an entry ending in * is a prefix. Whoever can move v1
+    // or push to main (write access to ai-review) is trusted: see README.md.
+    "WORKFLOW_REFS": "TanksterAI/ai-review/.github/workflows/review.yml@refs/tags/v1,TanksterAI/ai-review/.github/workflows/review.yml@refs/heads/main",
+    "MODEL": "@cf/openai/gpt-oss-120b",
+    "REASONING_EFFORT": "medium",
+    // Of the account's 10,000 free neurons a day; the rest stays for other Workers.
+    "DAILY_NEURON_CAP": "6000",
+    "MAX_DIFF_CHARS": "90000",
+    // Reasoning counts as output: room for both, all reserved in the budget check.
+    "MAX_OUTPUT_TOKENS": "12000"
+  },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}

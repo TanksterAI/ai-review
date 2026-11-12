@@ -1,0 +1,196 @@
+# Reusable AI pull-request review: free, and no secrets anywhere.
+#
+# The job reads the pull request with its own GITHUB_TOKEN, sends the changed
+# files to the tankster-ai-review Worker (Cloudflare Workers AI, free daily
+# allocation, never bills), and posts what comes back as one COMMENT review
+# with inline comments. It never approves and never requests changes.
+#
+# Authentication is GitHub's OIDC token for this job: the Worker accepts it
+# only from the TanksterAI organisation (by numeric id) and only from this
+# workflow (job_workflow_ref), so nothing has to be created, stored or rotated.
+#
+# The Worker's address is fixed here, not an input: the job's OIDC token is
+# only ever sent to it. Callers need `id-token: write` and
+# `pull-requests: write`, and call this file at @v1 (or @main): the Worker
+# refuses other refs. See README.md for the caller file every repository uses.
+name: ai-review
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: Pull request to review. 0, the default, means the pull request that triggered the run.
+        type: number
+        default: 0
+      force:
+        description: Review again even if this head commit has already been reviewed.
+        type: boolean
+        default: false
+      skip-authors:
+        description: >-
+          Comma-separated logins whose pull requests are not reviewed, to save
+          the daily budget. Agents that open pull requests through a GitHub App
+          are still reviewed unless listed here.
+        type: string
+        default: renovate[bot],dependabot[bot]
+      runs-on:
+        description: >-
+          Runner label. Empty (the default) follows the organisation's
+          CI_RUNNER variable, which moves CI onto the Cloud Build fallback
+          runner when the included Actions minutes run out, and means
+          ubuntu-latest when that variable is unset. A value here also
+          overrides light.
+        type: string
+        default: ""
+      light:
+        description: >-
+          Run on the Cloud Run light runner, which has no Docker, once the
+          organisation opens the light lane (CI_LIGHT_RUNNER is
+          tankster-light). Nothing here needs Docker or a toolchain: one
+          JavaScript action and a few small HTTPS requests. false keeps it
+          off the lane.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  review:
+    name: AI review
+    # Light lane, run-bound so a light runner only ever takes a job of this
+    # run: see "Light lane" in TanksterAI/.github's README.
+    runs-on: >-
+      ${{ inputs.runs-on
+      || (inputs.light && vars.CI_LIGHT_RUNNER == 'tankster-light'
+      && format('tankster-light-{0}-{1}', github.run_id, github.run_attempt))
+      || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Review the pull request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          FORCE: ${{ inputs.force }}
+          SKIP_AUTHORS: ${{ inputs.skip-authors }}
+        with:
+          # The script below is tested as-is by worker/test/workflow.test.js.
+          script: |
+            const AUDIENCE = "tankster-ai-review";
+            const ENDPOINT = "https://tankster-ai-review.rishi-tank.workers.dev";
+            const { owner, repo } = context.repo;
+            const number = Number(process.env.PR_NUMBER) || context.payload.pull_request?.number || 0;
+            if (!number) {
+              core.setFailed("No pull request to review: pass pr-number, or run on a pull_request event.");
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (pr.state !== "open") {
+              core.notice(`PR #${number} is ${pr.state}; nothing to review.`);
+              return;
+            }
+            if (pr.draft) {
+              core.notice(`PR #${number} is a draft; it is reviewed when it is marked ready.`);
+              return;
+            }
+            const skip = String(process.env.SKIP_AUTHORS || "").split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+            if (skip.includes(String(pr.user?.login).toLowerCase())) {
+              core.notice(`PR #${number} was opened by ${pr.user.login}; skipped (skip-authors).`);
+              return;
+            }
+            if (pr.head.repo?.full_name !== pr.base.repo.full_name) {
+              // A fork's run gets no OIDC token and a read-only GITHUB_TOKEN.
+              core.notice(`PR #${number} comes from a fork; AI review runs only on branches of this repository.`);
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            // The Worker shows the model at most 20,000 characters of a file and
+            // 90,000 in all, and has 10 ms of CPU: send it little more than that.
+            const PER_FILE = 20_000;
+            let room = 120_000;
+            const payload = {
+              pr: number,
+              head_sha: pr.head.sha,
+              title: pr.title,
+              body: pr.body ?? "",
+              // A re-run of this job (say, after a failed post) reviews again.
+              force: process.env.FORCE === "true" || Number(process.env.GITHUB_RUN_ATTEMPT) > 1,
+              files: files.map((f) => {
+                const out = { filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions };
+                if (typeof f.patch !== "string") return out;
+                const patch = f.patch.length > PER_FILE ? f.patch.slice(0, PER_FILE) : f.patch;
+                if (patch.length > room) return { ...out, patch_omitted: true };
+                room -= patch.length;
+                return { ...out, patch };
+              }),
+            };
+
+            const token = await core.getIDToken(AUDIENCE);
+            const res = await fetch(`${ENDPOINT}/v1/review`, {
+              method: "POST",
+              headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(12 * 60 * 1000),
+            });
+            let out;
+            try {
+              out = await res.json();
+            } catch {
+              out = { status: "failed", reason: `HTTP ${res.status} without a JSON body` };
+            }
+
+            if (res.status === 409) {
+              core.notice(`PR #${number} at ${pr.head.sha.slice(0, 7)} was already reviewed. Run the ai-review workflow with force to review it again.`);
+              return;
+            }
+            if (res.status === 429) {
+              // Not a failure: the review waits for tomorrow's free allocation.
+              core.warning(`Review deferred: ${out.reason}. The budget resets at ${out.resets_at}.`);
+              return;
+            }
+            if (res.status === 503) {
+              core.warning(`Review not run: ${out.reason ?? "the review service is unavailable"}. Add the ai-review label later to retry.`);
+              return;
+            }
+            if (res.ok && out.status === "skipped") {
+              core.notice(`Nothing to review in PR #${number}: ${out.reason}.`);
+              return;
+            }
+            if (!res.ok || out.status !== "reviewed" || !out.review) {
+              core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
+              return;
+            }
+
+            const { body, comments } = out.review;
+            let posted = comments.length;
+            try {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number: number, commit_id: pr.head.sha, event: "COMMENT", body, comments,
+              });
+            } catch (e) {
+              if (e.status !== 422) throw e;
+              // GitHub refused a comment position, or the reviewed commit left the
+              // PR (a force-push during the review). Keep every finding, in the
+              // body, on the PR as it is now, and say which commit was reviewed.
+              const listed = comments
+                .map((c) => `- \`${c.path}:${c.line}\`: ${c.body.replace(/\n+/g, " ")}`)
+                .join("\n");
+              const parts = [body, `Reviewed commit ${pr.head.sha.slice(0, 7)}.`];
+              if (listed) parts.push(`#### Findings (GitHub would not place them inline)\n\n${listed}`);
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number: number, event: "COMMENT", body: parts.join("\n\n"),
+              });
+              posted = 0;
+            }
+            const u = out.usage ?? {};
+            core.notice(
+              `Reviewed PR #${number}: ${posted} inline comment(s). ` +
+              `${Math.round(u.neurons ?? 0)} neurons; ${Math.round(u.spent_today ?? 0)} of ${u.cap ?? "?"} used today.`,
+            );

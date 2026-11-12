@@ -1,0 +1,42 @@
+# Unit tests: the Worker (OIDC verification, budget, prompt and review
+# building) and the reusable workflow's script, run as written. No
+# dependencies to install, and no Node to download.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    # Light lane, run-bound so a light runner only ever takes a job of this
+    # run: see "Light lane" in TanksterAI/.github's README. No Docker, no
+    # toolchain, no install.
+    runs-on: >-
+      ${{ (vars.CI_LIGHT_RUNNER == 'tankster-light'
+      && format('tankster-light-{0}-{1}', github.run_id, github.run_attempt))
+      || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The light image cannot start a downloaded Node (it has no
+      # libatomic.so.1), so the tests run on the Node 24 the runner itself
+      # ships for JavaScript actions: github-script's process.execPath.
+      - name: Test
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.info(`Node ${process.version}`);
+            await exec.exec(process.execPath, ["--test", "worker/test/*.test.js"]);
