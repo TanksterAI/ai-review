@@ -45,6 +45,46 @@ This repository's own pull requests are reviewed by hand. Its `ai-review.yml` ru
 
 **Before another repository can call `review.yml`**, this repository's Settings → Actions → General → Access must be "Accessible from repositories in the 'TanksterAI' organization". A private repository's reusable workflows are closed to other repositories by default. It was set on 12 Nov 2026.
 
+## v2: the Tankster AI Review GitHub App (in progress)
+
+v2 moves to an org-wide GitHub App, **Tankster AI Review**. It needs no caller file in each repository, and it adds chat, commands and incremental reviews. The aim is parity with CodeRabbit and beyond. The design is in the Tankster AI project notes (`ai-review-v2-coderabbit-parity-design-2026-11-12.md`), and the work is tracked in Linear project "ai-review v2: CodeRabbit parity".
+
+```
+GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Object ──alarm──▶ workflow_dispatch
+                    (HMAC verified)                (state, single-use jobs)     │
+                                                                                ▼
+                    Worker /v1/runner/review ◀── runner.yml (this repo, light lane, OIDC)
+                    model, then posts as tankster-ai-review[bot]
+```
+
+- **Who decides what.**
+  - The PR's Durable Object decides what happens. Each job it mints is single-use and names its own repository, PR and commits.
+  - The runner proves who it is with its OIDC token. Only `runner.yml` on `main` is accepted.
+  - It gets a read-only token for the one repository in the job, and revokes it at the end.
+- **What the runner never gets.** It never holds the App's key, a write token or a model key. It also never runs code from the reviewed repository: it reads the diff through the API.
+- **Who posts.** The Worker runs the model and posts the review.
+- **Who gets reviewed automatically.**
+  - An author whose association is not owner, member or collaborator is checked against the permission API first, because private org membership under-reports.
+  - PRs from forks, outside authors and bots wait until someone with write access comments `@tankster-ai-review review`.
+- **Failures and retries.** The Durable Object performs one side effect per alarm. An item stays stored until its effect succeeds, and is retried up to five times.
+- **Rate limits.** Replies to people without write access, and `help`, go out at most once an hour per person. Text that is not a command gets no reply.
+- **What the App needs.**
+  - Repository permissions:
+    - Metadata: read;
+    - Pull requests: read and write;
+    - Issues: read (for `issue_comment` events);
+    - Actions: read and write (to start `runner.yml`);
+    - Contents: read.
+  - Events: `pull_request`, `issue_comment`, `pull_request_review_comment`.
+  - Also held, for later phases:
+    - Issues: write (on top of read), for chat and issue links;
+    - Checks: read and write, for pre-merge checks;
+    - Commit statuses: read and write.
+
+    The Worker never asks for them in a token yet.
+- **Commands.** `review`, `full review`, `pause`, `resume` and `help`. Everything except `help` needs write access, checked through the API.
+- **Secrets.** The Worker needs `GITHUB_APP_PRIVATE_KEY` (the App's `.pem`, pasted as downloaded) and `GITHUB_WEBHOOK_SECRET`. Only the owner sets them, as Worker secrets.
+
 ## Releasing v1
 
 After a change to `review.yml` or the Worker is merged and deployed, run Actions → release-v1 → Run workflow, on `main`. It creates `v1` at `main`, or moves it forward to `main`. It never moves `v1` back or sideways: it compares the two first and refuses unless `main` is ahead, so an older `review.yml` cannot become trusted again by a click. Moving `v1` back is for the owner, by hand.
@@ -68,12 +108,21 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 |---|---|
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
-| Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`) |
+| Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `GITHUB_APP_ID`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`) |
+| Secrets | `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET` (set by the owner in the dashboard) |
 
 `GET /healthz` shows the model and today's spend.
 
-Deploying: `npx wrangler deploy -c worker/wrangler.jsonc`, or upload the four modules through the Cloudflare API with the bindings in `wrangler.jsonc`. Claude sessions use the API through the Cloudflare connector. Deploy only what is on `main`.
+Deploy only what is on `main`.
+
+- **With wrangler:** `npx wrangler deploy -c worker/wrangler.jsonc`.
+- **Through the Cloudflare API** (what Claude sessions use, via the Cloudflare connector):
+  - Upload all eight modules in `worker/src`: `index.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js` and `effects.js`.
+  - Set `main_module: "index.js"` and include the bindings and settings from `wrangler.jsonc`.
+  - Add the Durable Object binding `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}`.
+  - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
+  - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState"]}`.
 
 ## Limits worth knowing
 
@@ -89,4 +138,15 @@ Deploying: `npx wrangler deploy -c worker/wrangler.jsonc`, or upload the four mo
 npm test
 ```
 
-This runs the Worker's OIDC verification (with a real RSA key pair), the budget, the prompt and review building, the HTTP handler, and the workflows' own `github-script` steps exactly as written in `review.yml` and `release-v1.yml`, against stand-ins. It also checks the release workflow keeps its guard rails: dispatch only, `main` only, `contents: write` only, one run at a time.
+This runs the following, against stand-ins:
+
+- the Worker's OIDC verification, with a real RSA key pair;
+- the budget, and the prompt and review building;
+- the HTTP handlers;
+- v2's App authentication, again with a real PKCS#1 key;
+- webhook signatures and normalisation;
+- the PR Durable Object, including outbox retries, rate limits and job claims;
+- the GitHub side effects;
+- the workflows' own `github-script` steps, exactly as written in `review.yml`, `release-v1.yml` and `runner.yml`.
+
+It also checks that `release-v1.yml` and `runner.yml` keep their guard rails.
