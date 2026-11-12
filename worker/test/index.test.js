@@ -46,7 +46,8 @@ async function req(body, { token, claims } = {}) {
   });
 }
 
-const deps = { jwks: staticJwks([signer.jwk]), now: () => NOW_MS };
+const sleeps = [];
+const deps = { jwks: staticJwks([signer.jwk]), now: () => NOW_MS, sleep: async (ms) => { sleeps.push(ms); } };
 const goodBody = { pr: 39, head_sha: SHA, title: "t", body: "b", files: [{ filename: "src/a.js", status: "modified", patch: PATCH }] };
 const answer = JSON.stringify({
   summary: "Adds y.",
@@ -191,10 +192,12 @@ test("the account's daily allocation used up (3036) is a deferral, not a failure
 });
 
 test("out of capacity (3040) is retried once, then reported as unavailable", async () => {
+  sleeps.length = 0;
   const ok = aiScript([new Error("AiError: 3040: Capacity temporarily exceeded"), responsesResult(answer)]);
   const r1 = await handleReview(await req(goodBody), env(ok), deps);
   assert.equal(r1.status, 200);
   assert.equal(ok.calls.length, 2);
+  assert.deepEqual(sleeps, [3000]);
   const busy = aiScript([new Error("3040: out of capacity")]);
   const r2 = await handleReview(await req(goodBody), env(busy), deps);
   assert.equal(r2.status, 503);
@@ -204,6 +207,13 @@ test("out of capacity (3040) is retried once, then reported as unavailable", asy
   const r3 = await handleReview(await req(goodBody), env(other), deps);
   assert.equal(r3.status, 502);
   assert.equal(other.calls.length, 1);
+  // A permanent error that merely mentions capacity is not retried.
+  const ctx = aiScript([new Error("5021: input exceeds the model's context capacity")]);
+  const r4 = await handleReview(await req(goodBody), env(ctx), deps);
+  assert.equal(r4.status, 502);
+  assert.equal(ctx.calls.length, 1);
+  const lim = aiScript([new Error("4006: neurons limit for this request")]);
+  assert.equal((await handleReview(await req(goodBody), env(lim), deps)).status, 502);
 });
 
 test("an answer cut short is retried once with low effort", async () => {
