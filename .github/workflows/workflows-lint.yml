@@ -1,0 +1,17 @@
+# actionlint, the runner guard and the light-lane lint over this repo's workflows.
+name: workflows-lint
+
+on:
+  pull_request:
+    paths: [".github/workflows/**", "examples/**"]
+  push:
+    branches: [main]
+    paths: [".github/workflows/**", "examples/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    uses: TanksterAI/.github/.github/workflows/workflows-lint.yml@v1

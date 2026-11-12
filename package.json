@@ -1,0 +1,14 @@
+{
+  "name": "@tanksterai/ai-review",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Free, secretless AI pull-request review for the TanksterAI organisation: a Workers AI Worker behind GitHub OIDC, and the reusable workflow that calls it.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"worker/test/*.test.js\""
+  }
+}
