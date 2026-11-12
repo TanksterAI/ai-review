@@ -30,7 +30,7 @@ pull request opened ─▶ caller workflow (each repo)
 
 ## Using it in a repository
 
-Copy [`examples/ai-review.yml`](examples/ai-review.yml) to `.github/workflows/ai-review.yml`, and call `review.yml` at `@v1`. It reviews a pull request when it is opened, reopened or marked ready for review. To review it again after new pushes:
+Copy [`examples/ai-review.yml`](examples/ai-review.yml) to `.github/workflows/ai-review.yml`. It calls `review.yml` at `@main` until a `v1` tag is cut (the Worker trusts both). This repository's own pull requests are reviewed by hand: its `ai-review.yml` runs only from Actions → Run workflow, on `main`, because a run on a pull-request ref is refused by design. It reviews a pull request when it is opened, reopened or marked ready for review. To review it again after new pushes:
 
 - add the `ai-review` label (remove it first if it is already there), or
 - run the workflow by hand: Actions → ai-review → Run workflow, with the PR number. A Claude session can do the same through the GitHub connector's workflow dispatch.

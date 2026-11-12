@@ -1,0 +1,35 @@
+# Reviews this repository's own pull requests, by hand: Actions -> ai-review ->
+# Run workflow, on main, with the PR number. Dispatch only: a pull_request run
+# here would call review.yml at refs/pull/N/merge, which the Worker refuses
+# (it trusts review.yml at main and v1 only).
+name: ai-review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number
+        required: true
+        type: number
+      force:
+        description: Review again even if this commit was already reviewed
+        type: boolean
+        default: false
+
+concurrency:
+  group: ai-review-${{ inputs.pr }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  review:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/review.yml
+    with:
+      pr-number: ${{ inputs.pr }}
+      force: ${{ inputs.force }}

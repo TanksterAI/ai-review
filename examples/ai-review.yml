@@ -38,7 +38,8 @@ jobs:
       contents: read
       pull-requests: write
       id-token: write
-    uses: TanksterAI/ai-review/.github/workflows/review.yml@v1
+    # main until a v1 tag is cut; the Worker trusts both and nothing else.
+    uses: TanksterAI/ai-review/.github/workflows/review.yml@main
     with:
       pr-number: ${{ inputs.pr || 0 }}
       force: ${{ inputs.force || false }}
