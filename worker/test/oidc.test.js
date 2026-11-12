@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createJwksCache, verifyGithubOidc, OidcError, JWKS_URL } from "../src/oidc.js";
-import { makeSigner, claimsAt, staticJwks, AUDIENCE, OWNER_ID, WORKFLOW_PREFIX } from "./helpers.js";
+import { makeSigner, claimsAt, staticJwks, AUDIENCE, OWNER_ID, WORKFLOW, WORKFLOW_REFS } from "./helpers.js";
 
 const NOW = 1_794_500_000;
 const signer = await makeSigner();
-const opts = { audience: AUDIENCE, ownerId: OWNER_ID, workflowPrefix: WORKFLOW_PREFIX, jwks: staticJwks([signer.jwk]), nowS: NOW };
+const opts = { audience: AUDIENCE, ownerId: OWNER_ID, workflowRefs: WORKFLOW_REFS, jwks: staticJwks([signer.jwk]), nowS: NOW };
 
 async function rejects(token, reason, o = opts) {
   await assert.rejects(verifyGithubOidc(token, o), (e) => e instanceof OidcError && e.reason === reason);
@@ -16,9 +16,16 @@ test("accepts a valid token from our workflow", async () => {
   assert.equal(c.repository, "TanksterAI/browser-relay");
 });
 
-test("accepts a SHA-pinned workflow ref and an audience list", async () => {
-  const t = await signer.sign(claimsAt(NOW, { aud: ["other", AUDIENCE], job_workflow_ref: `${WORKFLOW_PREFIX}${"a".repeat(40)}` }));
-  await verifyGithubOidc(t, opts);
+test("accepts main, v1 and v1.x point tags, and an audience list", async () => {
+  for (const ref of ["refs/heads/main", "refs/tags/v1", "refs/tags/v1.2.0"]) {
+    await verifyGithubOidc(await signer.sign(claimsAt(NOW, { aud: ["other", AUDIENCE], job_workflow_ref: `${WORKFLOW}@${ref}` })), opts);
+  }
+});
+
+test("refuses review.yml at unreleased refs", async () => {
+  for (const ref of ["refs/heads/feature", "a".repeat(40), "refs/tags/v10", "refs/tags/v1-evil", "refs/heads/main-evil", "refs/pull/1/merge"]) {
+    await rejects(await signer.sign(claimsAt(NOW, { job_workflow_ref: `${WORKFLOW}@${ref}` })), "wrong workflow");
+  }
 });
 
 test("rejects other audiences, owners, workflows and issuers", async () => {
@@ -56,6 +63,7 @@ test("rejects bad signatures, other keys and other algorithms", async () => {
 
 test("refuses to run unconfigured", async () => {
   await rejects(await signer.sign(claimsAt(NOW)), "verifier not configured", { ...opts, ownerId: undefined });
+  await rejects(await signer.sign(claimsAt(NOW)), "verifier not configured", { ...opts, workflowRefs: [] });
 });
 
 test("the key cache refetches once on an unknown kid, and expires", async () => {
@@ -75,8 +83,15 @@ test("the key cache refetches once on an unknown kid, and expires", async () => 
   keys = [{ kid: "a", kty: "RSA" }, { kid: "b", kty: "RSA" }];
   assert.equal((await cache.get("b")).kid, "b");
   assert.equal(calls, 2);
+  // A made-up kid forces a refetch at most once a minute.
   await assert.rejects(cache.get("zzz"), (e) => e.reason === "unknown signing key");
-  t = 11 * 60 * 1000;
+  assert.equal(calls, 2);
+  t = 61 * 1000;
+  await assert.rejects(cache.get("yyy"), (e) => e.reason === "unknown signing key");
+  assert.equal(calls, 3);
+  await assert.rejects(cache.get("xxx"), (e) => e.reason === "unknown signing key");
+  assert.equal(calls, 3);
+  t = 12 * 60 * 1000;
   await cache.get("a");
   assert.equal(calls, 4);
 });

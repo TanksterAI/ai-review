@@ -3,7 +3,9 @@
 
 export const OWNER_ID = "259206056";
 export const AUDIENCE = "tankster-ai-review";
-export const WORKFLOW_PREFIX = "TanksterAI/ai-review/.github/workflows/review.yml@";
+export const WORKFLOW = "TanksterAI/ai-review/.github/workflows/review.yml";
+// The refs the deployed Worker trusts (wrangler.jsonc WORKFLOW_REFS).
+export const WORKFLOW_REFS = [`${WORKFLOW}@refs/heads/main`, `${WORKFLOW}@refs/tags/v1`, `${WORKFLOW}@refs/tags/v1.*`];
 
 function b64url(bytes) {
   return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -35,7 +37,8 @@ export function claimsAt(nowS, over = {}) {
     repository: "TanksterAI/browser-relay",
     repository_owner: "TanksterAI",
     repository_owner_id: OWNER_ID,
-    job_workflow_ref: `${WORKFLOW_PREFIX}refs/heads/main`,
+    job_workflow_ref: `${WORKFLOW}@refs/tags/v1`,
+    jti: crypto.randomUUID(),
     event_name: "pull_request",
     ...over,
   };
