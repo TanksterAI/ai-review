@@ -7,6 +7,10 @@
 # by a click. (Anyone who can run this can already push to main, so the
 # trust boundary is write access to this repository, as the README says.)
 # The ancestry check, not the API's force flag, is what keeps it forward-only.
+# Known limit: GitHub will not let a job token move a ref across commits
+# that change .github/workflows (that needs the "workflows" permission, which
+# a GITHUB_TOKEN cannot be given). When that happens the job fails and prints
+# the one git command that moves v1 by hand.
 name: release-v1
 
 on:
@@ -38,32 +42,65 @@ jobs:
           script: |
             const sha = context.sha;
             const { owner, repo } = context.repo;
+            const short = (x) => x.slice(0, 7);
+            const byHand =
+              `Move v1 by hand instead: git push --force origin ${sha}:refs/tags/v1`;
+            // GitHub refuses a GITHUB_TOKEN ref update whose range changes
+            // .github/workflows (that needs the "workflows" permission, which
+            // a job token can never have). Say so plainly instead of a bare 403.
+            async function write(fn) {
+              try {
+                await fn();
+                return true;
+              } catch (e) {
+                if (e.status !== 403) throw e;
+                core.setFailed(
+                  `GitHub refused to create or move v1 (403: ${e.message}). This happens when ` +
+                  `the commits since v1 change .github/workflows. ${byHand}`,
+                );
+                return false;
+              }
+            }
+            // Where v1 points now, as a commit. An annotated tag (made by hand
+            // with git tag -a) points at a tag object, so peel it.
             let before = null;
             try {
               const { data } = await github.rest.git.getRef({ owner, repo, ref: "tags/v1" });
               before = data.object.sha;
+              if (data.object.type === "tag") {
+                const { data: tag } = await github.rest.git.getTag({ owner, repo, tag_sha: before });
+                before = tag.object.sha;
+              }
             } catch (e) {
               if (e.status !== 404) throw e;
             }
             if (before === sha) {
-              core.notice(`v1 is already at ${sha.slice(0, 7)}.`);
-            } else if (before) {
-              // Forward only: v1 may move to a descendant of where it is,
-              // never back to an older review.yml (one with a fixed hole)
-              // or sideways onto a commit main never had.
-              const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
-                owner, repo, basehead: `${before}...${sha}`,
-              });
-              if (cmp.status !== "ahead") {
-                core.setFailed(
-                  `Refusing to move v1: main (${sha.slice(0, 7)}) is ${cmp.status} of v1 ` +
-                  `(${before.slice(0, 7)}), not ahead. Moving v1 back needs the owner, by hand.`,
-                );
-                return;
+              core.notice(`v1 is already at ${short(sha)}.`);
+              return;
+            }
+            if (!before) {
+              if (await write(() => github.rest.git.createRef({ owner, repo, ref: "refs/tags/v1", sha }))) {
+                core.notice(`v1 created at ${short(sha)}.`);
               }
-              await github.rest.git.updateRef({ owner, repo, ref: "tags/v1", sha, force: true });
-              core.notice(`v1 moved from ${before.slice(0, 7)} to ${sha.slice(0, 7)}.`);
-            } else {
-              await github.rest.git.createRef({ owner, repo, ref: "refs/tags/v1", sha });
-              core.notice(`v1 created at ${sha.slice(0, 7)}.`);
+              return;
+            }
+            // Forward only: v1 may move to a descendant of where it is, never
+            // back to an older review.yml (one with a fixed hole) or sideways
+            // onto a commit main never had.
+            const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${before}...${sha}`,
+            });
+            if (cmp.status === "identical") {
+              core.notice(`v1 already points at ${short(sha)}.`);
+              return;
+            }
+            if (cmp.status !== "ahead") {
+              core.setFailed(
+                `Refusing to move v1: main (${short(sha)}) is not a descendant of v1 ` +
+                `(${short(before)}; compare: ${cmp.status}). Moving v1 back needs the owner, by hand.`,
+              );
+              return;
+            }
+            if (await write(() => github.rest.git.updateRef({ owner, repo, ref: "tags/v1", sha, force: true }))) {
+              core.notice(`v1 moved from ${short(before)} to ${short(sha)}.`);
             }
