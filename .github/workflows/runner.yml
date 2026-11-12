@@ -1,0 +1,146 @@
+# The Tankster AI Review App's runner (v2).
+#
+# The Worker starts this with a workflow_dispatch whose only input is one job
+# id (the App needs just actions:write on this repository for that).
+# Everything the job may do (which repository, which pull request, which
+# commits) is decided and held by the Worker; this run proves who it is with
+# its OIDC token and asks.
+#
+# What this run gets: one read-only installation token for the one repository
+# in the job (contents and pull requests: read), revoked at the end. What it
+# never gets: the App's key, any write token, or any model key. The Worker
+# runs the model and posts the review as tankster-ai-review[bot].
+#
+# This run executes no code from the reviewed repository: it reads the diff
+# through the API. Anything that runs repository code (tests, repo-declared
+# scripts) belongs in a separate job with no credentials (design §5a, C1).
+name: ai-review-runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job id minted by the Worker. Useless without the Worker's record of it.
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: ai-review-runner-${{ inputs.job }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    name: Review
+    # Light lane, run-bound so a light runner only ever takes a job of this
+    # run: see "Light lane" in TanksterAI/.github's README.
+    runs-on: >-
+      ${{ (vars.CI_LIGHT_RUNNER == 'tankster-light'
+      && format('tankster-light-{0}-{1}', github.run_id, github.run_attempt))
+      || vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+    steps:
+      - name: Run the job
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # Passed as data, never interpolated into the script.
+          JOB: ${{ inputs.job }}
+        with:
+          # The script below is tested as-is by worker/test/runner.test.js.
+          script: |
+            const AUDIENCE = "tankster-ai-review";
+            const ENDPOINT = "https://tankster-ai-review.rishi-tank.workers.dev";
+            const job = String(process.env.JOB || "");
+            if (!/^[A-Za-z0-9_-]{4,400}\.[0-9a-f]{32}$/.test(job)) {
+              core.setFailed("This run carries no valid job id.");
+              return;
+            }
+
+            // Every call to the Worker carries a fresh OIDC token: each one is
+            // good for one request.
+            async function call(path, body) {
+              const id = await core.getIDToken(AUDIENCE);
+              const res = await fetch(`${ENDPOINT}${path}`, {
+                method: "POST",
+                headers: { authorization: `Bearer ${id}`, "content-type": "application/json" },
+                body: JSON.stringify({ job, ...body }),
+                signal: AbortSignal.timeout(12 * 60 * 1000),
+              });
+              let out;
+              try {
+                out = await res.json();
+              } catch {
+                out = { status: "failed", reason: `HTTP ${res.status} without a JSON body` };
+              }
+              return { res, out };
+            }
+
+            const session = await call("/v1/runner/session", {});
+            if (!session.res.ok || !session.out.token) {
+              core.setFailed(`The Worker refused this job: ${session.out.reason ?? `HTTP ${session.res.status}`}`);
+              return;
+            }
+            const { job: j, token } = session.out;
+            core.setSecret(token);
+            const gh = getOctokit(token);
+            const [owner, repo] = j.repo.full.split("/");
+            try {
+              const { data: pr } = await gh.rest.pulls.get({ owner, repo, pull_number: j.pr });
+              if (pr.state !== "open") {
+                core.notice(`${j.repo.full}#${j.pr} is ${pr.state}; nothing to review.`);
+                return;
+              }
+
+              // Incremental when the last reviewed commit is still behind the
+              // head (no force-push since): only what changed after it.
+              let files = null;
+              let since = null;
+              if (j.since && j.since !== pr.head.sha) {
+                try {
+                  const { data: cmp } = await gh.rest.repos.compareCommitsWithBasehead({
+                    owner, repo, basehead: `${j.since}...${pr.head.sha}`,
+                  });
+                  if (cmp.status === "ahead") {
+                    files = cmp.files ?? [];
+                    since = j.since;
+                  }
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+              }
+              files ??= await gh.paginate(gh.rest.pulls.listFiles, { owner, repo, pull_number: j.pr, per_page: 100 });
+
+              // The Worker has 10 ms of CPU: send it little more than it reads.
+              const PER_FILE = 20_000;
+              let room = 120_000;
+              const payload = {
+                head_sha: pr.head.sha,
+                title: pr.title,
+                body: pr.body ?? "",
+                since,
+                files: files.map((f) => {
+                  const out = { filename: f.filename, status: f.status, additions: f.additions, deletions: f.deletions };
+                  if (typeof f.patch !== "string") return out;
+                  const patch = f.patch.length > PER_FILE ? f.patch.slice(0, PER_FILE) : f.patch;
+                  if (patch.length > room) return { ...out, patch_omitted: true };
+                  room -= patch.length;
+                  return { ...out, patch };
+                }),
+              };
+
+              const { res, out } = await call("/v1/runner/review", payload);
+              const where = `${j.repo.full}#${j.pr} at ${pr.head.sha.slice(0, 7)}`;
+              if (res.status === 409) core.notice(`${where} was already reviewed.`);
+              else if (res.status === 429) core.warning(`Review deferred: ${out.reason}. The budget resets at ${out.resets_at}.`);
+              else if (res.status === 503) core.warning(`Review not run: ${out.reason ?? "the review service is unavailable"}.`);
+              else if (res.ok && out.status === "skipped") core.notice(`Nothing to review in ${where}: ${out.reason}.`);
+              else if (res.ok && out.status === "reviewed") {
+                core.notice(`Reviewed ${where}: ${out.inline ?? 0} inline comment(s), ${Math.round(out.usage?.neurons ?? 0)} neurons.`);
+              } else core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
+            } finally {
+              // The token dies with the run, whatever happened.
+              await gh.request("DELETE /installation/token").catch(() => {});
+            }
