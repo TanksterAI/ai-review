@@ -16,14 +16,14 @@ test("accepts a valid token from our workflow", async () => {
   assert.equal(c.repository, "TanksterAI/browser-relay");
 });
 
-test("accepts main, v1 and v1.x point tags, and an audience list", async () => {
-  for (const ref of ["refs/heads/main", "refs/tags/v1", "refs/tags/v1.2.0"]) {
+test("accepts main and v1, and an audience list", async () => {
+  for (const ref of ["refs/heads/main", "refs/tags/v1"]) {
     await verifyGithubOidc(await signer.sign(claimsAt(NOW, { aud: ["other", AUDIENCE], job_workflow_ref: `${WORKFLOW}@${ref}` })), opts);
   }
 });
 
 test("refuses review.yml at unreleased refs", async () => {
-  for (const ref of ["refs/heads/feature", "a".repeat(40), "refs/tags/v10", "refs/tags/v1-evil", "refs/heads/main-evil", "refs/pull/1/merge"]) {
+  for (const ref of ["refs/heads/feature", "a".repeat(40), "refs/tags/v10", "refs/tags/v1.2.0", "refs/tags/v1-evil", "refs/heads/main-evil", "refs/pull/1/merge"]) {
     await rejects(await signer.sign(claimsAt(NOW, { job_workflow_ref: `${WORKFLOW}@${ref}` })), "wrong workflow");
   }
 });
@@ -59,6 +59,12 @@ test("rejects bad signatures, other keys and other algorithms", async () => {
   await rejects(`${h}.${p}`, "malformed token");
   await rejects("", "malformed token");
   await rejects(`${h}.!!!.${s}`, "malformed token");
+});
+
+test("an entry ending in * is a prefix", async () => {
+  const o = { ...opts, workflowRefs: [`${WORKFLOW}@refs/tags/v2.*`] };
+  await verifyGithubOidc(await signer.sign(claimsAt(NOW, { job_workflow_ref: `${WORKFLOW}@refs/tags/v2.1` })), o);
+  await rejects(await signer.sign(claimsAt(NOW, { job_workflow_ref: `${WORKFLOW}@refs/tags/v2` })), "wrong workflow", o);
 });
 
 test("refuses to run unconfigured", async () => {

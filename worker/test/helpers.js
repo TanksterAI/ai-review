@@ -5,7 +5,7 @@ export const OWNER_ID = "259206056";
 export const AUDIENCE = "tankster-ai-review";
 export const WORKFLOW = "TanksterAI/ai-review/.github/workflows/review.yml";
 // The refs the deployed Worker trusts (wrangler.jsonc WORKFLOW_REFS).
-export const WORKFLOW_REFS = [`${WORKFLOW}@refs/heads/main`, `${WORKFLOW}@refs/tags/v1`, `${WORKFLOW}@refs/tags/v1.*`];
+export const WORKFLOW_REFS = [`${WORKFLOW}@refs/heads/main`, `${WORKFLOW}@refs/tags/v1`];
 
 function b64url(bytes) {
   return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
