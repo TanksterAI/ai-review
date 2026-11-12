@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { handleReview } from "../src/index.js";
-import { makeSigner, claimsAt, staticJwks, memoryKv, responsesResult, PATCH, AUDIENCE, OWNER_ID, WORKFLOW_PREFIX } from "./helpers.js";
+import { makeSigner, claimsAt, staticJwks, memoryKv, responsesResult, PATCH, AUDIENCE, OWNER_ID, WORKFLOW_REFS } from "./helpers.js";
 
 const NOW_MS = 1_794_500_000_000;
 const signer = await makeSigner();
@@ -9,7 +9,8 @@ const SHA = "a".repeat(40);
 
 function env(ai, over = {}) {
   return {
-    AUDIENCE, OWNER_ID, WORKFLOW_PREFIX,
+    AUDIENCE, OWNER_ID,
+    WORKFLOW_REFS: WORKFLOW_REFS.join(","),
     DAILY_NEURON_CAP: "6000",
     LEDGER: memoryKv(),
     AI: ai,
@@ -20,6 +21,20 @@ function env(ai, over = {}) {
 function aiReturning(text, usage) {
   const calls = [];
   return { calls, async run(model, input) { calls.push({ model, input }); return responsesResult(text, usage); } };
+}
+
+// Scripted model: each entry is a result to return or an Error to throw.
+function aiScript(steps) {
+  const calls = [];
+  return {
+    calls,
+    async run(model, input) {
+      calls.push({ model, input });
+      const s = steps[Math.min(calls.length - 1, steps.length - 1)];
+      if (s instanceof Error) throw s;
+      return s;
+    },
+  };
 }
 
 async function req(body, { token, claims } = {}) {
@@ -77,6 +92,8 @@ test("unauthenticated calls never reach the model", async () => {
     await req(goodBody, { token: "nope" }),
     await req(goodBody, { claims: { repository_owner_id: "1" } }),
     await req(goodBody, { claims: { job_workflow_ref: "TanksterAI/x/.github/workflows/y.yml@main" } }),
+    await req(goodBody, { claims: { job_workflow_ref: "TanksterAI/ai-review/.github/workflows/review.yml@refs/heads/feature" } }),
+    await req(goodBody, { claims: { jti: undefined } }),
     new Request("https://x/v1/review", { method: "POST", body: "{}" }),
   ]) {
     const res = await handleReview(r, env(ai), deps);
@@ -123,7 +140,7 @@ test("a spent budget defers without calling the model", async () => {
 });
 
 test("model failures and unusable answers are 502s; spend is still recorded", async () => {
-  const failing = { async run() { throw new Error("3040: out of capacity"); } };
+  const failing = { async run() { throw new Error("5007: internal server error"); } };
   const r1 = await handleReview(await req(goodBody), env(failing), deps);
   assert.equal(r1.status, 502);
 
@@ -148,4 +165,80 @@ test("router: healthz, method and 404", async () => {
   assert.equal(body.budget.cap, 6000);
   assert.equal((await worker.fetch(new Request("https://x/v1/review"), e)).status, 405);
   assert.equal((await worker.fetch(new Request("https://x/other"), e)).status, 404);
+});
+
+test("a token is good for one review", async () => {
+  const ai = aiReturning(answer);
+  const e = env(ai);
+  const token = await signer.sign(claimsAt(Math.floor(NOW_MS / 1000)));
+  assert.equal((await handleReview(await req(goodBody, { token }), e, deps)).status, 200);
+  const again = await handleReview(await req({ ...goodBody, force: true }, { token }), e, deps);
+  assert.equal(again.status, 401);
+  assert.equal((await again.json()).reason, "token already used");
+  assert.equal(ai.calls.length, 1);
+});
+
+test("oversized bodies are refused", async () => {
+  const big = await req({ ...goodBody, title: "x".repeat(2 * 1024 * 1024 + 10) });
+  assert.equal((await handleReview(big, env(aiReturning(answer)), deps)).status, 413);
+});
+
+test("the account's daily allocation used up (3036) is a deferral, not a failure", async () => {
+  const e = env(aiScript([new Error("AiError: 3036: Account limited: daily free allocation of 10,000 neurons used")]));
+  const res = await handleReview(await req(goodBody), e, deps);
+  assert.equal(res.status, 429);
+  assert.equal((await res.json()).status, "deferred");
+});
+
+test("out of capacity (3040) is retried once, then reported as unavailable", async () => {
+  const ok = aiScript([new Error("AiError: 3040: Capacity temporarily exceeded"), responsesResult(answer)]);
+  const r1 = await handleReview(await req(goodBody), env(ok), deps);
+  assert.equal(r1.status, 200);
+  assert.equal(ok.calls.length, 2);
+  const busy = aiScript([new Error("3040: out of capacity")]);
+  const r2 = await handleReview(await req(goodBody), env(busy), deps);
+  assert.equal(r2.status, 503);
+  assert.equal((await r2.json()).status, "unavailable");
+  assert.equal(busy.calls.length, 2);
+  const other = aiScript([new Error("5007: internal")]);
+  const r3 = await handleReview(await req(goodBody), env(other), deps);
+  assert.equal(r3.status, 502);
+  assert.equal(other.calls.length, 1);
+});
+
+test("an answer cut short is retried once with low effort", async () => {
+  const cut = { ...responsesResult(""), status: "incomplete", output: [{ type: "reasoning", content: [] }] };
+  const ai = aiScript([cut, responsesResult(answer)]);
+  const e = env(ai);
+  const res = await handleReview(await req(goodBody), e, deps);
+  assert.equal(res.status, 200);
+  assert.equal(ai.calls[0].input.reasoning.effort, "medium");
+  assert.equal(ai.calls[1].input.reasoning.effort, "low");
+  assert.equal((await res.json()).usage.neurons, 132);
+  assert.equal(e.LEDGER.map.get("spent:2026-11-12"), "132");
+
+  // Cut short twice: a clear reason, and both calls are counted.
+  const twice = aiScript([cut]);
+  const e2 = env(twice);
+  const r2 = await handleReview(await req(goodBody), e2, deps);
+  assert.equal(r2.status, 502);
+  assert.match((await r2.json()).reason, /ran out of output room/);
+  assert.equal(twice.calls.length, 2);
+  assert.equal(e2.LEDGER.map.get("spent:2026-11-12"), "132");
+
+  // No retry when the budget cannot cover it: the first call spent 600, and
+  // a second (about 840 reserved) would pass the 1,400 cap.
+  const tight = aiScript([{ ...cut, usage: { input_tokens: 1, output_tokens: 1, neurons: 600 } }]);
+  const e3 = env(tight, { DAILY_NEURON_CAP: "1400" });
+  const r3 = await handleReview(await req(goodBody), e3, deps);
+  assert.equal(r3.status, 502);
+  assert.equal(tight.calls.length, 1);
+});
+
+test("the estimate reserves the whole output allowance", async () => {
+  // About 12,000 output tokens is ~818 neurons: a 700-neuron cap defers.
+  const ai = aiReturning(answer);
+  const res = await handleReview(await req(goodBody), env(ai, { DAILY_NEURON_CAP: "700" }), deps);
+  assert.equal(res.status, 429);
+  assert.equal(ai.calls.length, 0);
 });
