@@ -30,6 +30,9 @@ jobs:
       pull-requests: write
       id-token: write
     uses: ./.github/workflows/review.yml
+    # Dispatch inputs arrive as strings ("2", "false") whatever their declared
+    # type, and review.yml's typed inputs refuse a string at startup, so both
+    # are converted here.
     with:
-      pr-number: ${{ inputs.pr }}
-      force: ${{ inputs.force }}
+      pr-number: ${{ fromJSON(inputs.pr) }}
+      force: ${{ fromJSON(inputs.force || 'false') }}

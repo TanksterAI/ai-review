@@ -40,6 +40,9 @@ jobs:
       id-token: write
     # main until a v1 tag is cut; the Worker trusts both and nothing else.
     uses: TanksterAI/ai-review/.github/workflows/review.yml@main
+    # Dispatch inputs arrive as strings ("2", "false") whatever their declared
+    # type, and review.yml's typed inputs refuse a string at startup, so both
+    # are converted; on pull_request events they are empty and default here.
     with:
-      pr-number: ${{ inputs.pr || 0 }}
-      force: ${{ inputs.force || false }}
+      pr-number: ${{ fromJSON(inputs.pr || '0') }}
+      force: ${{ fromJSON(inputs.force || 'false') }}

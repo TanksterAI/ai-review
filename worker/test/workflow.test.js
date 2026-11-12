@@ -202,3 +202,16 @@ test("patches are capped per file and in total before they are sent", async () =
   assert.equal(sent[12].patch, undefined);
   assert.equal(sent[12].patch_omitted, undefined);
 });
+
+// Callers: a manual run passes its inputs as strings, and review.yml's typed
+// inputs refuse a string at startup (ai-review run 1 failed with "Unexpected
+// value '2'"). Every caller must convert them with fromJSON.
+test("callers convert dispatch inputs before passing them to review.yml", () => {
+  for (const rel of ["../../.github/workflows/ai-review.yml", "../../examples/ai-review.yml"]) {
+    const text = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+    const pr = text.match(/^\s+pr-number: (.+)$/m)?.[1] ?? "";
+    const force = text.match(/^\s+force: (\$\{\{.+)$/m)?.[1] ?? "";
+    assert.match(pr, /^\$\{\{ fromJSON\(inputs\.pr( \|\| '0')?\) \}\}$/, rel);
+    assert.match(force, /^\$\{\{ fromJSON\(inputs\.force \|\| 'false'\) \}\}$/, rel);
+  }
+});
