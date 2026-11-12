@@ -156,6 +156,26 @@ test("sanitize cannot be beaten by nesting, and defuses tags, images and links",
   assert.equal(sanitize("if (a < b && c > d)", 200), "if (a < b && c > d)");
 });
 
+test("sanitize defuses reference links and bare autolinks in prose", () => {
+  const out = sanitize("See [the fix][1].\n[1]: https://evil.example/login\nor https://evil.example or www.evil.example", 300);
+  assert.doesNotMatch(out, /^\[1\]:/m);
+  assert.doesNotMatch(out, /https:\/\//);
+  assert.doesNotMatch(out, /www\./i);
+});
+
+test("sanitize leaves code spans and fenced blocks exactly as written", () => {
+  assert.equal(sanitize("Use `List<String>` and `@Override`, not <b>", 200), `Use \`List<String>\` and \`@Override\`, not <${ZWSP}b>`);
+  const fenced = "Fix:\n```java\n@Override\npublic List<String> f() { return \"https://x\"; }\n```\nthanks @bob";
+  const out = sanitize(fenced, 500);
+  assert.ok(out.includes("```java\n@Override\npublic List<String> f() { return \"https://x\"; }\n```"));
+  assert.ok(out.endsWith(`@${ZWSP}bob`));
+  // An unclosed fence is code to the end, as on GitHub.
+  assert.equal(sanitize("```\n<b>@x", 100), "```\n<b>@x\n```");
+  // A fence cut by the length bound is closed, so it cannot swallow the rest.
+  const cut = sanitize(`\`\`\`\n${"x".repeat(50)}\n\`\`\``, 20);
+  assert.equal((cut.match(/```/g) || []).length, 2);
+});
+
 test("classifyFindings splits inline from general, normalises, dedupes and caps", () => {
   const commentable = new Map([["src/a.js", new Set([2, 3])]]);
   const findings = [
