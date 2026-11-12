@@ -17,8 +17,10 @@
 //   POST /v1/github/webhook  GitHub's HMAC-signed deliveries -> the PR's Durable Object
 //   POST /v1/runner/session  runner.yml (OIDC) claims its job -> read-only token for one repo
 //   POST /v1/runner/review   runner.yml (OIDC) sends the diff -> the Worker reviews and posts
-// The App's private key and webhook secret are Worker secrets; no token with
-// more than read access ever leaves the Worker.
+//   GET  /v1/setup/github-app[/callback]  one-time App creation from a manifest
+// The App's private key and webhook secret come from the manifest flow and
+// live in the AppSecrets Durable Object (or Worker secrets, if set); no token
+// with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
 import { buildPrompt, classifyFindings, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
@@ -26,8 +28,10 @@ import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
 import { normalise, prKey, verifySignature } from "./webhook.js";
 import { prKeyOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
+import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
 
 export { PrState } from "./pr-state.js";
+export { AppSecrets } from "./setup.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
@@ -277,12 +281,13 @@ async function askPr(env, key, msg) {
 // POST /v1/github/webhook: verify, describe, hand to the PR's Durable Object,
 // acknowledge. All work happens later, in the object's alarm.
 export async function handleWebhook(request, env) {
-  if (!env.GITHUB_WEBHOOK_SECRET) return json(503, { status: "unavailable", reason: "webhook secret not configured" });
+  const app = await appConfig(env);
+  if (!app?.webhookSecret) return json(503, { status: "unavailable", reason: "the GitHub App is not set up yet" });
   const len = Number(request.headers.get("content-length") || 0);
   if (len > MAX_WEBHOOK_BYTES) return json(413, { status: "rejected", reason: "payload too large" });
   const raw = await request.arrayBuffer();
   if (raw.byteLength > MAX_WEBHOOK_BYTES) return json(413, { status: "rejected", reason: "payload too large" });
-  if (!(await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, request.headers.get("x-hub-signature-256")))) {
+  if (!(await verifySignature(app.webhookSecret, raw, request.headers.get("x-hub-signature-256")))) {
     log({ ev: "webhook_bad_signature" });
     return json(401, { status: "unauthorized", reason: "bad signature" });
   }
@@ -294,7 +299,7 @@ export async function handleWebhook(request, env) {
   } catch {
     return json(400, { status: "rejected", reason: "body is not JSON" });
   }
-  const ev = normalise(event, payload, { ownerId: env.OWNER_ID });
+  const ev = normalise(event, payload, { ownerId: env.OWNER_ID, slug: app.slug });
   if (!ev) return json(202, { status: "ignored" });
   const out = await askPr(env, prKey(ev.repo.full, ev.pr), { op: "event", delivery, ev });
   log({ ev: "webhook", event, kind: ev.kind, repository: ev.repo.full, pr: ev.pr, action: out.action });
@@ -330,7 +335,7 @@ async function runnerJob(request, env, deps) {
 export async function handleRunnerSession(request, env, deps = {}) {
   const r = await runnerJob(request, env, deps);
   if (r instanceof Response) return r;
-  const fx = deps.effects ?? createEffects(env);
+  const fx = deps.effects ?? createEffects(env, { config: await appConfig(env) });
   const token = await fx.cloneToken(r.job.repo.full);
   log({ ev: "runner_session", repository: r.job.repo.full, pr: r.job.pr, run: r.claims.run_id });
   return json(200, { job: { repo: r.job.repo, pr: r.job.pr, since: r.job.since, scope: r.job.scope }, token });
@@ -357,7 +362,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
   const finish = () => askPr(env, key, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
 
   if (out.status === 200 && out.body.status === "reviewed") {
-    const fx = deps.effects ?? createEffects(env);
+    const fx = deps.effects ?? createEffects(env, { config: await appConfig(env) });
     const review = out.body.review;
     let { body: text, comments } = review;
     if (since) {
@@ -392,6 +397,8 @@ export default {
       return json(200, { ok: true, model: cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) } });
     }
     if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
+    if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
+    if (url.pathname === "/v1/setup/github-app/callback" && request.method === "GET") return handleSetupCallback(request, env);
     if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
     if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
     if (url.pathname === "/v1/review") {
