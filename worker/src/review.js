@@ -220,23 +220,38 @@ export function parseAnswer(text) {
   }
 }
 
-// Model text is untrusted. A zero-width space is put where it defuses
-// markup without changing what a reader sees, even inside code spans:
+// Code spans and fenced blocks, which GitHub shows literally: no HTML, no
+// links, no mentions. An unclosed fence runs to the end, as on GitHub.
+const CODE = /(```[\s\S]*?(?:```|$)|`[^`\n]+`)/g;
+
+// Defuses markdown in prose (never in code, so code that is copied out of a
+// finding is exactly what the model wrote). A zero-width space goes:
 //   - after @ before a name, so nobody is notified;
 //   - after < before a letter, !, / or ?, so there are no HTML tags and no
 //     HTML comments (which could forge our marker). One pass is enough:
 //     nothing is removed, so no new tag can be spliced together;
-//   - in ![ and ](, so there are no images (tracking) and no links.
-// Length is bounded.
-export function sanitize(text, max) {
-  let s = String(text ?? "")
-    .replace(/\r/g, "")
+//   - in ![ and ](, before the colon of a [ref]: definition, after the colon
+//     of a URL scheme and in www., so there are no images (tracking) and no
+//     links of any kind (inline, reference or bare autolink).
+function defuseProse(t) {
+  return t
     .replace(/@(?=[A-Za-z0-9-])/g, `@${ZWSP}`)
     .replace(/<(?=[A-Za-z!/?])/g, `<${ZWSP}`)
     .replace(/!\[/g, `!${ZWSP}[`)
     .replace(/\]\(/g, `]${ZWSP}(`)
-    .trim();
+    .replace(/^(\s*\[[^\]\n]*\]):/gm, `$1${ZWSP}:`)
+    .replace(/([A-Za-z][A-Za-z0-9+.-]*):\/\//g, `$1:${ZWSP}//`)
+    .replace(/\bwww\./gi, (m) => `${m.slice(0, 3)}${ZWSP}.`);
+}
+
+// Model text is untrusted: prose is defused (above), code is left alone, and
+// length is bounded. A fence cut off by the bound is closed, so it cannot
+// swallow what follows it in the review.
+export function sanitize(text, max) {
+  const raw = String(text ?? "").replace(/\r/g, "");
+  let s = raw.split(CODE).map((part, i) => (i % 2 === 1 ? part : defuseProse(part))).join("").trim();
   if (s.length > max) s = `${s.slice(0, max - 1)}…`;
+  if ((s.match(/```/g) || []).length % 2 === 1) s += "\n```";
   return s;
 }
 
