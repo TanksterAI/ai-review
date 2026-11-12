@@ -14,7 +14,7 @@ const WRITE_LEVELS = new Set(["admin", "maintain", "write"]);
 const PR_SCOPE = { pull_requests: "write" };
 export const MARKER = "<!-- tankster-ai-review -->";
 
-let cached;
+const apps = new Map(); // appId -> App client, one per isolate
 
 function nameOf(repoFull) {
   const [owner, name, extra] = String(repoFull).split("/");
@@ -22,10 +22,16 @@ function nameOf(repoFull) {
   return name;
 }
 
+// deps.config: {appId, pem} from appConfig() (setup.js). Without it there is
+// no App to act as, and this throws.
 export function createEffects(env, deps = {}) {
-  const app =
-    deps.app ??
-    (cached ??= createGithubApp({ appId: env.GITHUB_APP_ID, privateKeyPem: env.GITHUB_APP_PRIVATE_KEY, org: ORG }));
+  let app = deps.app;
+  if (!app) {
+    const cfg = deps.config;
+    if (!cfg?.appId || !cfg?.pem) throw new Error("the GitHub App is not set up yet");
+    if (!apps.has(cfg.appId)) apps.set(cfg.appId, createGithubApp({ appId: cfg.appId, privateKeyPem: cfg.pem, org: ORG }));
+    app = apps.get(cfg.appId);
+  }
 
   return {
     app,

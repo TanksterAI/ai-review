@@ -11,13 +11,16 @@
     { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
   ],
   // v2: one Durable Object per pull request (SQLite-backed, on Workers Free).
-  "durable_objects": { "bindings": [{ "name": "PR_STATE", "class_name": "PrState" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PrState"] }],
-  // Secrets, set by Rishi in the dashboard, never in this file:
-  //   GITHUB_APP_PRIVATE_KEY (the App's .pem, as downloaded), GITHUB_WEBHOOK_SECRET.
+  // AppSecrets: the GitHub App's id, slug, key and webhook secret, stored by
+  // the one-time manifest flow (GET /v1/setup/github-app). No person handles them.
+  "durable_objects": {
+    "bindings": [
+      { "name": "PR_STATE", "class_name": "PrState" },
+      { "name": "APP_SECRETS", "class_name": "AppSecrets" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PrState", "AppSecrets"] }],
   "vars": {
-    // The Tankster AI Review GitHub App (org-owned, installable on TanksterAI only).
-    "GITHUB_APP_ID": "5735981",
     // Only the App's runner, on main, may claim jobs.
     "RUNNER_REFS": "TanksterAI/ai-review/.github/workflows/runner.yml@refs/heads/main",
     // TanksterAI's numeric organisation id: the OIDC token must carry it.

@@ -5,8 +5,15 @@
 // (the PR's Durable Object does that). The payload is untrusted beyond the
 // fields GitHub itself sets; nothing here acts on it, it only describes it.
 
-export const BOT_LOGIN = "tankster-ai-review[bot]";
-export const MENTION = /(^|[^\w-])@tankster-ai-review(?![\w-])/i;
+// The App's slug decides its login ("<slug>[bot]") and how people mention it.
+export const DEFAULT_SLUG = "tankster-ai-review";
+export const BOT_LOGIN = `${DEFAULT_SLUG}[bot]`;
+
+export function mentionOf(slug = DEFAULT_SLUG) {
+  if (!/^[a-z0-9-]+$/.test(slug)) throw new Error("bad App slug");
+  return new RegExp(`(^|[^\\w-])@${slug}(?![\\w-])`, "i");
+}
+export const MENTION = mentionOf();
 
 const REVIEW_ACTIONS = new Set(["opened", "reopened", "ready_for_review", "synchronize"]);
 const WRITERS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -34,7 +41,7 @@ function repoOf(p) {
 }
 
 // Returns null for anything ai-review ignores, otherwise a small plain object.
-export function normalise(event, p, { ownerId } = {}) {
+export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
   if (!p || typeof p !== "object") return null;
   const repo = repoOf(p);
   if (!repo || (ownerId && repo.ownerId !== String(ownerId))) return null;
@@ -63,11 +70,12 @@ export function normalise(event, p, { ownerId } = {}) {
   const isComment = event === "issue_comment" || event === "pull_request_review_comment";
   if (isComment && p.action === "created") {
     const c = p.comment;
-    if (!c || sender.bot || sender.login === BOT_LOGIN || !MENTION.test(String(c.body ?? ""))) return null;
+    if (!c || sender.bot || sender.login === `${slug}[bot]` || !mentionOf(slug).test(String(c.body ?? ""))) return null;
     const prNumber = event === "issue_comment" ? (p.issue?.pull_request ? p.issue.number : null) : p.pull_request?.number;
     if (!Number.isInteger(prNumber)) return null;
     return {
       kind: "command",
+      slug,
       repo,
       pr: prNumber,
       sender,
