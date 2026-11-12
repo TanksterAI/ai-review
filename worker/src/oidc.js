@@ -14,6 +14,9 @@ const SKEW_S = 60;
 const MAX_LIFETIME_S = 60 * 60;
 // How long a fetched key set is trusted before it is fetched again.
 const JWKS_TTL_MS = 10 * 60 * 1000;
+// An unknown kid forces a refetch at most this often, so unauthenticated
+// requests with made-up kids cannot make us hammer GitHub.
+const FORCED_REFETCH_MS = 60 * 1000;
 
 export class OidcError extends Error {
   constructor(reason) {
@@ -42,10 +45,12 @@ function decodeJson(part) {
 }
 
 // A small key cache shared by requests in the same isolate. A miss on the
-// kid forces one refetch, so a key rotation is picked up at once.
+// kid forces one refetch (at most once a minute), so a key rotation is picked
+// up at once.
 export function createJwksCache(fetcher = (url) => fetch(url), now = () => Date.now()) {
   let keys = null;
   let fetchedAt = 0;
+  let lastForced = -Infinity;
   async function load() {
     const res = await fetcher(JWKS_URL);
     if (!res.ok) throw new OidcError(`jwks fetch failed (${res.status})`);
@@ -58,7 +63,8 @@ export function createJwksCache(fetcher = (url) => fetch(url), now = () => Date.
     async get(kid) {
       if (!keys || now() - fetchedAt > JWKS_TTL_MS) await load();
       let jwk = keys.find((k) => k.kid === kid);
-      if (!jwk) {
+      if (!jwk && now() - lastForced > FORCED_REFETCH_MS) {
+        lastForced = now();
         await load();
         jwk = keys.find((k) => k.kid === kid);
       }
@@ -70,14 +76,16 @@ export function createJwksCache(fetcher = (url) => fetch(url), now = () => Date.
 
 /**
  * @param {string} token
- * @param {{audience: string, ownerId: string, workflowPrefix: string,
+ * @param {{audience: string, ownerId: string, workflowRefs: string[],
  *          jwks: {get(kid: string): Promise<JsonWebKey>}, nowS?: number}} opts
  * @returns {Promise<Record<string, unknown>>} the verified claims
  */
 export async function verifyGithubOidc(token, opts) {
-  const { audience, ownerId, workflowPrefix, jwks } = opts;
+  const { audience, ownerId, workflowRefs, jwks } = opts;
   const nowS = opts.nowS ?? Math.floor(Date.now() / 1000);
-  if (!audience || !ownerId || !workflowPrefix) throw new OidcError("verifier not configured");
+  if (!audience || !ownerId || !Array.isArray(workflowRefs) || workflowRefs.length === 0) {
+    throw new OidcError("verifier not configured");
+  }
   if (typeof token !== "string") throw new OidcError("missing token");
   const parts = token.split(".");
   if (parts.length !== 3) throw new OidcError("malformed token");
@@ -122,10 +130,13 @@ export async function verifyGithubOidc(token, opts) {
   // take over the trust.
   if (String(c.repository_owner_id) !== String(ownerId)) throw new OidcError("wrong owner");
   if (typeof c.repository !== "string" || !c.repository.includes("/")) throw new OidcError("missing repository");
-  // Only our reusable workflow may call: a job in any repository of the org
-  // that writes its own curl gets a different job_workflow_ref.
-  if (typeof c.job_workflow_ref !== "string" || !c.job_workflow_ref.startsWith(workflowPrefix)) {
-    throw new OidcError("wrong workflow");
-  }
+  // Only our reusable workflow, at a released ref, may call: a job that
+  // writes its own curl, or calls review.yml from an unmerged branch or an
+  // arbitrary commit, gets a job_workflow_ref that is not on the list. An
+  // entry ending in "*" matches that prefix (refs/tags/v1.* for point tags).
+  const ref = c.job_workflow_ref;
+  const allowed = typeof ref === "string" && workflowRefs.some((w) =>
+    w.endsWith("*") ? ref.startsWith(w.slice(0, -1)) : ref === w);
+  if (!allowed) throw new OidcError("wrong workflow");
   return c;
 }

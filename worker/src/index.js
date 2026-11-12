@@ -6,6 +6,7 @@
 //   200 {status: "skipped", reason}               nothing reviewable
 //   409 {status: "duplicate"}                     this head commit was already reviewed
 //   429 {status: "deferred", reason, resets_at}   today's review budget is spent
+//   503 {status: "unavailable", reason}           Workers AI is out of capacity
 //   401 / 400 / 413 / 502                         see `reason`
 // GET /healthz  -> {ok, model, budget}
 //
@@ -19,7 +20,6 @@ import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
-const OUTPUT_RESERVE_TOKENS = 3000;
 const jwks = createJwksCache();
 
 function json(status, body) {
@@ -36,10 +36,11 @@ function config(env) {
     effort: ["low", "medium", "high"].includes(env.REASONING_EFFORT) ? env.REASONING_EFFORT : "medium",
     cap: num(env.DAILY_NEURON_CAP, 6000),
     maxChars: num(env.MAX_DIFF_CHARS, 90_000),
-    maxOutput: num(env.MAX_OUTPUT_TOKENS, 6000),
+    maxOutput: num(env.MAX_OUTPUT_TOKENS, 12_000),
     audience: env.AUDIENCE,
     ownerId: env.OWNER_ID,
-    workflowPrefix: env.WORKFLOW_PREFIX,
+    // Comma-separated job_workflow_ref values; an entry ending in * is a prefix.
+    workflowRefs: String(env.WORKFLOW_REFS ?? "").split(",").map((x) => x.trim()).filter(Boolean),
   };
 }
 
@@ -71,7 +72,7 @@ export async function handleReview(request, env, deps = {}) {
     claims = await verifyGithubOidc(token, {
       audience: cfg.audience,
       ownerId: cfg.ownerId,
-      workflowPrefix: cfg.workflowPrefix,
+      workflowRefs: cfg.workflowRefs,
       jwks: deps.jwks ?? jwks,
       nowS: Math.floor(now() / 1000),
     });
@@ -81,6 +82,23 @@ export async function handleReview(request, env, deps = {}) {
     return json(401, { status: "unauthorized", reason });
   }
   const repository = claims.repository;
+
+  // Each token is good for one review: a token copied out of a job log or a
+  // runner cannot be replayed. KV is eventually consistent, so this stops
+  // replays after the first second or so, not a simultaneous one; the daily
+  // cap bounds what any replay can cost. KV's shortest TTL is 60 s.
+  if (typeof claims.jti === "string" && claims.jti) {
+    const jtiKey = `jti:${claims.jti}`;
+    if (await env.LEDGER.get(jtiKey)) {
+      log({ ev: "auth_failed", reason: "token reused" });
+      return json(401, { status: "unauthorized", reason: "token already used" });
+    }
+    const ttl = Math.max(60, Math.ceil(claims.exp - now() / 1000) + 120);
+    await env.LEDGER.put(jtiKey, "1", { expirationTtl: ttl });
+  } else {
+    log({ ev: "auth_failed", reason: "no jti" });
+    return json(401, { status: "unauthorized", reason: "token has no jti" });
+  }
 
   const len = Number(request.headers.get("content-length") || 0);
   if (len > MAX_BODY_BYTES) return json(413, { status: "rejected", reason: "request too large" });
@@ -118,7 +136,8 @@ export async function handleReview(request, env, deps = {}) {
     prepared,
     tag: randomTag(),
   });
-  const estimate = estimateNeurons(cfg.model, instructions.length + modelInput.length, OUTPUT_RESERVE_TOKENS);
+  // The reserve is the whole output allowance: reasoning counts as output.
+  const estimate = estimateNeurons(cfg.model, instructions.length + modelInput.length, cfg.maxOutput);
   const spentBefore = await ledger.spent();
   if (spentBefore + estimate > cfg.cap) {
     log({ ev: "deferred", repository, pr, spent: Math.round(spentBefore), estimate: Math.round(estimate) });
@@ -130,28 +149,60 @@ export async function handleReview(request, env, deps = {}) {
   }
 
   const started = now();
-  let result;
-  try {
-    result = await env.AI.run(cfg.model, {
-      instructions,
-      input: modelInput,
-      reasoning: { effort: cfg.effort },
-      max_output_tokens: cfg.maxOutput,
-    });
-  } catch (e) {
-    log({ ev: "model_error", repository, pr, error: String(e?.message ?? e).slice(0, 200) });
-    return json(502, { status: "failed", reason: "the model call failed; try again later" });
+  // Up to two model calls:
+  //   - out of capacity (3040): try once more at once;
+  //   - an answer cut short (status "incomplete", reasoning used the room):
+  //     try once more with low reasoning effort, if the budget allows.
+  // The account's daily allocation used up (3036) is a deferral, like our cap.
+  let effort = cfg.effort;
+  let neurons = 0;
+  let spent = spentBefore;
+  let answer = null;
+  let lastStatus;
+  for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
+    let result;
+    try {
+      result = await env.AI.run(cfg.model, {
+        instructions,
+        input: modelInput,
+        reasoning: { effort },
+        max_output_tokens: cfg.maxOutput,
+      });
+    } catch (e) {
+      const message = String(e?.message ?? e);
+      log({ ev: "model_error", repository, pr, attempt, error: message.slice(0, 200) });
+      if (/\b3036\b|daily free allocation|neurons? limit/i.test(message)) {
+        return json(429, {
+          status: "deferred",
+          reason: "the account's free Workers AI allocation for today is used up",
+          resets_at: nextUtcMidnight(now()),
+        });
+      }
+      if (/\b3040\b|capacity/i.test(message)) {
+        if (attempt < 2) continue;
+        return json(503, { status: "unavailable", reason: "Workers AI is out of capacity; try again later" });
+      }
+      return json(502, { status: "failed", reason: "the model call failed; try again later" });
+    }
+    const usage = result?.usage ?? {};
+    const used = Number.isFinite(usage.neurons)
+      ? usage.neurons
+      : neuronsFor(cfg.model, usage.input_tokens ?? usage.prompt_tokens ?? 0, usage.output_tokens ?? usage.completion_tokens ?? 0);
+    neurons += used;
+    spent = await ledger.add(used);
+    lastStatus = result?.status;
+    answer = parseAnswer(extractText(result));
+    if (!answer) {
+      log({ ev: "unparseable", repository, pr, attempt, neurons: Math.round(used), status: lastStatus });
+      if (lastStatus !== "incomplete" || spent + estimate > cfg.cap) break;
+      effort = "low";
+    }
   }
-  const usage = result?.usage ?? {};
-  const neurons = Number.isFinite(usage.neurons)
-    ? usage.neurons
-    : neuronsFor(cfg.model, usage.input_tokens ?? usage.prompt_tokens ?? 0, usage.output_tokens ?? usage.completion_tokens ?? 0);
-  const spent = await ledger.add(neurons);
-
-  const answer = parseAnswer(extractText(result));
   if (!answer) {
-    log({ ev: "unparseable", repository, pr, neurons: Math.round(neurons), status: result?.status });
-    return json(502, { status: "failed", reason: "the model did not return a usable answer; try again later" });
+    const reason = lastStatus === "incomplete"
+      ? "the model ran out of output room before it answered; try again, or review a smaller change"
+      : "the model did not return a usable answer; try again later";
+    return json(502, { status: "failed", reason });
   }
   const classified = classifyFindings(answer, prepared.commentable);
   const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap } });
