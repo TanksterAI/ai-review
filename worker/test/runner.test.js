@@ -1,0 +1,137 @@
+// Runs the github-script step of .github/workflows/runner.yml exactly as
+// written, against stand-ins for core, fetch and getOctokit.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const yml = readFileSync(fileURLToPath(new URL("../../.github/workflows/runner.yml", import.meta.url)), "utf8");
+
+function extractScript(text) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => /^\s+script: \|\s*$/.test(l));
+  assert.ok(start > 0, "script block not found");
+  const indent = lines[start + 1].match(/^\s*/)[0].length;
+  const body = [];
+  for (const l of lines.slice(start + 1)) {
+    if (l.trim() !== "" && l.match(/^\s*/)[0].length < indent) break;
+    body.push(l.slice(indent));
+  }
+  return body.join("\n");
+}
+
+const SCRIPT = extractScript(yml);
+const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+const JOB = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"a".repeat(32)}`;
+const HEAD = "c".repeat(40);
+const SINCE = "b".repeat(40);
+
+function run({ job = JOB, session, review, pr = {}, compare, files = [{ filename: "a.js", status: "modified", patch: "@@ -1 +1 @@\n-a\n+b" }], prError } = {}) {
+  const log = { notices: [], warnings: [], failed: null, secrets: [], requests: [], fetches: [], revoked: 0, compared: null };
+  const core = {
+    notice: (m) => log.notices.push(m),
+    warning: (m) => log.warnings.push(m),
+    setFailed: (m) => { log.failed = m; },
+    setSecret: (s) => log.secrets.push(s),
+    getIDToken: async (aud) => { assert.equal(aud, "tankster-ai-review"); return `oidc-${log.fetches.length}`; },
+  };
+  const fetchStub = async (url, init) => {
+    const body = JSON.parse(init.body);
+    log.fetches.push({ url, auth: init.headers.authorization, body });
+    if (url.endsWith("/v1/runner/session")) {
+      const s = session ?? { status: 200, json: { job: { repo: { full: "TanksterAI/browser-relay", name: "browser-relay" }, pr: 39, since: SINCE, scope: "review" }, token: "ghs_clone" } };
+      return Response.json(s.json, { status: s.status });
+    }
+    const r = review ?? { status: 200, json: { status: "reviewed", inline: 2, usage: { neurons: 120 } } };
+    return Response.json(r.json, { status: r.status });
+  };
+  const getOctokit = (token) => {
+    assert.equal(token, "ghs_clone");
+    const listFiles = Symbol("listFiles");
+    return {
+      rest: {
+        pulls: {
+          get: async (a) => { if (prError) throw prError; log.prArgs = a; return { data: { state: "open", title: "T", body: null, head: { sha: HEAD }, ...pr } }; },
+          listFiles,
+        },
+        repos: {
+          compareCommitsWithBasehead: async (a) => { log.compared = a.basehead; return { data: compare ?? { status: "ahead", files: [{ filename: "new.js", status: "added", patch: "@@ +1 @@\n+x" }] } }; },
+        },
+      },
+      paginate: async (fn) => { assert.equal(fn, listFiles); log.paginated = true; return files; },
+      request: async (route) => { log.requests.push(route); if (route === "DELETE /installation/token") log.revoked++; },
+    };
+  };
+  const env = { JOB: job };
+  const proc = { env };
+  return new AsyncFunction("core", "fetch", "getOctokit", "process", "AbortSignal", SCRIPT)(core, fetchStub, getOctokit, proc, AbortSignal)
+    .then(() => log, (e) => { log.threw = e; return log; });
+}
+
+test("the workflow keeps its guard rails", () => {
+  assert.match(yml, /^on:\n  workflow_dispatch:\n    inputs:\n      job:\n/m);
+  assert.doesNotMatch(yml, /repository_dispatch|pull_request_target|issue_comment/);
+  assert.match(yml, /^permissions: \{\}$/m);
+  assert.match(yml, /^    permissions:\n      id-token: write\n    steps:/m, "id-token only; no GITHUB_TOKEN scopes");
+  assert.match(yml, /JOB: \$\{\{ inputs\.job \}\}/, "the job id reaches the script as data");
+  assert.doesNotMatch(SCRIPT, /\$\{\{/, "nothing is interpolated into the script");
+  assert.match(yml, /actions\/github-script@[0-9a-f]{40} # v9/);
+});
+
+test("a run without a valid job id does nothing", async () => {
+  for (const job of ["", "x", `${JOB}; rm -rf /`, "a.b"]) {
+    const log = await run({ job });
+    assert.match(log.failed, /no valid job id/);
+    assert.equal(log.fetches.length, 0);
+  }
+});
+
+test("incremental: only the commits after the recorded one, then the token is revoked", async () => {
+  const log = await run();
+  assert.deepEqual(log.secrets, ["ghs_clone"]);
+  assert.equal(log.compared, `${SINCE}...${HEAD}`);
+  assert.ok(!log.paginated);
+  const sent = log.fetches[1];
+  assert.match(sent.url, /\/v1\/runner\/review$/);
+  assert.equal(sent.body.job, JOB);
+  assert.equal(sent.body.since, SINCE);
+  assert.equal(sent.body.head_sha, HEAD);
+  assert.deepEqual(sent.body.files.map((f) => f.filename), ["new.js"]);
+  // A fresh OIDC token per request.
+  assert.notEqual(log.fetches[0].auth, log.fetches[1].auth);
+  assert.equal(log.revoked, 1);
+  assert.match(log.notices[0], /2 inline comment/);
+});
+
+test("after a force-push the whole PR is reviewed", async () => {
+  const log = await run({ compare: { status: "diverged", files: [] } });
+  assert.ok(log.paginated);
+  assert.equal(log.fetches[1].body.since, null);
+});
+
+test("a refused session stops before any GitHub call", async () => {
+  const log = await run({ session: { status: 403, json: { status: "refused", reason: "job already claimed" } } });
+  assert.match(log.failed, /job already claimed/);
+  assert.equal(log.fetches.length, 1);
+});
+
+test("the token is revoked even when the run fails", async () => {
+  const log = await run({ prError: Object.assign(new Error("boom"), { status: 500 }) });
+  assert.match(String(log.threw), /boom/);
+  assert.equal(log.revoked, 1);
+});
+
+test("closed PRs, deferrals and failures are reported, not hidden", async () => {
+  assert.match((await run({ pr: { state: "closed" } })).notices[0], /closed; nothing to review/);
+  assert.match((await run({ review: { status: 429, json: { reason: "spent", resets_at: "t" } } })).warnings[0], /deferred/);
+  assert.match((await run({ review: { status: 502, json: { reason: "bad answer" } } })).failed, /bad answer/);
+});
+
+test("big patches are cut and the total is bounded", async () => {
+  const files = Array.from({ length: 10 }, (_, i) => ({ filename: `f${i}.js`, status: "modified", patch: "x".repeat(30_000) }));
+  const log = await run({ compare: { status: "diverged" }, files });
+  const sent = log.fetches[1].body.files;
+  assert.ok(sent.every((f) => !f.patch || f.patch.length <= 20_000));
+  assert.ok(sent.reduce((n, f) => n + (f.patch?.length ?? 0), 0) <= 120_000);
+  assert.ok(sent.some((f) => f.patch_omitted));
+});
