@@ -30,7 +30,7 @@ pull request opened ─▶ caller workflow (each repo)
 
 ## Using it in a repository
 
-Copy [`examples/ai-review.yml`](examples/ai-review.yml) to `.github/workflows/ai-review.yml`. It calls `review.yml` at `@main` until a `v1` tag is cut (the Worker trusts both), and reviews a pull request when it is opened, reopened or marked ready for review. To review it again after new pushes:
+Copy [`examples/ai-review.yml`](examples/ai-review.yml) to `.github/workflows/ai-review.yml`. It calls `review.yml` at `@main` until a `v1` tag is cut (the Worker trusts both; see [Releasing v1](#releasing-v1)), and reviews a pull request when it is opened, reopened or marked ready for review. To review it again after new pushes:
 
 - add the `ai-review` label (remove it first if it is already there), or
 - run the workflow by hand: Actions → ai-review → Run workflow, with the PR number. A Claude session can do the same through the GitHub connector's workflow dispatch.
@@ -43,7 +43,13 @@ Each head commit is reviewed once. A repeat request for the same commit is skipp
 
 This repository's own pull requests are reviewed by hand. Its `ai-review.yml` runs only from Actions → Run workflow, on `main`, because a run on a pull-request ref calls `review.yml` at `refs/pull/N/merge`, which the Worker refuses by design.
 
-**Before another repository can call `review.yml`**, this repository's Settings → Actions → General → Access must be "Accessible from repositories in the 'TanksterAI' organization". A private repository's reusable workflows are closed to other repositories by default.
+**Before another repository can call `review.yml`**, this repository's Settings → Actions → General → Access must be "Accessible from repositories in the 'TanksterAI' organization". A private repository's reusable workflows are closed to other repositories by default. It was set on 12 Nov 2026.
+
+## Releasing v1
+
+After a change to `review.yml` or the Worker is merged and deployed, run Actions → release-v1 → Run workflow, on `main`. It creates `v1` at `main`, or moves it forward to `main`. It never moves `v1` back or sideways: it compares the two first and refuses unless `main` is ahead, so an older `review.yml` cannot become trusted again by a click. Moving `v1` back is for the owner, by hand.
+
+GitHub will not let the job's own token move a tag across commits that change `.github/workflows`, because that needs the `workflows` permission, which a job token cannot be given. When that happens the run fails and prints the `git push` command that moves `v1` by hand.
 
 ## Inputs (`review.yml`)
 
@@ -83,4 +89,4 @@ Deploying: `npx wrangler deploy -c worker/wrangler.jsonc`, or upload the four mo
 npm test
 ```
 
-This runs the Worker's OIDC verification (with a real RSA key pair), the budget, the prompt and review building, the HTTP handler, and the workflow's own `github-script` step exactly as written in `review.yml`, against stand-ins.
+This runs the Worker's OIDC verification (with a real RSA key pair), the budget, the prompt and review building, the HTTP handler, and the workflows' own `github-script` steps exactly as written in `review.yml` and `release-v1.yml`, against stand-ins. It also checks the release workflow keeps its guard rails: dispatch only, `main` only, `contents: write` only, one run at a time.
