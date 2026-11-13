@@ -1,4 +1,4 @@
-// tankster-ai-review: a free, secretless pull-request reviewer.
+// tankster-ai-review: a free pull-request reviewer (v1 secretless; v2 the GitHub App).
 //
 // POST /v1/review  (Authorization: Bearer <GitHub Actions OIDC token>)
 //   body: {pr, head_sha, title, body, files: [{filename, status, patch, additions, deletions}], force?}
@@ -10,13 +10,28 @@
 //   401 / 400 / 413 / 502                         see `reason`
 // GET /healthz  -> {ok, model, budget}
 //
-// The reviewing workflow (TanksterAI/ai-review .github/workflows/review.yml)
-// fetches the diff with its own GITHUB_TOKEN and posts the review; this
-// Worker never holds a GitHub credential and never sees one.
+// v1: the reviewing workflow (TanksterAI/ai-review .github/workflows/review.yml)
+// fetches the diff with its own GITHUB_TOKEN and posts the review.
+//
+// v2 (the Tankster AI Review GitHub App):
+//   POST /v1/github/webhook  GitHub's HMAC-signed deliveries -> the PR's Durable Object
+//   POST /v1/runner/session  runner.yml (OIDC) claims its job -> read-only token for one repo
+//   POST /v1/runner/review   runner.yml (OIDC) sends the diff -> the Worker reviews and posts
+//   GET  /v1/setup/github-app[/callback]  one-time App creation from a manifest
+// The App's private key and webhook secret come from the manifest flow and
+// live in the AppSecrets Durable Object (or Worker secrets, if set); no token
+// with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
 import { buildPrompt, classifyFindings, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
 import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
+import { normalise, prKey, verifySignature } from "./webhook.js";
+import { prKeyOfJob } from "./pr-state.js";
+import { createEffects } from "./effects.js";
+import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
+
+export { PrState } from "./pr-state.js";
+export { AppSecrets } from "./setup.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
@@ -61,20 +76,19 @@ function randomTag() {
   return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
-export async function handleReview(request, env, deps = {}) {
+// Verifies the GitHub Actions OIDC token on a request against the allowed
+// workflow refs, and spends its jti. Returns the claims, or a 401 Response.
+export async function authenticate(request, env, workflowRefs, deps = {}) {
   const cfg = config(env);
   const now = deps.now ?? (() => Date.now());
-  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-  const ledger = createLedger(env.LEDGER, now);
-
-  const auth = request.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const header = request.headers.get("authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   let claims;
   try {
     claims = await verifyGithubOidc(token, {
       audience: cfg.audience,
       ownerId: cfg.ownerId,
-      workflowRefs: cfg.workflowRefs,
+      workflowRefs,
       jwks: deps.jwks ?? jwks,
       nowS: Math.floor(now() / 1000),
     });
@@ -83,24 +97,32 @@ export async function handleReview(request, env, deps = {}) {
     log({ ev: "auth_failed", reason });
     return json(401, { status: "unauthorized", reason });
   }
-  const repository = claims.repository;
-
-  // Each token is good for one review: a token copied out of a job log or a
+  // Each token is good for one request: a token copied out of a job log or a
   // runner cannot be replayed. KV is eventually consistent, so this stops
   // replays after the first second or so, not a simultaneous one; the daily
   // cap bounds what any replay can cost. KV's shortest TTL is 60 s.
-  if (typeof claims.jti === "string" && claims.jti) {
-    const jtiKey = `jti:${claims.jti}`;
-    if (await env.LEDGER.get(jtiKey)) {
-      log({ ev: "auth_failed", reason: "token reused" });
-      return json(401, { status: "unauthorized", reason: "token already used" });
-    }
-    const ttl = Math.max(60, Math.ceil(claims.exp - now() / 1000) + 120);
-    await env.LEDGER.put(jtiKey, "1", { expirationTtl: ttl });
-  } else {
+  if (typeof claims.jti !== "string" || !claims.jti) {
     log({ ev: "auth_failed", reason: "no jti" });
     return json(401, { status: "unauthorized", reason: "token has no jti" });
   }
+  const jtiKey = `jti:${claims.jti}`;
+  if (await env.LEDGER.get(jtiKey)) {
+    log({ ev: "auth_failed", reason: "token reused" });
+    return json(401, { status: "unauthorized", reason: "token already used" });
+  }
+  const ttl = Math.max(60, Math.ceil(claims.exp - now() / 1000) + 120);
+  await env.LEDGER.put(jtiKey, "1", { expirationTtl: ttl });
+  return claims;
+}
+
+export async function handleReview(request, env, deps = {}) {
+  const cfg = config(env);
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+
+  const auth = await authenticate(request, env, cfg.workflowRefs, { ...deps, now });
+  if (auth instanceof Response) return auth;
+  const repository = auth.repository;
 
   const len = Number(request.headers.get("content-length") || 0);
   if (len > MAX_BODY_BYTES) return json(413, { status: "rejected", reason: "request too large" });
@@ -120,15 +142,24 @@ export async function handleReview(request, env, deps = {}) {
     return json(400, { status: "rejected", reason: `files must be an array of at most ${MAX_FILES}` });
   }
 
+  const out = await runReview({ cfg, env, repository, pr, headSha, input, now, sleep });
+  return json(out.status, out.body);
+}
+
+// The review itself, shared by the v1 endpoint (/v1/review) and the App's
+// runner endpoint. Returns {status, body}; callers turn it into a Response.
+export async function runReview({ cfg, env, repository, pr, headSha, input, now, sleep }) {
+  const res = (status, body) => ({ status, body });
+  const ledger = createLedger(env.LEDGER, now);
   const doneKey = `done:${repository}#${pr}@${headSha}`;
   if (!input.force && (await env.LEDGER.get(doneKey))) {
-    return json(409, { status: "duplicate", reason: "this commit was already reviewed; pass force to review it again" });
+    return res(409, { status: "duplicate", reason: "this commit was already reviewed; pass force to review it again" });
   }
 
   const prepared = prepareFiles(input.files, { maxChars: cfg.maxChars });
   if (prepared.included.length === 0) {
     log({ ev: "skipped", repository, pr, omitted: prepared.omitted.length });
-    return json(200, { status: "skipped", reason: "no reviewable text changes", omitted: prepared.omitted });
+    return res(200, { status: "skipped", reason: "no reviewable text changes", omitted: prepared.omitted });
   }
 
   const { instructions, input: modelInput } = buildPrompt({
@@ -143,7 +174,7 @@ export async function handleReview(request, env, deps = {}) {
   const spentBefore = await ledger.spent();
   if (spentBefore + estimate > cfg.cap) {
     log({ ev: "deferred", repository, pr, spent: Math.round(spentBefore), estimate: Math.round(estimate) });
-    return json(429, {
+    return res(429, {
       status: "deferred",
       reason: `today's review budget is spent (${Math.round(spentBefore)} of ${cfg.cap} neurons; this review needs about ${Math.round(estimate)})`,
       resets_at: nextUtcMidnight(now()),
@@ -174,7 +205,7 @@ export async function handleReview(request, env, deps = {}) {
       const message = String(e?.message ?? e);
       log({ ev: "model_error", repository, pr, attempt, error: message.slice(0, 200) });
       if (/\b3036\b|daily free allocation/i.test(message)) {
-        return json(429, {
+        return res(429, {
           status: "deferred",
           reason: "the account's free Workers AI allocation for today is used up",
           resets_at: nextUtcMidnight(now()),
@@ -186,9 +217,9 @@ export async function handleReview(request, env, deps = {}) {
           await sleep(CAPACITY_RETRY_MS);
           continue;
         }
-        return json(503, { status: "unavailable", reason: "Workers AI is out of capacity; try again later" });
+        return res(503, { status: "unavailable", reason: "Workers AI is out of capacity; try again later" });
       }
-      return json(502, { status: "failed", reason: "the model call failed; try again later" });
+      return res(502, { status: "failed", reason: "the model call failed; try again later" });
     }
     const usage = result?.usage ?? {};
     const used = Number.isFinite(usage.neurons)
@@ -208,7 +239,7 @@ export async function handleReview(request, env, deps = {}) {
     const reason = lastStatus === "incomplete"
       ? "the model ran out of output room before it answered; try again, or review a smaller change"
       : "the model did not return a usable answer; try again later";
-    return json(502, { status: "failed", reason });
+    return res(502, { status: "failed", reason });
   }
   const classified = classifyFindings(answer, prepared.commentable);
   const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap } });
@@ -225,11 +256,136 @@ export async function handleReview(request, env, deps = {}) {
     spent: Math.round(spent),
     ms: now() - started,
   });
-  return json(200, {
+  return res(200, {
     status: "reviewed",
     review,
     usage: { model: cfg.model, neurons, spent_today: spent, cap: cfg.cap },
   });
+}
+
+
+// ---------------------------------------------------------------------------
+// v2: the Tankster AI Review GitHub App.
+
+const MAX_WEBHOOK_BYTES = 5 * 1024 * 1024;
+
+function prStub(env, key) {
+  return env.PR_STATE.get(env.PR_STATE.idFromName(key));
+}
+
+async function askPr(env, key, msg) {
+  const res = await prStub(env, key).fetch("https://pr-state/", { method: "POST", body: JSON.stringify(msg) });
+  return res.json();
+}
+
+// POST /v1/github/webhook: verify, describe, hand to the PR's Durable Object,
+// acknowledge. All work happens later, in the object's alarm.
+export async function handleWebhook(request, env) {
+  const app = await appConfig(env);
+  if (!app?.webhookSecret) return json(503, { status: "unavailable", reason: "the GitHub App is not set up yet" });
+  const len = Number(request.headers.get("content-length") || 0);
+  if (len > MAX_WEBHOOK_BYTES) return json(413, { status: "rejected", reason: "payload too large" });
+  const raw = await request.arrayBuffer();
+  if (raw.byteLength > MAX_WEBHOOK_BYTES) return json(413, { status: "rejected", reason: "payload too large" });
+  if (!(await verifySignature(app.webhookSecret, raw, request.headers.get("x-hub-signature-256")))) {
+    log({ ev: "webhook_bad_signature" });
+    return json(401, { status: "unauthorized", reason: "bad signature" });
+  }
+  const event = request.headers.get("x-github-event") || "";
+  const delivery = request.headers.get("x-github-delivery") || "";
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return json(400, { status: "rejected", reason: "body is not JSON" });
+  }
+  const ev = normalise(event, payload, { ownerId: env.OWNER_ID, slug: app.slug });
+  if (!ev) return json(202, { status: "ignored" });
+  const out = await askPr(env, prKey(ev.repo.full, ev.pr), { op: "event", delivery, ev });
+  log({ ev: "webhook", event, kind: ev.kind, repository: ev.repo.full, pr: ev.pr, action: out.action });
+  return json(202, { status: "accepted", action: out.action });
+}
+
+function runnerRefs(env) {
+  return String(env.RUNNER_REFS ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+}
+
+// The runner's job: claimed by (or already claimed by) this workflow run.
+async function runnerJob(request, env, deps) {
+  const claims = await authenticate(request, env, runnerRefs(env), deps);
+  if (claims instanceof Response) return claims;
+  let body;
+  try {
+    const text = await request.text();
+    if (text.length > MAX_BODY_BYTES) return json(413, { status: "rejected", reason: "request too large" });
+    body = JSON.parse(text);
+  } catch {
+    return json(400, { status: "rejected", reason: "body is not JSON" });
+  }
+  const key = prKeyOfJob(body?.job);
+  // Only the App's own dispatch starts a job run.
+  if (!key || !claims.run_id || claims.event_name !== "workflow_dispatch") return json(403, { status: "refused", reason: "no such job" });
+  const out = await askPr(env, key, { op: "claim", jobId: body.job, runId: String(claims.run_id) });
+  if (!out.job) return json(403, { status: "refused", reason: out.error ?? "no such job" });
+  return { claims, body, job: out.job, key };
+}
+
+// POST /v1/runner/session -> {job, token}: the job and a read-only token for
+// the job's one repository.
+export async function handleRunnerSession(request, env, deps = {}) {
+  const r = await runnerJob(request, env, deps);
+  if (r instanceof Response) return r;
+  const fx = deps.effects ?? createEffects(env, { config: await appConfig(env) });
+  const token = await fx.cloneToken(r.job.repo.full);
+  log({ ev: "runner_session", repository: r.job.repo.full, pr: r.job.pr, run: r.claims.run_id });
+  return json(200, { job: { repo: r.job.repo, pr: r.job.pr, since: r.job.since, scope: r.job.scope }, token });
+}
+
+// POST /v1/runner/review: the runner's diff in, the review posted by the App.
+export async function handleRunnerReview(request, env, deps = {}) {
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? ((ms) => new Promise((res) => setTimeout(res, ms)));
+  const r = await runnerJob(request, env, deps);
+  if (r instanceof Response) return r;
+  const { body, job, key, claims } = r;
+  const headSha = String(body.head_sha ?? "");
+  if (!/^[0-9a-f]{40}$/.test(headSha)) return json(400, { status: "rejected", reason: "head_sha must be a 40-character commit id" });
+  if (!Array.isArray(body.files) || body.files.length > MAX_FILES) {
+    return json(400, { status: "rejected", reason: `files must be an array of at most ${MAX_FILES}` });
+  }
+  // Incremental only against the commit the Worker itself recorded.
+  const since = job.since && body.since === job.since ? job.since : null;
+  // A re-run of the runner (say, after the review failed to post) reviews again.
+  const force = Boolean(job.requestedBy) || Number(claims.run_attempt) > 1;
+  const input = { title: body.title, body: body.body, files: body.files, force };
+  const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep });
+  const finish = () => askPr(env, key, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
+
+  if (out.status === 200 && out.body.status === "reviewed") {
+    const fx = deps.effects ?? createEffects(env, { config: await appConfig(env) });
+    const review = out.body.review;
+    let { body: text, comments } = review;
+    if (since) {
+      // Inline comments may only sit on lines of the PR's own diff; findings on
+      // lines a later commit undid go in the body instead.
+      const lines = await fx.prLines(job.repo.full, job.pr, comments.map((c) => c.path));
+      const off = comments.filter((c) => !lines.get(c.path)?.has(c.line));
+      comments = comments.filter((c) => lines.get(c.path)?.has(c.line));
+      if (off.length) {
+        text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off
+          .map((c) => `- \`${c.path}:${c.line}\`: ${String(c.body).replace(/\n+/g, " ")}`)
+          .join("\n")}`;
+      }
+      text += `\n\n_Incremental review: commits after \`${since.slice(0, 7)}\`._`;
+    }
+    // If posting throws, the job is left open: a re-run of the runner (same
+    // run id, next attempt) reviews again and posts.
+    const posted = await fx.postReview(job.repo.full, job.pr, { commitId: headSha, body: text, comments });
+    await finish();
+    return json(200, { status: "reviewed", inline: posted.inline, usage: out.body.usage });
+  }
+  if (out.status === 409 || (out.status === 200 && out.body.status === "skipped")) await finish();
+  return json(out.status, out.body);
 }
 
 export default {
@@ -240,6 +396,11 @@ export default {
       const spent = await createLedger(env.LEDGER).spent();
       return json(200, { ok: true, model: cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) } });
     }
+    if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
+    if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
+    if (url.pathname === "/v1/setup/github-app/callback" && request.method === "GET") return handleSetupCallback(request, env);
+    if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
+    if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
     if (url.pathname === "/v1/review") {
       if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
       return handleReview(request, env);

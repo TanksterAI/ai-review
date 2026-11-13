@@ -10,7 +10,19 @@
     // ai-review-ledger: daily neuron spend and reviewed commits.
     { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
   ],
+  // v2: one Durable Object per pull request (SQLite-backed, on Workers Free).
+  // AppSecrets: the GitHub App's id, slug, key and webhook secret, stored by
+  // the one-time manifest flow (GET /v1/setup/github-app). No person handles them.
+  "durable_objects": {
+    "bindings": [
+      { "name": "PR_STATE", "class_name": "PrState" },
+      { "name": "APP_SECRETS", "class_name": "AppSecrets" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PrState", "AppSecrets"] }],
   "vars": {
+    // Only the App's runner, on main, may claim jobs.
+    "RUNNER_REFS": "TanksterAI/ai-review/.github/workflows/runner.yml@refs/heads/main",
     // TanksterAI's numeric organisation id: the OIDC token must carry it.
     "OWNER_ID": "259206056",
     "AUDIENCE": "tankster-ai-review",

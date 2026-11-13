@@ -78,3 +78,36 @@ export const PATCH = [
   " ",
   " export { x };",
 ].join("\n");
+
+// A Durable Object storage stand-in with the calls PrState uses.
+export function memoryStorage() {
+  const m = new Map();
+  const s = {
+    map: m,
+    alarm: null,
+    async get(k) { return m.has(k) ? structuredClone(m.get(k)) : undefined; },
+    async put(k, v) { m.set(k, structuredClone(v)); },
+    async delete(k) {
+      if (Array.isArray(k)) { let n = 0; for (const x of k) n += m.delete(x) ? 1 : 0; return n; }
+      return m.delete(k);
+    },
+    async list({ prefix = "" } = {}) { return new Map([...m].filter(([k]) => k.startsWith(prefix)).sort()); },
+    async setAlarm(t) { s.alarm = t; },
+  };
+  return s;
+}
+
+// Fake GitHub side effects, recording every call.
+export function fakeEffects({ writers = [] } = {}) {
+  const calls = [];
+  return {
+    calls,
+    async dispatch(jobId) { calls.push(["dispatch", jobId]); },
+    async comment(repo, pr, body) { calls.push(["comment", repo, pr, body]); },
+    async canWrite(repo, login) { calls.push(["canWrite", repo, login]); return writers.includes(login); },
+    async cloneToken(repo) { calls.push(["cloneToken", repo]); return "ghs_clone"; },
+    async postReview(repo, pr, review) { calls.push(["postReview", repo, pr, review]); return { inline: review.comments.length }; },
+    prLinesMap: new Map(),
+    async prLines(repo, pr, paths) { calls.push(["prLines", repo, pr, paths]); return this.prLinesMap; },
+  };
+}
