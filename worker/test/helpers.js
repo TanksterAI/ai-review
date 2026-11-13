@@ -93,6 +93,7 @@ export function memoryStorage() {
     },
     async list({ prefix = "" } = {}) { return new Map([...m].filter(([k]) => k.startsWith(prefix)).sort()); },
     async setAlarm(t) { s.alarm = t; },
+    async getAlarm() { return s.alarm; },
   };
   return s;
 }
