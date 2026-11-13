@@ -36,7 +36,7 @@ test("signatures: valid, wrong secret, tampered, missing, malformed", async () =
 });
 
 test("pull_request events become review or closed", () => {
-  for (const action of ["opened", "reopened", "ready_for_review", "synchronize"]) {
+  for (const action of ["opened", "reopened", "ready_for_review", "synchronize", "converted_to_draft"]) {
     const ev = normalise("pull_request", prPayload({ action }), { ownerId: OWNER_ID });
     assert.equal(ev.kind, "review");
     assert.equal(ev.pr, 39);
