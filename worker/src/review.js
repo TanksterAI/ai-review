@@ -324,7 +324,7 @@ export function renderReview({ answer, classified, prepared, meta }) {
     `- Reviewed ${prepared.included.length} file${prepared.included.length === 1 ? "" : "s"} (${prepared.chars.toLocaleString("en-GB")} characters of diff). ${omitted}`,
     `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
     "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement.",
-    "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
+    meta.again ?? "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
     "",
     "</details>",
   );
