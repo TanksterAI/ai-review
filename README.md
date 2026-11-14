@@ -23,7 +23,7 @@ pull request opened ─▶ caller workflow (each repo)
                                  the rest go in the review body
 ```
 
-- **Free.** Workers AI gives the Cloudflare account 10,000 neurons a day at no charge. On the Workers Free plan it refuses work past that and never bills. Reviews take at most `DAILY_NEURON_CAP` (6,000) of it, so other Workers that use Workers AI keep room. A typical review costs 300-1,200 neurons, so expect roughly 5-15 reviews a day. Past the cap, or when the account's whole allocation is used, a review is deferred to the next UTC day: the job warns and stays green. If Workers AI is out of capacity the Worker tries once more after 3 seconds, then the job warns.
+- **Free.** Workers AI gives the Cloudflare account 10,000 neurons a day at no charge. On the Workers Free plan it refuses work past that and never bills. Reviews take at most `DAILY_NEURON_CAP` (6,000) of it, so other Workers that use Workers AI keep room. A typical review costs 300-1,200 neurons, so expect roughly 5-15 reviews a day. Past the cap, or when the account's whole allocation is used, a review is deferred to the next UTC day: the job warns and stays green. If Workers AI is out of capacity the Worker tries once more after 3 seconds, then the job warns. With a Gemini or Anthropic key set, reviews also use those providers (see "Model providers" below), so one provider's quota no longer stops reviews.
 - **Secretless.** The Worker holds no GitHub credential and the workflow holds no Cloudflare one. GitHub's per-job OIDC token is the only authentication, so there is nothing to create, store, rotate or leak. The Worker's address is fixed in `review.yml`, so the token goes nowhere else. Each token is good for one review, and only `review.yml` at the `v1` tag or `main` is trusted: a branch or an arbitrary commit of it is refused. The trust boundary is therefore write access to this repository: GitHub Free cannot enforce rulesets on a private repository, so anyone who can move `v1` or push to `main` decides what the Worker trusts. Keep that list to the owner and his agents.
 - **Lean on CI.** The job runs on the light lane (Cloud Run, no Docker) and makes a few HTTPS calls. It uses no Actions minutes from the hosted pool and no Cloud Build minutes.
 - **What a finding looks like** (CodeRabbit's format):
@@ -146,16 +146,43 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
 | Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) |
-| Secrets | None needed. Optional: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `DRAFT_CHAIN`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) |
+| Secrets | None needed. Optional: `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` add those providers (see below); `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
-`GET /healthz` shows the model and today's spend.
+`GET /healthz` shows today's neuron spend and each provider: whether it is set up and, if it is out of quota, until when. It never shows a key.
+
+### Model providers
+
+A review goes to the first provider in `DRAFT_CHAIN` that can take it. One that is out of quota, busy or failing hands over to the next. Each is free to us, and none may train on what we send:
+
+| Provider | How it is paid | Data terms |
+|---|---|---|
+| Gemini API (`gemini:<model>`, with `GEMINI_API_KEY`) | The free tier, on a key whose project never has billing | For users in the UK, EEA and Switzerland the paid-service terms apply to the free tier: no training ([terms](https://ai.google.dev/gemini-api/terms)) |
+| Cloudflare Workers AI (`workers-ai:<model>`) | The account's 10,000 free neurons a day; `DAILY_NEURON_CAP` of them for reviews | No training, no retention ([data usage](https://developers.cloudflare.com/workers-ai/platform/data-usage/)) |
+| Anthropic API (`anthropic:<model>`, with `ANTHROPIC_API_KEY`) | The Claude plan's monthly API credit, on a Console organisation with no card, so requests stop at zero and never bill. `ANTHROPIC_DAILY_USD_CAP` (default $5) bounds any one day | No training on API content ([Commercial Terms](https://www.anthropic.com/legal/commercial-terms), B) |
+
+- **Without `DRAFT_CHAIN`,** the chain is Gemini Flash-Lite (when its key exists), then `MODEL` on Workers AI, then Claude Haiku (when its key exists).
+- **Out of quota** marks that provider (for Gemini, that model) in KV until its reset:
+  - Workers AI (3036): 00:00 UTC;
+  - Gemini daily quotas: midnight Pacific;
+  - Gemini minute limits: their retry delay;
+  - spent Anthropic credit: six hours, then it looks again.
+- **Queued, not dropped.**
+  - When every provider is out, the PR's Durable Object holds the dispatch instead of starting a runner that can only defer. It checks again at least hourly, keeping the job fresh, and dispatches once one resets.
+  - A review that defers anyway (because the last quota went mid-run, or a provider is out while another failed) is given back to the object and queued the same way. That wait never counts as a failure.
+  - A provider that failed a review outright is skipped on that review's later tries (and by the capacity check), so it cannot keep a waiting review running and spending the others' quota.
+  - A review that fails outright, or finds every provider busy with no time given, is tried again in 15 or 5 minutes. After 3 tries in all it stops, and says so on the pull request.
+  - Waiting for quota never counts as a failure, but a job stops three days after its first run, with a note on the pull request.
+  - Automatic reviews held while the PR is paused or made a draft are dropped; ones someone asked for still run.
+- **Secrets.** Rishi creates and adds the keys himself. Add each as a Worker secret in the Cloudflare dashboard: Workers, then `tankster-ai-review`, then Settings, Variables and Secrets.
+  - Gemini: a Google AI Studio key, with billing never enabled.
+  - Anthropic: a Console key in an `ai-review` workspace with a spend limit, in the organisation linked to the plan's API credit.
 
 Deploy only what is on `main`.
 
 - **With wrangler:** `npx wrangler deploy -c worker/wrangler.jsonc`.
 - **Through the Cloudflare API** (what Claude sessions use, via the Cloudflare connector):
-  - Upload all nine modules in `worker/src`: `index.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js`, `effects.js` and `setup.js`.
+  - Upload all eleven modules in `worker/src`: `index.js`, `config.js`, `providers.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js`, `effects.js` and `setup.js`.
   - Set `main_module: "index.js"` and include the bindings and settings from `wrangler.jsonc`.
   - Add the Durable Object bindings `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}` and `{type: "durable_object_namespace", name: "APP_SECRETS", class_name: "AppSecrets"}`.
   - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
@@ -171,7 +198,7 @@ Deploy only what is on `main`.
   - an answer is cut short (with low reasoning effort);
   - or an answer tried to be JSON but doesn't parse.
 
-  An answer that still cannot be parsed fails the job with a reason, and the neurons it used are still counted.
+  An answer that still cannot be parsed moves on to the next provider; when none answers, the job fails with a reason. Whatever was used is still counted.
 
 ## Tests
 
