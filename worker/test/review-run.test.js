@@ -433,9 +433,12 @@ test("files GitHub sent without a patch are fetched only while they fit the pull
   const s = setup({ github, env: { MAX_PR_CHARS: "100000" } });
   await runAll(s);
   // About 50,000 characters each: once less than a batch of the limit is
-  // left, the rest are named as not covered and never fetched.
+  // left, the rest are named as not covered. Each is fetched once, only to
+  // check it is not minified data, and none is stored.
   const fetched = github.calls.filter((c) => c.startsWith("blob:")).length;
-  assert.ok(fetched <= 3, `${fetched} blobs were fetched`);
+  assert.ok(fetched <= 6, `${fetched} blobs were fetched`);
+  const stored = [...s.storage.map.keys()].filter((k) => /:p\d+$/.test(k)).length;
+  assert.ok(stored <= 2, `${stored} patches were stored`);
   const { body } = github.posted[0];
   assert.match(body, /Not covered \(\d+\): `data\/big[1-5]\.js` \(the pull request is over the reviewer's limit of 100,000 characters of diff\)/);
   assert.equal(github.statuses.at(-1).state, "failure");
@@ -530,4 +533,17 @@ test("a minified file GitHub sent without a patch is not counted against the lim
   const { body } = github.posted[0];
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
   assert.match(body, /`public\/app\.bundle\.js` \(a line over 240,000 characters: minified or generated\)/);
+});
+
+test("a minified file without a patch is named as not reviewable, even when the limit is nearly used up", async () => {
+  const sha1 = "1".repeat(40);
+  const files = [file("src/a.js", added(1500, "near_")), file("public/app.bundle.js", undefined, { sha: sha1, additions: 1 })];
+  const github = fakeGithub({ files, blobs: new Map([[sha1, "y".repeat(300_000)]]) });
+  // src/a.js (about 127,000 characters annotated) leaves less than a batch of the limit.
+  const s = setup({ github, env: { MAX_PR_CHARS: "150000" } });
+  await runAll(s);
+  const { body } = github.posted[0];
+  assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+  assert.match(body, /`public\/app\.bundle\.js` \(a line over 240,000 characters: minified or generated\)/);
+  assert.equal(github.statuses.at(-1).state, "success");
 });

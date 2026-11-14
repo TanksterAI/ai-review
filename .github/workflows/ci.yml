@@ -39,4 +39,7 @@ jobs:
         with:
           script: |
             core.info(`Node ${process.version}`);
-            await exec.exec(process.execPath, ["--test", "worker/test/*.test.js"]);
+            // One test file at a time: the CPU-bound checks (10 ms on Workers
+            // Free) time themselves, and test files running side by side on
+            // a two-CPU runner slowed them past their bounds.
+            await exec.exec(process.execPath, ["--test", "--test-concurrency=1", "worker/test/*.test.js"]);

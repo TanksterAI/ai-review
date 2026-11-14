@@ -165,6 +165,9 @@ test("after a single-prompt review (the runner), the first Worker review covers 
 
 test("a run step that throws does not hold up the outbox: commands are still answered", async () => {
   const m = make();
+  await m.obj.onEvent({ delivery: "d0", ev: ev() });
+  m.storage.alarm = null;
+  await m.obj.alarm(); // a run is in progress
   m.obj.stepActiveRun = async () => { throw new Error("boom"); };
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review pause" } });
   m.storage.alarm = null;
@@ -196,21 +199,24 @@ test("a review that waits for hours still records its finish: the next review is
   assert.equal(st.lastCompleteReviewed, sha("e"));
 });
 
-test("a run step failing before it starts (no App configured) backs off and is given up, never looping", async () => {
+test("a run step failing before it starts (no App configured) backs off to an hour, and after the run's lifetime is given up and said", async () => {
   const m = make();
   await m.obj.onEvent({ delivery: "d1", ev: ev() });
   m.storage.alarm = null;
   await m.obj.alarm(); // the run starts
-  assert.ok(await m.storage.get("runmeta:" + (await m.storage.list({ prefix: "job:" })).keys().next().value.slice(4)));
+  const fx = m.obj.effects;
   m.obj.effects = null; // from now on createEffects throws: the App is not set up
   let wakes = 0;
   for (let i = 0; i < 500 && m.storage.alarm !== null && m.storage.alarm !== undefined; i++) {
     if (m.storage.alarm > m.now()) m.set(m.storage.alarm);
     m.storage.alarm = null;
+    if (m.now() - NOW > 3 * 24 * 3600_000) m.obj.effects = fx; // the App is back, for the comment
     await m.obj.alarm();
     wakes++;
   }
-  assert.ok(wakes <= 8, `${wakes} wake-ups`);
-  assert.ok(m.now() - NOW > 60_000, "it backed off");
+  // 30 s doubling to an hour, then hourly for three days: about 80 wake-ups, never one every 30 s.
+  assert.ok(wakes < 100, `${wakes} wake-ups`);
+  assert.ok(m.now() - NOW > 3 * 24 * 3600_000, "kept trying for the run's lifetime");
   assert.deepEqual([...(await m.storage.list({ prefix: "run" })).keys()], []);
+  assert.ok(m.fx.calls.some((c) => c[0] === "comment" && /stopped trying/.test(c[1])), "the PR is told");
 });

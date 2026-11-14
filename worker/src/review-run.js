@@ -327,13 +327,23 @@ async function stageContent(ctx, run, save) {
     const left = ctx.cfg.maxPrChars - run.patchChars;
     // Its changed lines alone, annotated, would not fit: not fetched.
     const least = ANNOTATION_PER_LINE * ((Number(f.additions) || 0) + (Number(f.deletions) || 0));
+    done++;
     if (left < ctx.cfg.batchChars || least > left) {
-      f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+      // It cannot fit, unless it is minified data (not reviewable, so not
+      // counted): its new text says which, and is then dropped.
+      try {
+        const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
+        const long = head && head.bytes.length <= MAX_FETCH_BYTES && !NUL(head.bytes) && tooLong(longestLine(new TextDecoder().decode(head.bytes)), ctx.cfg);
+        if (long) f.minified = true;
+        else if (head && NUL(head.bytes)) f.binary = true;
+        else f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+      } catch {
+        f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+      }
       f.checked = true;
       await putFile(ctx.storage, run.id, i, f);
       continue;
     }
-    done++;
     try {
       const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
       const oldPath = f.previous_filename ?? f.filename;

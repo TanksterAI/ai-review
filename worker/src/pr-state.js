@@ -12,7 +12,7 @@ import { appConfig } from "./setup.js";
 import { createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
+import { MAX_RUN_LIFE_MS, RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -377,17 +377,18 @@ export class PrState {
     } catch (e) {
       const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
       console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
-      if (n >= 6) {
-        const run = await activeRun(this.ctx.storage);
-        if (run) {
-          await dropRun(this.ctx.storage, run.id);
-          await this.ctx.storage.delete(`job:${run.id}`);
-        }
+      // Backing off to an hour, for as long as a run may live; then the run is
+      // given up, and the PR is told (its status may still say pending).
+      const run = await activeRun(this.ctx.storage);
+      if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
+        await dropRun(this.ctx.storage, run.id);
+        await this.ctx.storage.delete(`job:${run.id}`);
         await this.ctx.storage.delete("runFailures");
+        await this.outbox({ type: "comment", template: "gave_up", reason: "the review could not run (the App may not be set up)", tries: n, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
         runNext = null;
       } else {
         await this.ctx.storage.put("runFailures", n);
-        runNext = this.now() + Math.min(3600_000, RECHECK_MS * 2 ** (n - 1));
+        runNext = run ? this.now() + Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10)) : null;
       }
     }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
