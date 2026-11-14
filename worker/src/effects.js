@@ -1,6 +1,7 @@
 // Everything the Worker does to GitHub, as the Tankster AI Review App.
 // Each call mints (or reuses) a token for exactly one repository and only the
-// permissions that call needs. The runner never receives any of these.
+// permissions that call needs. The runner receives only cloneToken's read-only
+// token, minted fresh for each run and never reused (it revokes it at the end).
 
 import { createGithubApp } from "./github-app.js";
 import { annotatePatch, codeSpan } from "./review.js";
