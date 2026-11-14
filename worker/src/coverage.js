@@ -29,7 +29,17 @@ export const CONTEXT_LINE_MAX = 2_000;
 // Data, not code: an added line too long to show is passed over in these
 // (named in the review). In any other file it is code no model read, so the
 // file is not covered and the gate fails.
-export const DATA_FILE = /\.(json|jsonl|ndjson|geojson|topojson|csv|tsv|svg|txt|xml|map|pem|b64|base64|webmanifest)$/i;
+// Pure data only: SVG can carry scripts, XML builds (pom.xml, build.xml),
+// and JSON configures and runs things (package.json scripts, tasks.json,
+// devcontainer.json), so those are code. JSON counts as data only under a
+// data or fixtures folder; text files except dependency lists.
+const DATA_EXT = /\.(csv|tsv|jsonl|ndjson|geojson|topojson|b64|base64)$/i;
+const DATA_JSON = /(^|\/)(data|datasets?|fixtures?|testdata|__fixtures__)\/[^/]*\.json$/i;
+const DATA_TXT = /\.txt$/i;
+const NOT_DATA_TXT = /(^|\/)(requirements[^/]*|constraints[^/]*|CMakeLists)\.txt$/i;
+export const DATA_FILE = {
+  test: (path) => DATA_EXT.test(path) || DATA_JSON.test(path) || (DATA_TXT.test(path) && !NOT_DATA_TXT.test(path)),
+};
 const hiddenMarker = (n) => `[ai-review: a line of ${n.toLocaleString("en-GB")} characters, not shown]`;
 
 /**
