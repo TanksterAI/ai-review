@@ -196,3 +196,63 @@ test("a retry after an answer cut short asks for less thinking, on every provide
   assert.deepEqual(h.calls[0].body.generationConfig.thinkingConfig, { thinkingLevel: "low" });
   assert.equal(h.calls[1].body.generationConfig.thinkingConfig, undefined, "only Gemini 3 takes a level");
 });
+
+test("capacity needs a verifier too: both are needed, so it waits for the later of the two earliest resets", async () => {
+  const kv = memoryKv();
+  const env = {
+    LEDGER: kv, AI: {}, GEMINI_API_KEY: "k",
+    DRAFT_CHAIN: "workers-ai:@cf/zai-org/glm-4.7-flash",
+    VERIFY_CHAIN: "anthropic:claude-haiku-5-5", // no key: cannot run
+    VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite",
+  };
+  const chain = draftChain(env, cfg);
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: true, provider: "workers-ai:@cf/zai-org/glm-4.7-flash" });
+  // The only verifier is out for 3 hours: a drafter alone is not enough.
+  await markExhausted(kv, "gemini:gemini-3.5-flash-lite", NOW + 3 * 3600_000, NOW);
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: false, retryAt: NOW + 3 * 3600_000 });
+  // The drafter is out too, until midnight: the later of the two.
+  kv.map.set("spent:2026-11-14", "6000");
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: false, retryAt: nextUtcMidnight(NOW) });
+  await markExhausted(kv, "gemini:gemini-3.5-flash-lite", NOW + 30 * 3600_000, NOW);
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: false, retryAt: NOW + 30 * 3600_000 });
+  // Only the verifier out again: its reset.
+  kv.map.delete("spent:2026-11-14");
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: false, retryAt: NOW + 30 * 3600_000 });
+  // VERIFY=off: the verifiers do not count.
+  assert.equal((await capacity({ ...env, VERIFY: "off" }, cfg, chain, deps(null))).ok, true);
+  // No verifier set up at all is a configuration fault, which the review itself reports (429): not held here.
+  assert.equal((await capacity({ ...env, VERIFY_FALLBACK: "" }, cfg, chain, deps(null))).ok, true);
+});
+
+test("capacity: the drafter and the verifier must be two different providers", async () => {
+  const kv = memoryKv();
+  // Gemini Flash-Lite is the only drafter and the only verifier: it cannot check itself.
+  const env = { LEDGER: kv, GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite", VERIFY_CHAIN: "", VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b" };
+  const chain = draftChain(env, cfg);
+  // No AI binding: Workers AI is not set up. Held, until midnight (nothing else resets sooner).
+  assert.deepEqual(await capacity(env, cfg, chain, deps(null)), { ok: false, retryAt: nextUtcMidnight(NOW) });
+  // Workers AI out until 06:30: that is when a second provider comes back.
+  const withAi = { ...env, AI: {} };
+  await markExhausted(kv, "workers-ai", NOW + 4 * 3600_000, NOW);
+  assert.deepEqual(await capacity(withAi, cfg, chain, deps(null)), { ok: false, retryAt: NOW + 4 * 3600_000 });
+  // Once it is back, Gemini drafts and Workers AI verifies.
+  kv.map.delete("ex:workers-ai");
+  assert.deepEqual(await capacity(withAi, cfg, chain, deps(null)), { ok: true, provider: "gemini:gemini-3.5-flash-lite" });
+  // Two drafters, one of them also the only verifier: the other drafts.
+  const two = { ...env, AI: {}, DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash", VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite" };
+  assert.deepEqual(await capacity(two, cfg, draftChain(two, cfg), deps(null)), { ok: true, provider: "workers-ai:@cf/zai-org/glm-4.7-flash" });
+});
+
+test("providers in one review share its serialiser: concurrent spends on one ledger are all counted", async () => {
+  const { createSerial } = await import("../src/budget.js");
+  const kv = memoryKv();
+  const get = kv.get;
+  kv.get = async (k) => { const v = await get(k); await new Promise((r) => setTimeout(r, 2)); return v; };
+  const ai = { async run() { return { choices: [{ message: { content: "{}" }, finish_reason: "stop" }], usage: { neurons: 10 } }; } };
+  const env = { LEDGER: kv, AI: ai };
+  const reviewDeps = { ...deps(null), serial: createSerial() };
+  // Two Workers AI models: two provider objects, one day key, one review.
+  const [a, b] = createProviders(env, cfg, [{ kind: "workers-ai", model: "@cf/openai/gpt-oss-120b" }, { kind: "workers-ai", model: "@cf/zai-org/glm-4.7-flash" }], reviewDeps);
+  await Promise.all([a.complete(req), b.complete(req), a.complete(req), b.complete(req)]);
+  assert.equal(kv.map.get("spent:2026-11-14"), "40");
+});
