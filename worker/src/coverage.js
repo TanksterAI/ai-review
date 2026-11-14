@@ -37,8 +37,11 @@ const DATA_EXT = /\.(csv|tsv|jsonl|ndjson|geojson|topojson|b64|base64)$/i;
 const DATA_JSON = /(^|\/)(data|datasets?|fixtures?|testdata|__fixtures__)\/[^/]*\.json$/i;
 const DATA_TXT = /\.txt$/i;
 const NOT_DATA_TXT = /(^|\/)(requirements[^/]*|constraints[^/]*|CMakeLists)\.txt$/i;
+// Manifests and config run or configure things wherever they sit, even in a
+// folder called data (a workspace package's postinstall runs on install).
+const CONFIG_JSON = /(^|\/)(package|package-lock|composer|tasks|launch|settings|devcontainer|tsconfig|jsconfig|renovate|app|manifest|deno|bunfig|vercel|wrangler|firebase|turbo|nx|lerna|project)(\.[\w-]+)?\.json$/i;
 export const DATA_FILE = {
-  test: (path) => DATA_EXT.test(path) || DATA_JSON.test(path) || (DATA_TXT.test(path) && !NOT_DATA_TXT.test(path)),
+  test: (path) => DATA_EXT.test(path) || (DATA_JSON.test(path) && !CONFIG_JSON.test(path)) || (DATA_TXT.test(path) && !NOT_DATA_TXT.test(path)),
 };
 const hiddenMarker = (n) => `[ai-review: a line of ${n.toLocaleString("en-GB")} characters, not shown]`;
 

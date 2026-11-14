@@ -512,13 +512,13 @@ test("when no reviewable file can be taken at all, a review still says so, and t
 test("a minified file never uses up the pull request's limit, whatever the file order", async () => {
   const bundle = `@@ -0,0 +1,1 @@\n+${"x".repeat(300_000)}`;
   for (const order of ["bundle first", "bundle last"]) {
-    const files = [file("data/app.bundle.json", bundle), file("src/a.js", added(5, "a_"))];
+    const files = [file("data/catalog.json", bundle), file("src/a.js", added(5, "a_"))];
     if (order === "bundle last") files.reverse();
     const s = setup({ github: fakeGithub({ files }), env: { MAX_PR_CHARS: "200000" } });
     await runAll(s);
     const { body } = s.github.posted[0];
     assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/, order);
-    assert.match(body, /`data\/app\.bundle\.json` \(a line over 240,000 characters: minified or generated data\)/, order);
+    assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/, order);
     assert.equal(s.github.statuses.at(-1).state, "success", order);
   }
 });
@@ -526,25 +526,25 @@ test("a minified file never uses up the pull request's limit, whatever the file 
 test("a minified file GitHub sent without a patch is not counted against the limit either", async () => {
   const sha1 = "1".repeat(40);
   const sha2 = "2".repeat(40);
-  const files = [file("data/app.bundle.json", undefined, { sha: sha1, additions: 1 }), file("src/b.js", undefined, { sha: sha2, additions: 3 })];
+  const files = [file("data/catalog.json", undefined, { sha: sha1, additions: 1 }), file("src/b.js", undefined, { sha: sha2, additions: 3 })];
   const github = fakeGithub({ files, blobs: new Map([[sha1, "y".repeat(300_000)], [sha2, "const b0 = 1;\nconst b1 = 2;\nconst b2 = 3;"]]) });
   const s = setup({ github, env: { MAX_PR_CHARS: "200000" } });
   await runAll(s);
   const { body } = github.posted[0];
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
-  assert.match(body, /`data\/app\.bundle\.json` \(a line over 240,000 characters: minified or generated data\)/);
+  assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/);
 });
 
 test("a minified file without a patch is named as not reviewable, even when the limit is nearly used up", async () => {
   const sha1 = "1".repeat(40);
-  const files = [file("src/a.js", added(1500, "near_")), file("data/app.bundle.json", undefined, { sha: sha1, additions: 1 })];
+  const files = [file("src/a.js", added(1500, "near_")), file("data/catalog.json", undefined, { sha: sha1, additions: 1 })];
   const github = fakeGithub({ files, blobs: new Map([[sha1, "y".repeat(300_000)]]) });
   // src/a.js (about 127,000 characters annotated) leaves less than a batch of the limit.
   const s = setup({ github, env: { MAX_PR_CHARS: "150000" } });
   await runAll(s);
   const { body } = github.posted[0];
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
-  assert.match(body, /`data\/app\.bundle\.json` \(a line over 240,000 characters: minified or generated data\)/);
+  assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/);
   assert.equal(github.statuses.at(-1).state, "success");
 });
 

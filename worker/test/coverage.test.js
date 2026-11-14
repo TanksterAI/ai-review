@@ -246,7 +246,7 @@ test("a line cut to a marker can carry no comment, no suggestion and no evidence
 
 test("only pure data passes over a line too long to show: manifests, config, SVG and XML are code", () => {
   const padded = (path) => file(path, `@@ -0,0 +1,1 @@\n+${"{".padEnd(300_000, " ")}}`);
-  for (const path of ["package.json", "tools/composer.json", ".vscode/tasks.json", ".devcontainer/devcontainer.json", "public/logo.svg", "pom.xml", "build.xml", "site.webmanifest", "requirements.txt", "src/app.js"]) {
+  for (const path of ["packages/data/package.json", "fixtures/composer.json", "data/tasks.json", "src/data/tsconfig.json", "package.json", "tools/composer.json", ".vscode/tasks.json", ".devcontainer/devcontainer.json", "public/logo.svg", "pom.xml", "build.xml", "site.webmanifest", "requirements.txt", "src/app.js"]) {
     const plan = planReview([padded(path)], { batchChars: 60_000 });
     assert.equal(plan.uncovered.length, 1, `${path} is not covered`);
     assert.deepEqual(plan.skipped, [], path);
