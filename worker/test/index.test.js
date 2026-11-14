@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { handleReview, placeComments } from "../src/index.js";
-import { makeSigner, claimsAt, staticJwks, memoryKv, responsesResult, PATCH, AUDIENCE, OWNER_ID, WORKFLOW_REFS } from "./helpers.js";
+import { parseFindingsBlock } from "../src/review.js";
+import { askedFindings, testSleep, makeSigner, claimsAt, staticJwks, memoryKv, responsesResult, PATCH, GROUNDED_PATCH, AUDIENCE, OWNER_ID, WORKFLOW_REFS } from "./helpers.js";
 
 const NOW_MS = 1_794_500_000_000;
 const signer = await makeSigner();
@@ -12,6 +13,8 @@ function env(ai, over = {}) {
     AUDIENCE, OWNER_ID,
     WORKFLOW_REFS: WORKFLOW_REFS.join(","),
     DAILY_NEURON_CAP: "6000",
+    // These tests predate the verifier (verify.test.js covers it).
+    VERIFY: "off",
     LEDGER: memoryKv(),
     AI: ai,
     ...over,
@@ -47,11 +50,13 @@ async function req(body, { token, claims } = {}) {
 }
 
 const sleeps = [];
-const deps = { jwks: staticJwks([signer.jwk]), now: () => NOW_MS, sleep: async (ms) => { sleeps.push(ms); } };
-const goodBody = { pr: 39, head_sha: SHA, title: "t", body: "b", files: [{ filename: "src/a.js", status: "modified", patch: PATCH }] };
+// A retry pause is recorded and passes at once; a deadline's timer (a minute
+// or more) never fires unless a test makes it.
+const deps = { jwks: staticJwks([signer.jwk]), now: () => NOW_MS, sleep: (ms) => (ms >= 60_000 ? new Promise(() => {}) : (sleeps.push(ms), Promise.resolve())) };
+const goodBody = { pr: 39, head_sha: SHA, title: "t", body: "b", files: [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }] };
 const answer = JSON.stringify({
   summary: "Adds y.",
-  findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." }],
+  findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", evidence: "const ratio = total / 0;", body: "Guard it." }],
 });
 
 test("reviews, records spend and marks the commit done", async () => {
@@ -122,7 +127,7 @@ test("bad input is rejected", async () => {
 
 test("nothing reviewable is a skip, not a model call", async () => {
   const ai = aiReturning(answer);
-  const res = await handleReview(await req({ ...goodBody, files: [{ filename: "package-lock.json", patch: PATCH }] }), env(ai), deps);
+  const res = await handleReview(await req({ ...goodBody, files: [{ filename: "package-lock.json", patch: GROUNDED_PATCH }] }), env(ai), deps);
   assert.equal(res.status, 200);
   assert.equal((await res.json()).status, "skipped");
   assert.equal(ai.calls.length, 0);
@@ -400,4 +405,237 @@ test("the chain: one provider failing and another only out of quota waits (429),
   const res = await handleReview(await req(goodBody), e, { ...deps, fetch: geminiFetch([cut]) });
   assert.equal(res.status, 429);
   assert.match((await res.json()).reason, /Workers AI allocation/);
+});
+
+// --- verified findings, end to end: draft, ground, verify, render -----------
+
+test("draft, ground, verify and render: only confirmed findings are shown, and the footer says so", async () => {
+  const draft = JSON.stringify({ summary: "DrafterSaysAllIsWell.", findings: [
+    { path: "src/a.js", line: 3, severity: "major", type: "issue", category: "bug", title: "Division by zero", evidence: "const ratio = total / 0;", claim: "y is x / 0.", symbols: ["total", "ratio"], body: "Guard it.",
+      suggestion: "const y = x === 0 ? 0 : 1 / x;", agent_prompt: "UnpassedPrompt: rewrite the module." },
+    // The first evidence line has no content and is ignored; the second grounds it.
+    { path: "src/a.js", line: 2, severity: "minor", type: "issue", category: "bug", title: "Constant changed wrongly", evidence: "}\nconst ratio = total / 0;", claim: "x should stay 1.", body: "Hidden body one." },
+    { path: "src/a.js", line: 1, severity: "minor", type: "nitpick", category: "maintainability", title: "Import style", evidence: "import { loadStore } from './store.js';", body: "Use double quotes." },
+    { path: "src/a.js", line: 3, severity: "minor", type: "issue", category: "bug", title: "Calls `missingHelper`", evidence: "const ratio = total / 0;", body: "Hidden body two." },
+    { path: "src/a.js", line: 5, severity: "minor", type: "issue", category: "bug", title: "Invented line", evidence: "return cache;", body: "Hidden body three." },
+    { path: "src/a.js", line: 2, severity: "major", type: "issue", category: "bug", title: "Second major", evidence: ["const total = 2;", "const ratio = total / 0;"], body: "Hidden body four." },
+    { path: "src/a.js", line: 4, severity: "minor", type: "issue", category: "bug", title: "Lone brace", evidence: "}", body: "Hidden body five." },
+  ] });
+  const calls = [];
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    const reply = (status, data) => ({ ok: status === 200, status, headers: { get: () => null }, async json() { return data; } });
+    if (url.includes("generativelanguage")) {
+      calls.push("gemini");
+      return reply(429, { error: { details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }] } });
+    }
+    const findings = askedFindings(body.messages[0].content);
+    calls.push(`${body.model}:${findings.length}`);
+    const say = (f) => {
+      if (f.title === "Constant changed wrongly") return "refuted";
+      if (f.title === "Second major" && body.model === "claude-sonnet-5-5") return "refuted";
+      return "confirmed";
+    };
+    // Both pass the suggestion; Sonnet does not pass the prompt.
+    const text = JSON.stringify({ verdicts: findings.map((f) => ({ id: f.id, verdict: say(f), severity: f.severity, suggestion_ok: true, prompt_ok: body.model !== "claude-sonnet-5-5", reason: "VerifierOwnWords" })) });
+    return reply(200, { content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 5000, output_tokens: 200 } });
+  };
+  const ai = aiReturning(draft);
+  const e = env(ai, {
+    VERIFY: "", GEMINI_API_KEY: "g", ANTHROPIC_API_KEY: "sk", ANTHROPIC_DAILY_USD_CAP: "5",
+    DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash",
+  });
+  const res = await handleReview(await req(goodBody), e, { ...deps, sleep: testSleep, fetch });
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  // Gemini was out for the day; Workers AI drafted; Haiku checked the four
+  // findings that passed the grounding gate in one call (one file); Sonnet the
+  // two majors Haiku confirmed.
+  assert.deepEqual(calls, ["gemini", "claude-haiku-5-5:4", "claude-sonnet-5-5:2"]);
+  assert.equal(ai.calls[0].model, "@cf/zai-org/glm-4.7-flash");
+  const { body, comments } = out.review;
+  assert.deepEqual(comments.map((c) => c.line), [3]);
+  assert.match(comments[0].body, /Division by zero/);
+  // The suggestion both verifiers passed is kept; the prompt Sonnet did not pass is gone.
+  assert.match(comments[0].body, /```suggestion\nconst y = x === 0 \? 0 : 1 \/ x;\n```/);
+  assert.doesNotMatch(comments[0].body, /Prompt for AI agents/);
+  // The summary is the Worker's; the drafter's and the verifiers' own words are nowhere.
+  assert.match(body, /### AI review \(advisory\)\n\nReviewed 1 file\. 1 finding confirmed: 1 major \(plus 1 nitpick\)\.\n/);
+  assert.match(body, /2 findings: 1 inline, 1 below\./);
+  assert.match(body, /🧹 Nitpick comments \(1\)[\s\S]*Import style/);
+  assert.match(body, /\n- Verified: 2 findings confirmed by `claude-haiku-5-5` \(1 also by `claude-sonnet-5-5`\); 5 not shown \(1 refuted, 1 unconfirmed, 2 failed the evidence check, 1 named something not in the change\)\.\n/);
+  // Drafting on Workers AI, verifying on the plan's credit: $0.0006 for Haiku, $0.012 for Sonnet.
+  assert.match(body, /\n- Cost: 66 neurons; 5934 of today's 6000 left for reviews\. Verification: \$0\.0126 of the plan's API credit; \$4\.99 of today's \$5\.00 left\.\n/);
+  for (const t of ["Constant changed wrongly", "missingHelper", "Invented line", "Second major", "Lone brace", "Hidden body", "x should stay 1", "return cache", "DrafterSaysAllIsWell", "VerifierOwnWords", "UnpassedPrompt"]) {
+    assert.ok(!body.includes(t) && !comments.some((c) => c.body.includes(t)), t);
+  }
+  const block = parseFindingsBlock(body);
+  assert.deepEqual(block.findings.map((f) => [f.title ?? null, f.status, f.reason]), [
+    ["Division by zero", "confirmed", "confirmed by claude-haiku-5-5 and claude-sonnet-5-5"],
+    ["Import style", "confirmed", "confirmed by claude-haiku-5-5"],
+    // Hidden ones in severity order, as the drafter's findings are ranked.
+    [null, "unconfirmed", "claude-haiku-5-5 confirmed it; claude-sonnet-5-5 refuted it"],
+    [null, "refuted", "refuted by claude-haiku-5-5"],
+    [null, "dropped", "names something not in the change"],
+    [null, "dropped", "evidence not in the code"],
+    [null, "dropped", "evidence too thin"],
+  ]);
+  assert.deepEqual(block.findings[0].verified_by, ["anthropic:claude-haiku-5-5", "anthropic:claude-sonnet-5-5"]);
+  assert.deepEqual(out.usage.verification, { calls: 2, neurons: 0, usd: 0.0126 });
+  assert.ok(e.LEDGER.map.has(`done:TanksterAI/browser-relay#39@${SHA}`));
+});
+
+test("no verifier can run: the review waits (429) and nothing is posted or marked done", async () => {
+  const ai = aiReturning(answer);
+  // Workers AI drafts; no Anthropic key and no fallback: nothing independent to verify with.
+  const e = env(ai, { VERIFY: "", VERIFY_FALLBACK: "" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, sleep: testSleep });
+  assert.equal(res.status, 429);
+  const out = await res.json();
+  assert.equal(out.status, "deferred");
+  assert.match(out.reason, /no independent verifier is configured/);
+  assert.equal(out.resets_at, "2026-11-13T00:00:00.000Z");
+  assert.deepEqual(out.failed, []);
+  assert.ok(out.chars > 1000);
+  assert.equal(out.review, undefined);
+  assert.ok(![...e.LEDGER.map.keys()].some((k) => k.startsWith("done:")));
+  // The drafter's spend happened, and is recorded.
+  assert.equal(e.LEDGER.map.get("spent:2026-11-12"), "66");
+});
+
+test("a fallback verifier of the drafter's kind is used, and the footer says the check is weaker", async () => {
+  const draft = JSON.stringify({ summary: "s", findings: [{ path: "src/a.js", line: 3, severity: "minor", category: "bug", title: "Division by zero", evidence: "const ratio = total / 0;", body: "Guard it." }] });
+  const calls = [];
+  const ai = {
+    calls,
+    async run(model, input) {
+      calls.push(model);
+      if (model === "@cf/openai/gpt-oss-120b") return responsesResult(draft);
+      const findings = askedFindings(input.messages[1].content);
+      return { choices: [{ message: { content: JSON.stringify({ verdicts: findings.map((f) => ({ id: f.id, verdict: "confirmed", severity: "minor", suggestion_ok: false, prompt_ok: false, reason: "ok" })) }) }, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 100 } };
+    },
+  };
+  const res = await handleReview(await req(goodBody), env(ai, { VERIFY: "" }), { ...deps, sleep: testSleep });
+  assert.equal(res.status, 200);
+  const { body } = (await res.json()).review;
+  assert.deepEqual(calls, ["@cf/openai/gpt-oss-120b", "@cf/zai-org/glm-4.7-flash"]);
+  assert.match(body, /- Verified: 1 finding confirmed by `@cf\/zai-org\/glm-4\.7-flash`; nothing hidden\. Some findings were checked by a fallback model \(`@cf\/zai-org\/glm-4\.7-flash`\), because the usual verifier could not run\. Some were checked by a model of the same kind as the one that wrote them, which is a weaker check\./);
+  assert.match(body, /- Cost: 66 neurons; \d+ of today's 6000 left for reviews\. Verification: 9 neurons\./);
+  assert.equal(parseFindingsBlock(body).findings[0].weak, true);
+});
+
+// An Anthropic stand-in for the verifier: every finding confirmed, after
+// `delay(findings)` real milliseconds.
+function slowVerifier(delay) {
+  return async (url, init) => {
+    const body = JSON.parse(init.body);
+    const findings = askedFindings(body.messages[0].content);
+    const ms = delay(findings);
+    if (ms) await new Promise((r) => setTimeout(r, ms));
+    const text = JSON.stringify({ verdicts: findings.map((f) => ({ id: f.id, verdict: "confirmed", severity: "minor", suggestion_ok: true, prompt_ok: true, reason: "r" })) });
+    return { ok: true, status: 200, headers: { get: () => null }, async json() { return { content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 1000, output_tokens: 100 } }; } };
+  };
+}
+const shortTimer = { sleep: () => new Promise((r) => setTimeout(r, 30)) };
+
+test("the verifier answering too late: 503, nothing posted, nothing marked done", async () => {
+  const e = env(aiReturning(answer.replace('"major"', '"minor"')), { VERIFY: "", ANTHROPIC_API_KEY: "sk" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, ...shortTimer, fetch: slowVerifier(() => 200) });
+  assert.equal(res.status, 503);
+  const out = await res.json();
+  assert.deepEqual(out, { status: "unavailable", reason: "the verifier did not answer in time" });
+  assert.ok(![...e.LEDGER.map.keys()].some((k) => k.startsWith("done:")));
+});
+
+test("part of verification late: those findings are unconfirmed, and the cost says 'at least'", async () => {
+  const draft = JSON.stringify({ summary: "s", findings: [
+    { path: "src/a.js", line: 3, severity: "minor", category: "bug", title: "Fast one", evidence: "const ratio = total / 0;", body: "b" },
+    { path: "src/a.js", line: 2, severity: "minor", category: "bug", title: "Fast two", evidence: "const total = 2;", body: "b" },
+    { path: "src/b.js", line: 1, severity: "minor", category: "bug", title: "Slow one", evidence: "const discount = price / 0;", body: "b" },
+  ] });
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }, { filename: "src/b.js", status: "added", patch: "@@ -0,0 +1,1 @@\n+const discount = price / 0;" }];
+  const e = env(aiReturning(draft), { VERIFY: "", ANTHROPIC_API_KEY: "sk" });
+  const res = await handleReview(await req({ ...goodBody, files }), e, { ...deps, ...shortTimer, fetch: slowVerifier((f) => (f.some((x) => x.title === "Slow one") ? 200 : 0)) });
+  assert.equal(res.status, 200);
+  const { body, comments } = (await res.json()).review;
+  assert.deepEqual(comments.map((c) => c.path), ["src/a.js", "src/a.js"]);
+  assert.doesNotMatch(body, /Slow one/);
+  assert.match(body, /- Verified: 2 findings confirmed by `claude-haiku-5-5`; 1 not shown \(1 unconfirmed\)\./);
+  assert.match(body, /Verification: at least \$0\.\d{4} of the plan's API credit/);
+});
+
+test("drafting stops a minute before the review's deadline: no retry, no next provider, 503", async () => {
+  // Each model call takes 250 s on the clock: past 270 s less a minute.
+  let t = NOW_MS;
+  const calls = [];
+  const ai = { calls, async run(model) { calls.push(model); t += 250_000; return responsesResult('{"summary": "s", "findings": ['); } };
+  const e = env(ai, { DRAFT_CHAIN: "workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, now: () => t });
+  assert.equal(res.status, 503);
+  assert.match((await res.json()).reason, /ran out of time/);
+  assert.deepEqual(calls, ["@cf/openai/gpt-oss-120b"], "neither the retry nor the next provider was started");
+  // REVIEW_DEADLINE_MS sets it: with 20 minutes, the retry runs.
+  let t2 = NOW_MS;
+  const calls2 = [];
+  const ai2 = { async run(model) { calls2.push(model); t2 += 250_000; return responsesResult(calls2.length === 1 ? '{"summary": "s", "findings": [' : answer); } };
+  const res2 = await handleReview(await req(goodBody), env(ai2, { REVIEW_DEADLINE_MS: "1200000" }), { ...deps, now: () => t2 });
+  assert.equal(res2.status, 200);
+  assert.equal(calls2.length, 2);
+});
+
+test("a drafting call that has not answered by the review's deadline is given up: 503, queued, nothing done", async () => {
+  // The model takes 200 ms; the deadline's timer fires after 20.
+  const ai = { calls: 0, async run() { ai.calls++; await new Promise((r) => setTimeout(r, 200)); return responsesResult(answer); } };
+  const e = env(ai);
+  const timer = (ms) => (ms >= 60_000 ? new Promise((r) => setTimeout(r, 20)) : Promise.resolve());
+  const res = await handleReview(await req(goodBody), e, { ...deps, sleep: timer });
+  assert.equal(res.status, 503);
+  assert.deepEqual(await res.json(), { status: "unavailable", reason: "the review ran out of time before a model answered" });
+  assert.equal(ai.calls, 1);
+  assert.ok(![...e.LEDGER.map.keys()].some((k) => k.startsWith("done:")));
+});
+
+test("the planned drafter: when the first free drafter is the only free verifier, another drafts", async () => {
+  // Gemini Flash-Lite is first in the drafting chain and the only verifier;
+  // Workers AI glm is free to draft. So glm drafts and Gemini verifies.
+  const ai = aiReturning(answer.replace('"major"', '"minor"'));
+  const calls = [];
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    const findings = askedFindings(body.contents[0].parts[0].text);
+    calls.push(findings.length ? "verify" : "draft");
+    const text = findings.length
+      ? JSON.stringify({ verdicts: findings.map((f) => ({ id: f.id, verdict: "confirmed", severity: "minor", suggestion_ok: true, prompt_ok: true, reason: "r" })) })
+      : answer;
+    return { ok: true, status: 200, headers: { get: () => null }, async json() { return { candidates: [{ finishReason: "STOP", content: { parts: [{ text }] } }] }; } };
+  };
+  const over = { VERIFY: "", GEMINI_API_KEY: "g", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash", VERIFY_CHAIN: "", VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite" };
+  const res = await handleReview(await req(goodBody), env(ai, over), { ...deps, fetch });
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  assert.equal(out.usage.model, "@cf/zai-org/glm-4.7-flash");
+  assert.deepEqual(ai.calls.map((c) => c.model), ["@cf/zai-org/glm-4.7-flash"]);
+  assert.deepEqual(calls, ["verify"], "Gemini only verified");
+  assert.match(out.review.body, /- Verified: 1 finding confirmed by `gemini-3\.5-flash-lite`/);
+  // With verification off there is no plan: the chain's order stands.
+  const ai2 = aiReturning(answer);
+  const calls2 = [];
+  const fetch2 = async (u, i) => { calls2.push("draft"); return fetch(u, i); };
+  const res2 = await handleReview(await req(goodBody), env(ai2, { ...over, VERIFY: "off" }), { ...deps, fetch: fetch2 });
+  assert.equal((await res2.json()).usage.model, "gemini-3.5-flash-lite");
+  assert.equal(ai2.calls.length, 0);
+});
+
+test("a drafting call that never answers: the deadline's timer ends it, 503, nothing posted or marked done", async () => {
+  const ai = { calls: 0, run() { ai.calls++; return new Promise(() => {}); } };
+  const e = env(ai);
+  // Every wait ends at once: so the deadline comes while the model is still silent.
+  const atDeadline = () => Promise.resolve();
+  const res = await handleReview(await req(goodBody), e, { ...deps, sleep: atDeadline });
+  assert.equal(res.status, 503);
+  const out = await res.json();
+  assert.deepEqual(out, { status: "unavailable", reason: "the review ran out of time before a model answered" });
+  assert.equal(out.review, undefined, "nothing to post");
+  assert.equal(ai.calls, 1);
+  assert.ok(![...e.LEDGER.map.keys()].some((k) => k.startsWith("done:")));
 });
