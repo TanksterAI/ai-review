@@ -32,44 +32,54 @@ export function estimateNeurons(model, inputChars, outputReserveTokens) {
   return neuronsFor(model, Math.ceil(inputChars / 3), outputReserveTokens);
 }
 
-export function createLedger(kv, nowMs = () => Date.now()) {
-  const key = () => `spent:${utcDay(nowMs())}`;
+// Adds run one at a time: a read, then a write, so two adds at once (the
+// verifier's batches run concurrently) would lose one. A serialiser is a
+// queue for that; runReview makes one per review and hands it to every
+// provider's ledger (deps.serial), so ledgers on the same day key take turns
+// within the review, and nothing is shared between reviews. A ledger made
+// without one gets its own. Across reviews and isolates KV stays eventually
+// consistent (see README.md, "Budget accuracy").
+export function createSerial() {
+  let last = Promise.resolve();
+  return (work) => {
+    const run = last.then(work);
+    last = run.catch(() => {});
+    return run;
+  };
+}
+
+function dailyLedger(kv, prefix, nowMs, serial) {
+  const key = () => `${prefix}:${utcDay(nowMs())}`;
+  const read = async (k) => {
+    const v = Number(await kv.get(k));
+    return Number.isFinite(v) ? v : 0;
+  };
   return {
     async spent() {
-      const v = Number(await kv.get(key()));
-      return Number.isFinite(v) ? v : 0;
+      return read(key());
     },
-    async add(neurons) {
-      if (!(neurons > 0)) return this.spent();
-      const k = key();
-      const v = Number(await kv.get(k));
-      const next = (Number.isFinite(v) ? v : 0) + neurons;
-      // Kept two days so a late read near midnight still finds it.
-      await kv.put(k, String(next), { expirationTtl: 2 * 24 * 3600 });
-      return next;
+    add(amount) {
+      return serial(async () => {
+        const k = key();
+        if (!(amount > 0)) return read(k);
+        const next = (await read(k)) + amount;
+        // Kept two days so a late read near midnight still finds it.
+        await kv.put(k, String(next), { expirationTtl: 2 * 24 * 3600 });
+        return next;
+      });
     },
   };
+}
+
+export function createLedger(kv, nowMs = () => Date.now(), serial = createSerial()) {
+  return dailyLedger(kv, "spent", nowMs, serial);
 }
 
 // Dollars a day on a paid-from-credit provider (the Anthropic API), kept apart
 // from neurons. The plan's monthly credit stops requests at zero and never
 // bills; this cap stops any one day from spending the month.
-export function createUsdLedger(kv, nowMs = () => Date.now()) {
-  const key = () => `usd:${utcDay(nowMs())}`;
-  return {
-    async spent() {
-      const v = Number(await kv.get(key()));
-      return Number.isFinite(v) ? v : 0;
-    },
-    async add(usd) {
-      if (!(usd > 0)) return this.spent();
-      const k = key();
-      const v = Number(await kv.get(k));
-      const next = (Number.isFinite(v) ? v : 0) + usd;
-      await kv.put(k, String(next), { expirationTtl: 2 * 24 * 3600 });
-      return next;
-    },
-  };
+export function createUsdLedger(kv, nowMs = () => Date.now(), serial = createSerial()) {
+  return dailyLedger(kv, "usd", nowMs, serial);
 }
 
 // A provider (or one of its models) that said it is out of quota, until the
