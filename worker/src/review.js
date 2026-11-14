@@ -543,9 +543,9 @@ export function renderReview({ answer, classified, prepared, meta }) {
   lines.push(
     "<details><summary>About this review</summary>",
     "",
-    `- Model: \`${meta.model}\` on Cloudflare Workers AI, free daily allocation; it never bills.`,
+    meta.modelLine ?? `- Model: \`${meta.model}\` on Cloudflare Workers AI, free daily allocation; it never bills.`,
     `- Reviewed ${prepared.included.length} file${prepared.included.length === 1 ? "" : "s"} (${prepared.chars.toLocaleString("en-GB")} characters of diff). ${omitted}`,
-    `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
+    meta.costLine ?? `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
     "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement.",
     meta.again ?? "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
     "- Suggestions can be committed from the comment; check them first, like any change. Each finding also has a prompt for AI coding agents, and an id that stays the same while its title does.",
