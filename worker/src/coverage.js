@@ -23,6 +23,41 @@ export const BATCH_CHARS = 60_000;
 // A line longer than this many batches is minified or generated data: not
 // reviewable, and too big to store or send.
 export const LONG_LINE_BATCHES = 4;
+// Unchanged and removed lines are context, not under review: past this length
+// they are cut to a marker, so a long one never crowds out the change.
+export const CONTEXT_LINE_MAX = 2_000;
+const HIDDEN = /^\[ai-review: a line of [\d,]+ characters, not shown\]$/;
+const hiddenMarker = (n) => `[ai-review: a line of ${n.toLocaleString("en-GB")} characters, not shown]`;
+
+/**
+ * Long lines, judged line by line (never the whole file by one line):
+ * an unchanged or removed line over CONTEXT_LINE_MAX, and an added line over
+ * LONG_LINE_BATCHES batches, become a short marker in their place. Line
+ * numbers are kept. Returns {patch, added, hidden}: the added lines, and how
+ * many of them are markers (cut now or before: this is idempotent).
+ */
+export function trimLongLines(patch, batchChars = BATCH_CHARS) {
+  const addedMax = LONG_LINE_BATCHES * batchChars;
+  const out = [];
+  let added = 0;
+  let hidden = 0;
+  let changed = false;
+  for (const line of String(patch).split("\n")) {
+    const tag = line[0];
+    if (tag === "+" && !line.startsWith("+++")) {
+      added++;
+      const body = line.slice(1);
+      if (HIDDEN.test(body)) hidden++;
+      else if (body.length > addedMax) { out.push(`+${hiddenMarker(body.length)}`); hidden++; changed = true; continue; }
+    } else if ((tag === " " || tag === "-") && line.length - 1 > CONTEXT_LINE_MAX) {
+      out.push(`${tag}${hiddenMarker(line.length - 1)}`);
+      changed = true;
+      continue;
+    }
+    out.push(line);
+  }
+  return { patch: changed ? out.join("\n") : String(patch), added, hidden };
+}
 export const MAX_PR_CHARS = 5_000_000;
 // Room kept for a block's header line.
 const HEADER_ROOM = 160;
@@ -146,11 +181,16 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
     if (typeof f.unfetched === "string") { uncovered.push({ path, reason: f.unfetched }); continue; }
     if (f.patch_omitted === true) { uncovered.push({ path, reason: "its diff was not sent" }); continue; }
     if (typeof f.patch !== "string" || f.patch.length === 0) { skipped.push({ path, reason: "binary or no textual diff" }); continue; }
-    if (longestLine(f.patch) > LONG_LINE_BATCHES * batchChars) { skipped.push({ path, reason: long }); continue; }
-    // The limit is checked on the raw patch first, so a file far past it is
+    const t = trimLongLines(f.patch, batchChars);
+    // Every added line too long to show: minified or generated data.
+    if (t.added > 0 && t.hidden === t.added) { skipped.push({ path, reason: long }); continue; }
+    // The limit is checked on the patch first, so a file far past it is
     // never annotated (annotation adds about 8 characters a line).
-    if (chars + f.patch.length > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
-    const parts = splitFile(f, batchChars);
+    if (chars + t.patch.length > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
+    if (t.hidden > 0) {
+      skipped.push({ path, reason: `${t.hidden} added line${t.hidden === 1 ? "" : "s"} over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters not shown (minified or generated); the rest was reviewed` });
+    }
+    const parts = splitFile({ ...f, patch: t.patch }, batchChars);
     const size = parts.reduce((n, p) => n + p.chars, 0);
     if (chars + size > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
     chars += size;

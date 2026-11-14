@@ -547,3 +547,17 @@ test("a minified file without a patch is named as not reviewable, even when the 
   assert.match(body, /`public\/app\.bundle\.js` \(a line over 240,000 characters: minified or generated\)/);
   assert.equal(github.statuses.at(-1).state, "success");
 });
+
+test("a file without a patch, with a long unchanged line and a small change, is reviewed or named over the limit, never 'not reviewable'", async () => {
+  // The change is two lines below the long line, so the long line is in its context.
+  const head = `const icon = "${"D".repeat(300_000)}";\nconst k0 = 0;\nconst changed = compute();\nconst k1 = 1;`;
+  const base = `const icon = "${"D".repeat(300_000)}";\nconst k0 = 0;\nconst changed = 1;\nconst k1 = 1;`;
+  const files = [file("src/icons.js", undefined, { status: "modified", sha: "1".repeat(40), additions: 1, deletions: 1 })];
+  const github = fakeGithub({ files, blobs: new Map([["1".repeat(40), head], ["2".repeat(40), base]]), shas: new Map([[`src/icons.js@${MERGE_BASE}`, "2".repeat(40)]]) });
+  const s = setup({ github, models: fakeModels({ flag: "src/icons.js" }) });
+  await runAll(s);
+  const shown = s.models.calls.find((c) => c.files?.includes("src/icons.js"));
+  assert.ok(shown, "the change was shown to a model");
+  assert.match(shown.text, /\+ const changed = compute\(\);/);
+  assert.match(github.posted[0].body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+});

@@ -27,7 +27,7 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
-import { BATCH_CHARS, LONG_LINE_BATCHES, batchPrepared, coverageOf, longestLine, planReview, prLimitReason, skipReason } from "./coverage.js";
+import { batchPrepared, coverageOf, planReview, prLimitReason, skipReason, trimLongLines } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
 import { createProviders, draftChain } from "./providers.js";
@@ -83,16 +83,21 @@ export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.hea
 // limit before it loads any text.
 const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries", "minified"];
 
-async function putFile(storage, id, i, f) {
+async function putFile(storage, id, i, f, batchChars) {
   const rec = {};
   for (const k of META_FIELDS) if (f[k] !== undefined) rec[k] = f[k];
-  const patch = typeof f.patch === "string" ? f.patch : null;
+  // Long lines are cut before anything is stored or counted (coverage.js).
+  let patch = typeof f.patch === "string" ? f.patch : null;
+  if (patch !== null) {
+    const t = trimLongLines(patch, batchChars);
+    patch = t.patch;
+    rec.allHidden = t.added > 0 && t.hidden === t.added;
+  }
   rec.patchLen = patch === null ? -1 : patch.length;
   if (patch !== null) {
     let n = 1;
     for (let k = patch.indexOf("\n"); k >= 0; k = patch.indexOf("\n", k + 1)) n++;
     rec.patchLines = n;
-    rec.longest = longestLine(patch);
   }
   rec.pieces = patch === null ? 0 : Math.max(1, Math.ceil(patch.length / PIECE));
   for (let k = 0; k < rec.pieces; k++) await storage.put(pieceKey(id, i, k), patch.slice(k * PIECE, (k + 1) * PIECE));
@@ -105,14 +110,13 @@ const getMeta = (storage, id, i) => storage.get(fileKey(id, i));
 // gains its number (about 8 characters), and each part a header.
 export const ANNOTATION_PER_LINE = 8;
 const costOf = (len, lines) => len + ANNOTATION_PER_LINE * lines + 200;
-// A file planReview will skip as minified or generated (coverage.js): it
-// never counts against the limit, wherever it is in the list.
-const tooLong = (longest, cfg) => longest > LONG_LINE_BATCHES * (cfg.batchChars ?? BATCH_CHARS);
+// A file whose added lines are all too long to show is minified or
+// generated data (coverage.js): it never counts against the limit.
 
 async function getFile(storage, id, i) {
   const rec = await getMeta(storage, id, i);
   if (!rec) return rec;
-  const { pieces, patchLen, patchLines: _n, longest: _l, ...f } = rec;
+  const { pieces, patchLen, patchLines: _n, allHidden: _h, ...f } = rec;
   if (patchLen < 0) return f;
   const parts = [];
   for (let k = 0; k < pieces; k++) parts.push(await storage.get(pieceKey(id, i, k)));
@@ -266,7 +270,7 @@ async function stagePr(ctx, run, save) {
       const cmp = await ctx.fx.compare(run.repo.full, run.since, run.headSha);
       const files = Array.isArray(cmp?.files) ? cmp.files : [];
       if (cmp?.status === "ahead" && files.length < 300) {
-        for (const [i, f] of files.entries()) await putFile(ctx.storage, run.id, i, f);
+        for (const [i, f] of files.entries()) await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars);
         run.files = files.length;
         run.mergeBase = run.since;
         run.stage = "content";
@@ -287,7 +291,7 @@ async function stageFiles(ctx, run, save) {
   for (let n = 0; n < PAGES_PER_STEP; n++) {
     const page = await ctx.fx.listFiles(run.repo.full, run.pr, run.page);
     const list = Array.isArray(page) ? page : [];
-    for (const f of list) await putFile(ctx.storage, run.id, run.files++, f);
+    for (const f of list) await putFile(ctx.storage, run.id, run.files++, f, ctx.cfg.batchChars);
     run.page++;
     if (list.length < 100 || run.page > MAX_PAGES) {
       run.stage = "content";
@@ -308,7 +312,7 @@ async function stageContent(ctx, run, save) {
     run.patchChars = 0;
     for (let i = 0; i < run.files; i++) {
       const m = await getMeta(ctx.storage, run.id, i);
-      if (m && m.patchLen > 0 && !skipReason(m) && !tooLong(m.longest ?? 0, ctx.cfg)) run.patchChars += costOf(m.patchLen, m.patchLines ?? 0);
+      if (m && m.patchLen > 0 && !skipReason(m) && !m.allHidden) run.patchChars += costOf(m.patchLen, m.patchLines ?? 0);
     }
   }
   if (!run.mergeBase) {
@@ -322,28 +326,11 @@ async function stageContent(ctx, run, save) {
     const needs = f && typeof f.patch !== "string" && !skipReason(f) && !BINARY_EXT.test(f.filename) && f.status !== "removed" && !f.checked;
     if (!needs) continue;
     if (done >= CONTENTS_PER_STEP) { await save(run); return ctx.deps.now(); }
-    // A file GitHub sends without a patch is big: once less than a batch of
-    // the limit is left, none is fetched.
-    const left = ctx.cfg.maxPrChars - run.patchChars;
-    // Its changed lines alone, annotated, would not fit: not fetched.
-    const least = ANNOTATION_PER_LINE * ((Number(f.additions) || 0) + (Number(f.deletions) || 0));
     done++;
-    if (left < ctx.cfg.batchChars || least > left) {
-      // It cannot fit, unless it is minified data (not reviewable, so not
-      // counted): its new text says which, and is then dropped.
-      try {
-        const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
-        const long = head && head.bytes.length <= MAX_FETCH_BYTES && !NUL(head.bytes) && tooLong(longestLine(new TextDecoder().decode(head.bytes)), ctx.cfg);
-        if (long) f.minified = true;
-        else if (head && NUL(head.bytes)) f.binary = true;
-        else f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
-      } catch {
-        f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
-      }
-      f.checked = true;
-      await putFile(ctx.storage, run.id, i, f);
-      continue;
-    }
+    // Both sides are always fetched and diffed: only the added lines can say
+    // whether a file is minified data (not reviewable, not counted), and a
+    // long unchanged line is cut by trimLongLines, never taken for the file.
+    const left = ctx.cfg.maxPrChars - run.patchChars;
     try {
       const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
       const oldPath = f.previous_filename ?? f.filename;
@@ -360,20 +347,21 @@ async function stageContent(ctx, run, save) {
         } catch {
           f.unfetched = "its diff could not be worked out";
         }
-        const lines = patch ? patch.split("\n").length : 0;
-        // Minified or generated data: named as such, never kept or counted.
-        if (patch && tooLong(longestLine(patch), ctx.cfg)) f.minified = true;
-        else if (patch && costOf(patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
-        else if (patch) { f.patch = patch; f.synthetic = true; run.patchChars += costOf(patch.length, lines); }
+        const t = patch ? trimLongLines(patch, ctx.cfg.batchChars) : null;
+        const lines = t ? t.patch.split("\n").length : 0;
+        // Every added line minified or generated: named as such, never kept or counted.
+        if (t && t.added > 0 && t.hidden === t.added) f.minified = true;
+        else if (t && costOf(t.patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+        else if (t) { f.patch = t.patch; f.synthetic = true; run.patchChars += costOf(t.patch.length, lines); }
       }
       f.checked = true;
     } catch (e) {
       f.contentTries = (f.contentTries ?? 0) + 1;
-      if (f.contentTries < MAX_TRIES) { await putFile(ctx.storage, run.id, i, f); await save(run); return ctx.deps.now() + 10_000; }
+      if (f.contentTries < MAX_TRIES) { await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars); await save(run); return ctx.deps.now() + 10_000; }
       f.unfetched = "its text could not be fetched";
       f.checked = true;
     }
-    await putFile(ctx.storage, run.id, i, f);
+    await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars);
   }
   run.stage = "plan";
   await save(run);
@@ -389,8 +377,8 @@ async function stagePlan(ctx, run, save) {
   const files = [];
   let budget = ctx.cfg.maxPrChars;
   for (const { i, m } of metas) {
-    const { pieces: _p, patchLen: _l, patchLines: _n, longest: _g, ...rec } = m;
-    if (m.patchLen > 0 && tooLong(m.longest ?? 0, ctx.cfg)) { files.push({ ...rec, minified: true }); continue; }
+    const { pieces: _p, patchLen: _l, patchLines: _n, allHidden: _h, ...rec } = m;
+    if (m.patchLen > 0 && m.allHidden) { files.push({ ...rec, minified: true }); continue; }
     if (m.patchLen > 0 && !skipReason(m) && m.unfetched === undefined) {
       const cost = costOf(m.patchLen, m.patchLines ?? 0);
       if (cost > budget) { files.push({ ...rec, unfetched: prLimitReason(ctx.cfg.maxPrChars) }); continue; }

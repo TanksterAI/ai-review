@@ -158,3 +158,35 @@ test("past the size limit for one pull request, the rest is named as not covered
   for (const u of plan.uncovered) assert.match(u.reason, /^the pull request is over the reviewer's limit of 25,000 characters of diff$/);
   assert.equal(coverageOf(plan, new Set(plan.batches.map((_, i) => i))).complete, false);
 });
+
+// --- round 4 of the independent review: long lines are judged line by line --------
+
+test("a long unchanged line beside a real change never hides the change: it is cut, and the file is reviewed", () => {
+  const uri = `const logo = "data:image/png;base64,${"A".repeat(300_000)}";`;
+  const patch = ["@@ -1,4 +1,4 @@", ` ${uri}`, " const total = 10;", "-const ratio = total / 2;", "+const ratio = total / 0;", " export { ratio };"].join("\n");
+  const plan = planReview([file("src/logo.js", patch)], { batchChars: 60_000 });
+  assert.deepEqual(plan.skipped, []);
+  assert.deepEqual(plan.uncovered, []);
+  const text = plan.batches.flat().map((p) => p.block).join("\n");
+  assert.match(text, /\+ const ratio = total \/ 0;/);
+  assert.ok(text.length < 5_000, "the long line is not sent");
+  assert.match(text, /\[ai-review: a line of 300,0\d\d characters, not shown\]/);
+});
+
+test("a long removed line is cut too, and the added lines are reviewed", () => {
+  const patch = ["@@ -1,2 +1,2 @@", `-const old = "${"B".repeat(300_000)}";`, "+const fresh = load();", " export { fresh };"].join("\n");
+  const plan = planReview([file("src/a.js", patch)], { batchChars: 60_000 });
+  assert.deepEqual(plan.skipped, []);
+  assert.match(plan.batches[0][0].block, /\+ const fresh = load\(\);/);
+});
+
+test("a long added line is not shown, but the file's other added lines are, and the review names what was cut", () => {
+  const patch = ["@@ -0,0 +1,3 @@", "+const a = 1;", `+const blob = "${"C".repeat(300_000)}";`, "+const b = a + 1;"].join("\n");
+  const plan = planReview([file("src/mixed.js", patch)], { batchChars: 60_000 });
+  const text = plan.batches[0][0].block;
+  assert.match(text, /\+ const a = 1;/);
+  assert.match(text, /\+ const b = a \+ 1;/);
+  assert.ok(text.length < 5_000);
+  assert.deepEqual(plan.skipped, [{ path: "src/mixed.js", reason: "1 added line over 240,000 characters not shown (minified or generated); the rest was reviewed" }]);
+  assert.equal(coverageOf(plan, new Set([0])).complete, true);
+});
