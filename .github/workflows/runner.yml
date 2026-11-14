@@ -134,11 +134,14 @@ jobs:
               const { res, out } = await call("/v1/runner/review", payload);
               const where = `${j.repo.full}#${j.pr} at ${pr.head.sha.slice(0, 7)}`;
               if (res.status === 409) core.notice(`${where} was already reviewed.`);
-              else if (res.status === 429) core.warning(`Review deferred: ${out.reason}. The budget resets at ${out.resets_at}.`);
-              else if (res.status === 503) core.warning(`Review not run: ${out.reason ?? "the review service is unavailable"}.`);
+              else if (res.status === 429) core.warning(`Review deferred: ${out.reason}. It is queued and runs again after ${out.resets_at}.`);
+              else if (res.status === 503) core.warning(`Review not run yet: ${out.reason ?? "the review service is unavailable"}. It is queued and tried again in about 5 minutes.`);
+              else if (res.status === 502) core.warning(`Review failed: ${out.reason ?? "no reason given"}. It is queued and tried again in about 15 minutes (3 tries in all).`);
               else if (res.ok && out.status === "skipped") core.notice(`Nothing to review in ${where}: ${out.reason}.`);
               else if (res.ok && out.status === "reviewed") {
-                core.notice(`Reviewed ${where}: ${out.inline ?? 0} inline comment(s), ${Math.round(out.usage?.neurons ?? 0)} neurons.`);
+                const u = out.usage ?? {};
+                const cost = u.provider && u.provider !== "workers-ai" ? `${u.model}, $${Number(u.usd ?? 0).toFixed(4)}` : `${Math.round(u.neurons ?? 0)} neurons`;
+                core.notice(`Reviewed ${where}: ${out.inline ?? 0} inline comment(s), ${cost}.`);
               } else core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
             } finally {
               // The token dies with the run, whatever happened.
