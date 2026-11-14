@@ -27,7 +27,7 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
-import { batchPrepared, coverageOf, planReview, prLimitReason, skipReason, trimLongLines } from "./coverage.js";
+import { batchPrepared, coverageOf, onlyHidden, planReview, prLimitReason, skipReason, trimLongLines } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
 import { createProviders, draftChain } from "./providers.js";
@@ -81,7 +81,7 @@ export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.hea
 // A file's record holds its patch's length, never the patch: the patch is in
 // pieces of its own, so the plan can choose what fits the pull request's
 // limit before it loads any text.
-const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries", "minified"];
+const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries", "minified", "hiddenAdded", "hiddenLines"];
 
 async function putFile(storage, id, i, f, batchChars) {
   const rec = {};
@@ -89,9 +89,12 @@ async function putFile(storage, id, i, f, batchChars) {
   // Long lines are cut before anything is stored or counted (coverage.js).
   let patch = typeof f.patch === "string" ? f.patch : null;
   if (patch !== null) {
+    // What was cut is recorded, added to what an earlier cut recorded.
     const t = trimLongLines(patch, batchChars);
     patch = t.patch;
-    rec.allHidden = t.added > 0 && t.hidden === t.added;
+    rec.hiddenAdded = (Number(f.hiddenAdded) || 0) + t.hidden;
+    rec.hiddenLines = [...(Array.isArray(f.hiddenLines) ? f.hiddenLines : []), ...t.hiddenLines];
+    rec.allHidden = onlyHidden(t, rec.hiddenAdded);
   }
   rec.patchLen = patch === null ? -1 : patch.length;
   if (patch !== null) {
@@ -350,9 +353,9 @@ async function stageContent(ctx, run, save) {
         const t = patch ? trimLongLines(patch, ctx.cfg.batchChars) : null;
         const lines = t ? t.patch.split("\n").length : 0;
         // Every added line minified or generated: named as such, never kept or counted.
-        if (t && t.added > 0 && t.hidden === t.added) f.minified = true;
+        if (t && onlyHidden(t, t.hidden)) f.minified = true;
         else if (t && costOf(t.patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
-        else if (t) { f.patch = t.patch; f.synthetic = true; run.patchChars += costOf(t.patch.length, lines); }
+        else if (t) { f.patch = t.patch; f.hiddenAdded = t.hidden; f.hiddenLines = t.hiddenLines; f.synthetic = true; run.patchChars += costOf(t.patch.length, lines); }
       }
       f.checked = true;
     } catch (e) {
