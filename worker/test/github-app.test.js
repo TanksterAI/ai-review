@@ -59,6 +59,22 @@ test("anything that is not a private key is refused", () => {
   assert.throws(() => createGithubApp({ appId: 1 }), GithubAppError);
 });
 
+test("a fresh token is minted every time and never cached or served from the cache", async () => {
+  // Two runs on one repository: the first revokes its token when it ends, so
+  // the second must never be handed the same one.
+  const gh = fakeGithub();
+  const app = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: gh.fetcher, now: () => NOW });
+  const cached = await app.installationToken(["browser-relay"], { contents: "read" });
+  const a = await app.installationToken(["browser-relay"], { contents: "read" }, { fresh: true });
+  const b = await app.installationToken(["browser-relay"], { contents: "read" }, { fresh: true });
+  assert.notEqual(a, b);
+  assert.notEqual(a, cached);
+  assert.notEqual(b, cached);
+  // The cached token is still the one served to cached callers.
+  assert.equal(await app.installationToken(["browser-relay"], { contents: "read" }), cached);
+  assert.equal(gh.calls.filter((c) => c.url.includes("/access_tokens")).length, 3);
+});
+
 test("installation tokens are scoped to named repos and permissions, and cached", async () => {
   const gh = fakeGithub();
   let t = NOW;

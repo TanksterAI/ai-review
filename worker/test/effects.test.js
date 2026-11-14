@@ -6,7 +6,7 @@ function fakeApp(respond = () => ({})) {
   const log = { tokens: [], calls: [] };
   return {
     log,
-    async installationToken(repos, permissions) { log.tokens.push({ repos, permissions }); return `tok-${repos.join(",")}`; },
+    async installationToken(repos, permissions, opts) { log.tokens.push({ repos, permissions, ...(opts ? { opts } : {}) }); return `tok-${repos.join(",")}`; },
     async call(method, path, opts) {
       log.calls.push({ method, path, ...opts });
       const out = respond(method, path, opts);
@@ -72,10 +72,12 @@ test("canWrite: write, maintain and admin; not read, not unknown users, not odd 
   assert.deepEqual(app.log.tokens[0].permissions, { pull_requests: "write" });
 });
 
-test("cloneToken is read-only", async () => {
+test("cloneToken is read-only and fresh for every run (the runner revokes it)", async () => {
   const app = fakeApp();
   await createEffects({}, { app }).cloneToken("TanksterAI/browser-relay");
-  assert.deepEqual(app.log.tokens[0], { repos: ["browser-relay"], permissions: { contents: "read", pull_requests: "read" } });
+  assert.deepEqual(app.log.tokens[0], {
+    repos: ["browser-relay"], permissions: { contents: "read", pull_requests: "read" }, opts: { fresh: true },
+  });
 });
 
 test("postReview falls back to a body-only review on a 422", async () => {
