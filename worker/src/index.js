@@ -5,8 +5,9 @@
 //   200 {status: "reviewed", review: {body, comments}, usage}
 //   200 {status: "skipped", reason}               nothing reviewable
 //   409 {status: "duplicate"}                     this head commit was already reviewed
-//   429 {status: "deferred", reason, resets_at, chars}  every model provider is out
-//                                                 of quota or busy until resets_at
+//   429 {status: "deferred", reason, resets_at, chars}  every model provider (or
+//                                                 every verifier) is out of quota or busy
+//                                                 until resets_at
 //   503 {status: "unavailable", reason}           a provider is busy, with no time given
 //   401 / 400 / 413 / 502                         see `reason`
 // GET /healthz  -> {ok, model, budget, providers}
@@ -25,8 +26,10 @@
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
 import { buildPrompt, classifyFindings, codeSpan, parseAnswer, prepareFiles, renderReview } from "./review.js";
-import { createLedger, nextUtcMidnight, utcDay } from "./budget.js";
-import { ProviderError, createProviders, draftChain } from "./providers.js";
+import { createLedger, createSerial, nextUtcMidnight, utcDay } from "./budget.js";
+import { LATE, ProviderError, beforeDeadline, capacity, createProviders, draftChain, verifyOff } from "./providers.js";
+import { groundFindings } from "./grounding.js";
+import { applyVerdicts, verifyFindings } from "./verify.js";
 import { config } from "./config.js";
 import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { prKeyOfJob } from "./pr-state.js";
@@ -184,10 +187,22 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     tag: randomTag(),
   });
   const chars = instructions.length + modelInput.length;
-  const deps = { now, sleep, fetch: fetchImpl ?? ((...a) => fetch(...a)), log };
+  const started = now();
+  // serial: this review's queue for ledger writes, shared by its drafting
+  // and verifying providers and by no other review.
+  const deps = { now, sleep, fetch: fetchImpl ?? ((...a) => fetch(...a)), log, serial: createSerial() };
   // Providers that failed this review outright before are not asked again.
   const skipped = new Set(skip);
-  const providers = createProviders(env, cfg, draftChain(env, cfg).filter((x) => !skipped.has(`${x.kind}:${x.model}`)), deps);
+  const chain = draftChain(env, cfg).filter((x) => !skipped.has(`${x.kind}:${x.model}`));
+  // The drafter the capacity check plans for goes first: the first free one,
+  // unless it is the only free verifier and another drafter is free (no
+  // model checks its own findings). The same rule decides the dispatch.
+  if (!verifyOff(env)) {
+    const plan = await capacity(env, cfg, chain, deps, chars);
+    const at = plan.ok && plan.provider ? chain.findIndex((x) => `${x.kind}:${x.model}` === plan.provider) : -1;
+    if (at > 0) chain.unshift(...chain.splice(at, 1));
+  }
+  const providers = createProviders(env, cfg, chain, deps);
 
   // Each provider in turn, until one answers: one that is out of quota,
   // busy, or failing hands over to the next. On one provider, up to two calls:
@@ -197,7 +212,13 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   //     a suggestion is where models slip): once more, if the budget allows.
   //   Either retry asks for no suggestions, which makes the answer shorter
   //   and its JSON simpler.
-  const started = now();
+  // Every call races the review's deadline: one that has not answered by
+  // then is given up, and the review is queued (503) to try again.
+  const deadline = started + cfg.reviewDeadlineMs;
+  // Drafting stops a minute before the review's deadline, so verification
+  // still has time: no new provider and no retry after that.
+  const outOfTime = () => now() - started > cfg.reviewDeadlineMs - 60_000;
+  let timedOut = false;
   const outcomes = [];
   let answer = null;
   let used = null;
@@ -206,6 +227,7 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   let last = {};
   for (const p of providers) {
     if (!p.configured) continue;
+    if (outOfTime()) { timedOut = true; break; }
     const until = await p.exhausted();
     if (until) { outcomes.push({ id: p.id, kind: "deferred", reason: `${p.id} is out of quota`, resetAt: until }); continue; }
     const first = await p.affordable(chars, cfg.maxOutput);
@@ -221,14 +243,20 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     let low = false;
     let lastStatus = null;
     for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
+      if (attempt > 1 && outOfTime()) { timedOut = true; break; }
       let r;
       try {
-        r = await p.complete({ system: instructions + note, user: modelInput, maxOutput: cfg.maxOutput, low });
+        r = await beforeDeadline(p.complete({ system: instructions + note, user: modelInput, maxOutput: cfg.maxOutput, low }), deadline, deps);
       } catch (e) {
         if (!(e instanceof ProviderError)) throw e;
         outcomes.push({ id: p.id, kind: e.kind, reason: e.reason, resetAt: e.resetAt });
         lastStatus = "error";
         break;
+      }
+      if (r === LATE) {
+        // The call may still finish and record its spend; this review stops.
+        log({ ev: "draft_out_of_time", repository, pr, provider: p.id, attempt });
+        return res(503, { status: "unavailable", reason: "the review ran out of time before a model answered" });
       }
       neurons += r.neurons ?? 0;
       usd += r.usd ?? 0;
@@ -246,6 +274,11 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     else if (lastStatus === "unparseable") outcomes.push({ id: p.id, kind: "failed", reason: "the model did not return a usable answer; try again later" });
   }
 
+  if (!answer && timedOut) {
+    // Queued and tried again shortly, like a busy provider.
+    log({ ev: "draft_out_of_time", repository, pr, passed_over: outcomes.length });
+    return res(503, { status: "unavailable", reason: "the review ran out of time before a model answered" });
+  }
   if (!answer) {
     // Any provider out of quota, or busy until a known time: wait for the
     // first of those to come back (the review is queued, not dropped), even
@@ -265,13 +298,48 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     return res(502, { status: "failed", reason: failed?.reason ?? none });
   }
 
-  const cost = used.kind === "workers-ai"
-    ? `- Cost: ${neurons.toFixed(0)} neurons; ${Math.max(0, cfg.cap - (last.spent ?? 0)).toFixed(0)} of today's ${cfg.cap} left for reviews.`
-    : used.kind === "anthropic"
-      ? `- Cost: $${usd.toFixed(4)} of the plan's API credit; $${Math.max(0, (last.capUsd ?? 0) - (last.spentUsd ?? 0)).toFixed(2)} of today's $${(last.capUsd ?? 0).toFixed(2)} left.`
-      : "- Cost: nothing (free tier).";
+  // Every finding passes the grounding gate, then an independent verifier,
+  // before anything is shown (TAN-299). The drafter's spend has happened
+  // either way.
   const classified = classifyFindings(answer, prepared.commentable, prepared.lineText);
-  const review = renderReview({ answer, classified, prepared, meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha } });
+  const grounded = groundFindings(classified, prepared, { title: input.title, body: input.body });
+  const verified = await verifyFindings({ classified: grounded.classified, prepared, title: input.title, body: input.body, drafter: used, env, cfg, deps, started });
+  if (verified.outcome.kind !== "ok") {
+    // Never posted unverified: the review waits for a verifier, like a
+    // drafting deferral (429), or is tried again shortly (503) or later (502).
+    const o = verified.outcome;
+    log({ ev: "verify_stopped", repository, pr, kind: o.kind, findings: grounded.classified.inline.length + grounded.classified.general.length });
+    if (o.kind === "deferred") return res(429, { status: "deferred", reason: o.reason, resets_at: new Date(o.resetAt).toISOString(), chars, failed: [] });
+    if (o.kind === "unavailable") return res(503, { status: "unavailable", reason: o.reason });
+    return res(502, { status: "failed", reason: o.reason });
+  }
+  // Confirmed findings are shown, with only the suggestions and prompts the
+  // verifiers passed; the rest are hidden. Every reason is the Worker's own.
+  const { shown, hidden } = applyVerdicts(grounded.classified, grounded.dropped, verified.verdicts);
+
+  // The cost line: drafting, then verification.
+  const neuronsLeft = Math.max(0, cfg.cap - Math.max(last.spent ?? 0, verified.spentNeurons ?? 0));
+  const usdSpent = Math.max(last.spentUsd ?? 0, verified.spentUsd ?? 0);
+  const usdCap = last.capUsd ?? verified.capUsd ?? 0;
+  let cost = used.kind === "workers-ai"
+    ? `- Cost: ${neurons.toFixed(0)} neurons; ${neuronsLeft.toFixed(0)} of today's ${cfg.cap} left for reviews.`
+    : used.kind === "anthropic"
+      ? `- Cost: $${usd.toFixed(4)} of the plan's API credit; $${Math.max(0, usdCap - usdSpent).toFixed(2)} of today's $${usdCap.toFixed(2)} left.`
+      : "- Cost: nothing (free tier).";
+  if (!verified.off) {
+    const parts = [];
+    if (verified.neurons > 0) parts.push(`${verified.neurons.toFixed(0)} neurons`);
+    if (verified.usd > 0) parts.push(`$${verified.usd.toFixed(4)} of the plan's API credit`);
+    // Calls still running at the deadline are not counted here.
+    cost += ` Verification: ${verified.late ? "at least " : ""}${parts.length ? parts.join(" and ") : "nothing (free tier)"}`;
+    if (verified.usd > 0 && used.kind !== "anthropic" && verified.capUsd) cost += `; $${Math.max(0, verified.capUsd - (verified.spentUsd ?? 0)).toFixed(2)} of today's $${verified.capUsd.toFixed(2)} left`;
+    cost += ".";
+  }
+  const review = renderReview({
+    answer, classified: shown, hidden, prepared,
+    verification: { off: verified.off, weak: verified.weak, fallback: verified.fallback, fallbackBy: verified.fallbackBy, selfExcluded: verified.selfExcluded },
+    meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha, profile: cfg.profile },
+  });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
     ev: "reviewed",
@@ -280,16 +348,21 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     provider: used.id,
     files: prepared.included.length,
     omitted: prepared.omitted.length,
-    inline: classified.inline.length,
-    general: classified.general.length,
-    neurons: Math.round(neurons),
-    usd: Number(usd.toFixed(5)),
+    inline: shown.inline.length,
+    general: shown.general.length,
+    hidden: hidden.length,
+    dropped: grounded.dropped.length,
+    stripped: grounded.stripped.length,
+    verify_calls: verified.calls,
+    neurons: Math.round(neurons + verified.neurons),
+    usd: Number((usd + verified.usd).toFixed(5)),
     passed_over: outcomes.length,
     ms: now() - started,
   });
   const usage = used.kind === "workers-ai"
     ? { provider: used.kind, model: used.model, neurons, spent_today: last.spent, cap: cfg.cap }
     : { provider: used.kind, model: used.model, usd };
+  if (!verified.off) usage.verification = { calls: verified.calls, neurons: verified.neurons, usd: verified.usd };
   return res(200, { status: "reviewed", review, usage });
 }
 
