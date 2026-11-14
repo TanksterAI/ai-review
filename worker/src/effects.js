@@ -3,7 +3,7 @@
 // permissions that call needs. The runner never receives any of these.
 
 import { createGithubApp } from "./github-app.js";
-import { annotatePatch } from "./review.js";
+import { annotatePatch, codeSpan } from "./review.js";
 
 export const ORG = "TanksterAI";
 export const RUNNER_REPO = "ai-review";
@@ -102,7 +102,9 @@ export function createEffects(env, deps = {}) {
         if (e.status !== 422) throw e;
         // A comment position GitHub refuses, or the commit left the PR: keep
         // every finding, in the body.
-        const listed = comments.map((c) => `- \`${c.path}:${c.line}\`: ${String(c.body).replace(/\n+/g, " ")}`).join("\n");
+        // Each comment's first line only (labels and title), so the list stays
+        // readable and well inside GitHub's size limit.
+        const listed = comments.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${String(c.body).split("\n")[0].slice(0, 300)}`).join("\n");
         const text = [body, `Reviewed commit ${String(commitId).slice(0, 7)}.`, listed && `#### Findings (GitHub would not place them inline)\n\n${listed}`]
           .filter(Boolean)
           .join("\n\n");
