@@ -79,6 +79,19 @@ export const PATCH = [
   " export { x };",
 ].join("\n");
 
+// PATCH's shape (lines 2 and 3 added, 1, 4 and 5 context) with lines that
+// name things (total, ratio, loadStore), for tests that go through the
+// grounding gate.
+export const GROUNDED_PATCH = [
+  "@@ -1,4 +1,5 @@",
+  " import { loadStore } from './store.js';",
+  "-const total = 1;",
+  "+const total = 2;",
+  "+const ratio = total / 0;",
+  " ",
+  " export { total };",
+].join("\n");
+
 // A Durable Object storage stand-in with the calls PrState uses.
 export function memoryStorage() {
   const m = new Map();
@@ -111,4 +124,16 @@ export function fakeEffects({ writers = [] } = {}) {
     prLinesMap: new Map(),
     async prLines(repo, pr, paths) { calls.push(["prLines", repo, pr, paths]); return this.prLinesMap; },
   };
+}
+
+// The findings a fake verifier was asked about, read back out of its input.
+export function askedFindings(user) {
+  const m = /<<<BEGIN FINDINGS (\w+)>>>\n([\s\S]*?)\n<<<END FINDINGS \1>>>/.exec(String(user));
+  return m ? JSON.parse(m[2]) : [];
+}
+
+// A timer for tests: short waits (a retry pause) pass at once; a long one
+// (the verifier's time budget) never runs out unless a test makes it.
+export function testSleep(ms) {
+  return ms >= 60_000 ? new Promise(() => {}) : Promise.resolve();
 }
