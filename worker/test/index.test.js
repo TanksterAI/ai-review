@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import worker, { handleReview } from "../src/index.js";
+import worker, { handleReview, placeComments } from "../src/index.js";
 import { makeSigner, claimsAt, staticJwks, memoryKv, responsesResult, PATCH, AUDIENCE, OWNER_ID, WORKFLOW_REFS } from "./helpers.js";
 
 const NOW_MS = 1_794_500_000_000;
@@ -216,6 +216,28 @@ test("out of capacity (3040) is retried once, then reported as unavailable", asy
   assert.equal((await handleReview(await req(goodBody), env(lim), deps)).status, 502);
 });
 
+test("an answer that tried to be JSON but does not parse is retried once, without suggestions", async () => {
+  const broken = responsesResult('{"summary": "s", "findings": [{"suggestion": "a "unescaped" quote"}]}');
+  const ai = aiScript([broken, responsesResult(answer)]);
+  const e = env(ai);
+  const res = await handleReview(await req(goodBody), e, deps);
+  assert.equal(res.status, 200);
+  assert.equal(ai.calls.length, 2);
+  assert.doesNotMatch(ai.calls[0].input.instructions, /could not be used/);
+  assert.match(ai.calls[1].input.instructions, /leave out every "suggestion" key/);
+  // Same effort: only an answer cut short lowers it.
+  assert.equal(ai.calls[1].input.reasoning.effort, "medium");
+  // Broken twice: one retry only.
+  const twice = aiScript([broken]);
+  assert.equal((await handleReview(await req(goodBody), env(twice), deps)).status, 502);
+  assert.equal(twice.calls.length, 2);
+  // No retry when the first answer used up the budget a second would need.
+  const costly = responsesResult('{"summary": "s", "findings": [', { input_tokens: 1, output_tokens: 1, neurons: 5_990 });
+  const tight = aiScript([costly, responsesResult(answer)]);
+  assert.equal((await handleReview(await req(goodBody), env(tight), deps)).status, 502);
+  assert.equal(tight.calls.length, 1);
+});
+
 test("an answer cut short is retried once with low effort", async () => {
   const cut = { ...responsesResult(""), status: "incomplete", output: [{ type: "reasoning", content: [] }] };
   const ai = aiScript([cut, responsesResult(answer)]);
@@ -251,4 +273,24 @@ test("the estimate reserves the whole output allowance", async () => {
   const res = await handleReview(await req(goodBody), env(ai, { DAILY_NEURON_CAP: "700" }), deps);
   assert.equal(res.status, 429);
   assert.equal(ai.calls.length, 0);
+});
+
+test("placeComments keeps what fits, shrinks a range to its line, and moves the rest", () => {
+  const lines = new Map([["a.js", new Set([3, 4])]]);
+  const comments = [
+    { path: "a.js", line: 4, start_line: 3, start_side: "RIGHT", side: "RIGHT", body: "whole" },
+    { path: "a.js", line: 4, start_line: 2, start_side: "RIGHT", side: "RIGHT", body: "range with suggestion" },
+    { path: "a.js", line: 4, start_line: 2, start_side: "RIGHT", side: "RIGHT", body: "no single-line body" },
+    { path: "a.js", line: 9, side: "RIGHT", body: "gone" },
+    { path: "b.js", line: 3, side: "RIGHT", body: "other file" },
+  ];
+  const { kept, off } = placeComments(comments, [null, "single", undefined], lines);
+  assert.deepEqual(kept.map((c) => c.body.split("\n")[0]), ["whole", "single"]);
+  assert.equal(kept[0].start_line, 3);
+  assert.equal(kept[1].start_line, undefined);
+  assert.equal(kept[1].start_side, undefined);
+  assert.match(kept[1].body, /The suggestion was left out/);
+  // Without a single-line body (an older review), the comment is not edited: it moves.
+  assert.deepEqual(off.map((c) => c.body), ["no single-line body", "gone", "other file"]);
+  assert.deepEqual(placeComments(comments.slice(1, 2), undefined, lines).off.length, 1);
 });
