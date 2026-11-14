@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import worker, { handleWebhook, handleRunnerSession, handleRunnerReview } from "../src/index.js";
 import { PrState } from "../src/pr-state.js";
-import { makeSigner, claimsAt, staticJwks, memoryKv, memoryStorage, fakeEffects, responsesResult, PATCH, AUDIENCE, OWNER_ID } from "./helpers.js";
+import { makeSigner, claimsAt, staticJwks, memoryKv, memoryStorage, fakeEffects, responsesResult, testSleep, PATCH, GROUNDED_PATCH, AUDIENCE, OWNER_ID } from "./helpers.js";
 
 const NOW_MS = 1_794_500_000_000;
 const SECRET = "whsec";
@@ -41,9 +41,11 @@ function env(over = {}) {
     // Effects are faked; appConfig only needs all three to be present.
     GITHUB_APP_ID: "1",
     GITHUB_APP_PRIVATE_KEY: "unused-in-tests",
+    // These tests predate the verifier (verify.test.js covers it).
+    VERIFY: "off",
     LEDGER: memoryKv(),
     PR_STATE: namespace(fx, clock),
-    AI: { async run() { return responsesResult(JSON.stringify({ summary: "Adds y.", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." }] })); } },
+    AI: { async run() { return responsesResult(JSON.stringify({ summary: "Adds y.", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", evidence: "const ratio = total / 0;", body: "Guard it." }] })); } },
     ...over,
   };
 }
@@ -71,7 +73,7 @@ function hook(body, { secret = SECRET, event = "pull_request", delivery = crypto
   });
 }
 
-const deps = (e) => ({ jwks: staticJwks([signer.jwk]), now: () => NOW_MS, sleep: async () => {}, effects: e.fx });
+const deps = (e) => ({ jwks: staticJwks([signer.jwk]), now: () => NOW_MS, sleep: testSleep, effects: e.fx });
 
 async function runnerReq(path, body, claims = {}) {
   const token = await signer.sign(claimsAt(Math.floor(NOW_MS / 1000), {
@@ -128,7 +130,7 @@ test("webhook to runner to review: the whole path", async () => {
   const other = await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }, { run_id: "6000" }), e, deps(e));
   assert.equal(other.status, 403);
 
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), title: "t", body: "b", files }), e, deps(e));
   assert.equal(r.status, 200);
   const out = await r.json();
@@ -162,7 +164,7 @@ test("webhook to runner to review: the whole path", async () => {
 test("runner review: 'since' counts only when it is the commit the Worker recorded", async () => {
   const e = env();
   const jobId = await openPr(e);
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), since: "f".repeat(40), files }), e, deps(e));
   const post = e.fx.calls.find((c) => c[0] === "postReview");
   assert.doesNotMatch(post[3].body, /Incremental review/);
@@ -187,7 +189,7 @@ test("router knows the v2 paths", async () => {
 test("incremental: findings off the PR's own diff move to the body", async () => {
   const e = env();
   const first = await openPr(e);
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   await handleRunnerReview(await runnerReq("/v1/runner/review", { job: first, head_sha: "a".repeat(40), files }), e, deps(e));
   await handleWebhook(hook(prBody("synchronize")), e);
   e.clock.t += 180_000;
@@ -209,12 +211,12 @@ test("incremental: findings off the PR's own diff move to the body", async () =>
 test("incremental: a suggestion's whole range must still be in the PR's diff", async () => {
   const e = env({ AI: { async run() {
     return responsesResult(JSON.stringify({ summary: "s", findings: [
-      { path: "src/a.js", start_line: 2, line: 3, severity: "major", category: "bug", title: "Range", body: "b\n\n```suggestion\nconst y = 9;\n```", suggestion: "const x = 3;\nconst y = 1;" },
-      { path: "src/a.js", line: 3, severity: "minor", category: "bug", title: "Single", body: "b", suggestion: "const y = 1;" },
+      { path: "src/a.js", start_line: 2, line: 3, severity: "major", category: "bug", title: "Range", evidence: "const ratio = total / 0;", body: "b\n\n```suggestion\nconst y = 9;\n```", suggestion: "const x = 3;\nconst y = 1;" },
+      { path: "src/a.js", line: 3, severity: "minor", category: "bug", title: "Single", evidence: "const ratio = total / 0;", body: "b", suggestion: "const y = 1;" },
     ] }));
   } } });
   const first = await openPr(e);
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   await handleRunnerReview(await runnerReq("/v1/runner/review", { job: first, head_sha: "a".repeat(40), files }), e, deps(e));
   const full = e.fx.calls.filter((c) => c[0] === "postReview")[0][3];
   assert.deepEqual(full.comments.map((c) => [c.start_line, c.line]), [[2, 3], [undefined, 3]]);
@@ -262,7 +264,7 @@ test("incremental: a suggestion's whole range must still be in the PR's diff", a
 test("a re-run of the runner reviews again after a failed post; other events cannot claim", async () => {
   const e = env();
   const jobId = await openPr(e);
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   const real = e.fx.postReview;
   e.fx.postReview = async () => { throw new Error("GitHub 502"); };
   await assert.rejects(handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), files }), e, deps(e)));
@@ -280,7 +282,7 @@ test("runner review deferred: the job goes back to the PR's object and is dispat
   const e = env({ AI: { async run() { throw new Error("AiError: 3036: daily free allocation used"); } } });
   const jobId = await openPr(e);
   await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, deps(e));
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), title: "t", body: "b", files }), e, deps(e));
   assert.equal(r.status, 429);
   assert.equal(e.fx.calls.filter((c) => c[0] === "postReview").length, 0);
@@ -307,7 +309,7 @@ test("runner review: a provider that failed is skipped when the deferred review 
   const d = { ...deps(e), fetch: async () => day };
   const jobId = await openPr(e);
   await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, d);
-  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
   const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), files }), e, d);
   assert.equal(r.status, 429);
   assert.equal(calls, 1);
@@ -317,4 +319,22 @@ test("runner review: a provider that failed is skipped when the deferred review 
   await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }, { run_id: "9100" }), e, d);
   await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), files }, { run_id: "9100" }), e, d);
   assert.equal(calls, 1, "the failing provider is not asked again");
+});
+
+test("runner review: findings no verifier can check are never posted; the job waits in the PR's object", async () => {
+  // Verification on, and nothing independent of the drafter to verify with.
+  const e = env({ VERIFY: "", VERIFY_FALLBACK: "" });
+  const jobId = await openPr(e);
+  await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, deps(e));
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
+  const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), title: "t", body: "b", files }), e, { ...deps(e), sleep: testSleep });
+  assert.equal(r.status, 429);
+  assert.match((await r.json()).reason, /no independent verifier/);
+  assert.equal(e.fx.calls.filter((c) => c[0] === "postReview").length, 0);
+  const obj = e.PR_STATE.objects.get("TanksterAI/browser-relay#39");
+  const box = await obj.ctx.storage.get("outbox");
+  assert.deepEqual(box.map((b) => [b.type, b.jobId]), [["dispatch", jobId]]);
+  assert.ok(box[0].notBefore > NOW_MS);
+  // The drafter is not blamed: it is not skipped next time.
+  assert.deepEqual((await obj.ctx.storage.get(`job:${jobId}`)).skip ?? [], []);
 });
