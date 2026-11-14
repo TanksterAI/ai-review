@@ -187,7 +187,17 @@ test("a long added line is not shown, but the file's other added lines are, and 
   assert.match(text, /\+ const a = 1;/);
   assert.match(text, /\+ const b = a \+ 1;/);
   assert.ok(text.length < 5_000);
-  assert.deepEqual(plan.skipped, [{ path: "src/mixed.js", reason: "1 added line over 240,000 characters not shown (minified or generated); the rest was reviewed" }]);
+  // In code, a line no model could read is code nobody reviewed: the rest of
+  // the file is reviewed, but the file is not covered, and the gate fails.
+  assert.deepEqual(plan.skipped, []);
+  assert.deepEqual(plan.uncovered, [{ path: "src/mixed.js", reason: "1 added line over 240,000 characters could not be shown to a model (generated code belongs under dist/ or in a .min.js file)" }]);
+  assert.deepEqual(coverageOf(plan, new Set([0])), { reviewable: 1, covered: 0, complete: false, chars: plan.chars });
+});
+
+test("in a data file, an added line too long to show is named and passed over; the gate is not held for data", () => {
+  const patch = ["@@ -0,0 +1,2 @@", '+{"a": 1,', `+"blob": "${"C".repeat(300_000)}"}`].join("\n");
+  const plan = planReview([file("fixtures/catalog.json", patch)], { batchChars: 60_000 });
+  assert.deepEqual(plan.skipped, [{ path: "fixtures/catalog.json", reason: "1 added line over 240,000 characters not shown (minified or generated data); the rest was reviewed" }]);
   assert.equal(coverageOf(plan, new Set([0])).complete, true);
 });
 

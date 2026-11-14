@@ -612,7 +612,8 @@ async function stagePost(ctx, run, save) {
   for (const b of batches) if (b.status === "failed") for (const p of b.parts) failedPaths.add(p.path);
   const uncovered = [...plan.uncovered, ...[...failedPaths].map((path) => ({ path, reason: batches.find((b) => b.status === "failed" && b.parts.some((p) => p.path === path))?.reason ?? "no model could review it" }))];
   const cov = coverageOf(full, done);
-  const coveredPaths = plan.files.filter((f) => f.batches.every((b) => done.has(b))).map((f) => f.path);
+  const notCovered = new Set(uncovered.map((u) => u.path));
+  const coveredPaths = plan.files.filter((f) => !notCovered.has(f.path) && f.batches.every((b) => done.has(b))).map((f) => f.path);
   const merged = mergeResults(batches.filter((b) => b.status === "verified").map((b) => b.result));
   const ids = Object.entries(run.drafters);
   const modelLine = !ids.length

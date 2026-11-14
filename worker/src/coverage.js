@@ -26,6 +26,10 @@ export const LONG_LINE_BATCHES = 4;
 // Unchanged and removed lines are context, not under review: past this length
 // they are cut to a marker, so a long one never crowds out the change.
 export const CONTEXT_LINE_MAX = 2_000;
+// Data, not code: an added line too long to show is passed over in these
+// (named in the review). In any other file it is code no model read, so the
+// file is not covered and the gate fails.
+export const DATA_FILE = /\.(json|jsonl|ndjson|geojson|topojson|csv|tsv|svg|txt|xml|map|pem|b64|base64|webmanifest)$/i;
 const hiddenMarker = (n) => `[ai-review: a line of ${n.toLocaleString("en-GB")} characters, not shown]`;
 
 /**
@@ -197,8 +201,15 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
     const path = f.filename;
     const skip = skipReason(f);
     if (skip) { skipped.push({ path, reason: skip }); continue; }
-    const long = `a line over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters: minified or generated`;
-    if (f.minified === true) { skipped.push({ path, reason: long }); continue; }
+    const max = (LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB");
+    const data = DATA_FILE.test(path);
+    const unread = (n) => `${n} added line${n === 1 ? "" : "s"} over ${max} characters could not be shown to a model (generated code belongs under dist/ or in a .min.js file)`;
+    const long = `a line over ${max} characters: minified or generated data`;
+    if (f.minified === true) {
+      if (data) skipped.push({ path, reason: long });
+      else uncovered.push({ path, reason: unread(Number(f.hiddenAdded) || 1) });
+      continue;
+    }
     if (typeof f.unfetched === "string") { uncovered.push({ path, reason: f.unfetched }); continue; }
     if (f.patch_omitted === true) { uncovered.push({ path, reason: "its diff was not sent" }); continue; }
     if (typeof f.patch !== "string" || f.patch.length === 0) { skipped.push({ path, reason: "binary or no textual diff" }); continue; }
@@ -207,13 +218,18 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
     const hiddenAdded = (Number(f.hiddenAdded) || 0) + t.hidden;
     const hiddenLines = [...(Array.isArray(f.hiddenLines) ? f.hiddenLines : []), ...t.hiddenLines];
     // Nothing but added lines too long to show: minified or generated data.
-    if (f.allHidden === true || onlyHidden(t, hiddenAdded)) { skipped.push({ path, reason: long }); continue; }
+    if (f.allHidden === true || onlyHidden(t, hiddenAdded)) {
+      if (data) skipped.push({ path, reason: long });
+      else uncovered.push({ path, reason: unread(hiddenAdded) });
+      continue;
+    }
     // The limit is checked on the patch first, so a file far past it is
     // never annotated (annotation adds about 8 characters a line).
     if (chars + t.patch.length > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
-    if (hiddenAdded > 0) {
-      skipped.push({ path, reason: `${hiddenAdded} added line${hiddenAdded === 1 ? "" : "s"} over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters not shown (minified or generated); the rest was reviewed` });
-    }
+    // Some added lines too long to show: the rest of the file is reviewed. In
+    // data that is all there is to review; in code the file is not covered.
+    if (hiddenAdded > 0 && data) skipped.push({ path, reason: `${hiddenAdded} added line${hiddenAdded === 1 ? "" : "s"} over ${max} characters not shown (minified or generated data); the rest was reviewed` });
+    else if (hiddenAdded > 0) uncovered.push({ path, reason: unread(hiddenAdded) });
     const parts = splitFile({ ...f, patch: t.patch, hiddenLines }, batchChars);
     const size = parts.reduce((n, p) => n + p.chars, 0);
     if (chars + size > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
@@ -243,8 +259,11 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
  * indexes): a file counts only when every batch holding a part of it is done.
  */
 export function coverageOf(plan, done) {
-  const covered = plan.files.filter((f) => f.batches.every((b) => done.has(b))).length;
-  const reviewable = plan.files.length + plan.uncovered.length;
+  // A file can be both planned (its readable lines) and not covered (a line
+  // no model could read): it counts once, as not covered.
+  const missing = new Set(plan.uncovered.map((u) => u.path));
+  const covered = plan.files.filter((f) => !missing.has(f.path) && f.batches.every((b) => done.has(b))).length;
+  const reviewable = new Set([...plan.files.map((f) => f.path), ...missing]).size;
   return { reviewable, covered, complete: covered === reviewable, chars: plan.chars };
 }
 
