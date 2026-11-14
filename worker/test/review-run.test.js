@@ -1,0 +1,402 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { DRAFT_PARALLEL, STEP_SUBREQUESTS, activeRun, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
+import { config } from "../src/config.js";
+import { parseFindingsBlock } from "../src/review.js";
+import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
+
+const NOW = Date.UTC(2026, 10, 14, 21, 0, 0);
+const HEAD = "a".repeat(40);
+const BASE = "b".repeat(40);
+const MERGE_BASE = "c".repeat(40);
+const repo = { full: "TanksterAI/ai-review", name: "ai-review" };
+
+// A patch adding n distinctive lines to a new file.
+function added(n, word) {
+  return `@@ -0,0 +1,${n} @@\n${Array.from({ length: n }, (_, i) => `+const ${word}${i} = compute(${i}, "${"x".repeat(40)}");`).join("\n")}`;
+}
+const file = (filename, patch, over = {}) => ({ filename, status: "added", additions: 1, deletions: 0, patch, sha: null, ...over });
+
+// PR #9's shape: 18 files, about 214,000 characters, every test file and the
+// README among them (the old reviewer skipped all of those).
+const PR9 = [
+  ...Array.from({ length: 10 }, (_, i) => file(`worker/src/m${i}.js`, added(180, `src${i}_`))),
+  ...Array.from({ length: 7 }, (_, i) => file(`worker/test/m${i}.test.js`, added(180, `test${i}_`))),
+  file("README.md", added(120, "doc_")),
+];
+
+function fakeGithub({ files = PR9, pr = {}, compare = null, blobs = new Map(), shas = new Map(), statusOk = true } = {}) {
+  const calls = [];
+  return {
+    calls,
+    statuses: [],
+    posted: [],
+    async pullRequest() { calls.push("pullRequest"); return { state: "open", head: { sha: HEAD }, base: { sha: BASE }, title: "feat: x", body: "Does x.", changed_files: files.length, ...pr }; },
+    async listFiles(_r, _p, page) { calls.push(`listFiles:${page}`); return files.slice((page - 1) * 100, page * 100); },
+    async compare(_r, base, head) {
+      calls.push(`compare:${base.slice(0, 1)}...${head.slice(0, 1)}`);
+      return compare?.(base, head) ?? { status: "diverged", merge_base_commit: { sha: MERGE_BASE }, files: [] };
+    },
+    async blob(_r, sha) { calls.push(`blob:${sha.slice(0, 2)}`); const t = blobs.get(sha); return t === undefined ? null : { bytes: typeof t === "string" ? new TextEncoder().encode(t) : t, size: t.length }; },
+    async fileSha(_r, path, ref) { calls.push(`fileSha:${path}@${ref.slice(0, 1)}`); return shas.get(`${path}@${ref}`) ?? null; },
+    async setStatus(_r, sha, state, description) { calls.push("setStatus"); if (!statusOk) return false; this.statuses.push({ sha, state, description }); return true; },
+    async postReview(_r, pr, review) { calls.push("postReview"); this.posted.push(review); return { inline: review.comments.length }; },
+    prLinesMap: new Map(),
+    async prLines() { calls.push("prLines"); return this.prLinesMap; },
+  };
+}
+
+// The files a drafting prompt shows, and its first added line (for a finding
+// whose evidence is real).
+function shownFiles(text) {
+  return [...String(text).matchAll(/^### (\S+) \(/gm)].map((m) => m[1]);
+}
+function firstLine(text, path) {
+  const at = text.indexOf(`### ${path} (`);
+  const m = /\n\s*(\d+) \+ (.*)/.exec(text.slice(at));
+  return { line: Number(m[1]), evidence: m[2] };
+}
+
+const reply = (status, data) => ({ ok: status === 200, status, headers: { get: () => null }, async json() { return data; } });
+const geminiDay = reply(429, { error: { details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }] } });
+
+// Model providers: Gemini models draft (one finding on any batch that shows
+// `flag`), Claude Haiku verifies (confirms all). Overrides per model by name.
+function fakeModels({ flag = "worker/src/m3.js", gemini = {}, anthropic = null } = {}) {
+  const calls = [];
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (url.includes("generativelanguage")) {
+      const model = decodeURIComponent(/models\/([^:]+):/.exec(url)[1]);
+      const text = body.contents[0].parts[0].text;
+      calls.push({ model, files: shownFiles(text), text });
+      const over = gemini[model]?.(calls.filter((c) => c.model === model).length);
+      if (over) return over;
+      const findings = [];
+      if (shownFiles(text).includes(flag)) {
+        const { line, evidence } = firstLine(text, flag);
+        findings.push({ path: flag, line, severity: "minor", type: "issue", category: "bug", title: "Off by one", evidence, claim: "It is off by one.", symbols: [], body: "Fix the bound." });
+      }
+      return reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ summary: "s", findings }) }] } }] });
+    }
+    const asked = askedFindings(body.messages[0].content);
+    calls.push({ model: body.model, verify: asked.length });
+    if (anthropic) return anthropic(body, asked);
+    const text = JSON.stringify({ verdicts: asked.map((f) => ({ id: f.id, verdict: "confirmed", severity: f.severity, suggestion_ok: false, prompt_ok: false, reason: "r" })) });
+    return reply(200, { content: [{ type: "text", text }], stop_reason: "end_turn", usage: { input_tokens: 3000, output_tokens: 100 } });
+  };
+  fetch.calls = calls;
+  return fetch;
+}
+
+function setup({ github = fakeGithub(), models = fakeModels(), env: over = {}, job: jobOver = {} } = {}) {
+  let now = NOW;
+  const storage = memoryStorage();
+  const env = {
+    LEDGER: memoryKv(), GEMINI_API_KEY: "g", ANTHROPIC_API_KEY: "sk", ANTHROPIC_DAILY_USD_CAP: "5", VERIFY: "",
+    DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it,anthropic:claude-haiku-5-5",
+    VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite",
+    ...over,
+  };
+  const done = [];
+  const ctx = {
+    storage, env, cfg: config(env), fx: github,
+    deps: { now: () => now, sleep: testSleep, fetch: models, log: () => {} },
+    again: "- Review again: comment `@tankster-ai-review review`.",
+    onDone: async (run, out) => { done.push(out); },
+  };
+  const job = { id: "job1", repo, pr: 9, since: null, full: false, requestedBy: null, ...jobOver };
+  return { ctx, storage, github, models, env, done, job, setNow: (t) => { now = t; }, getNow: () => now };
+}
+
+// Runs steps until the run is over; returns how many it took. Time moves to
+// each step's due time, as the alarm would.
+async function runAll(s, { max = 200 } = {}) {
+  await startRun(s.storage, s.job, s.getNow());
+  for (let i = 1; i <= max; i++) {
+    const at = await stepRun(s.ctx, s.job.id);
+    if (at === null) return i;
+    if (at > s.getNow()) s.setNow(at);
+  }
+  throw new Error("the run never finished");
+}
+
+test("PR #9's shape: every one of its 18 files is reviewed, in batches, and one review is posted at 100%", async () => {
+  const s = setup();
+  await runAll(s);
+  const prompts = s.models.calls.filter((c) => c.files);
+  assert.ok(prompts.length > 1, "more than one pass");
+  const reviewed = new Set(prompts.flatMap((c) => c.files));
+  for (const f of PR9) assert.ok(reviewed.has(f.filename), `${f.filename} was shown to a model`);
+  assert.equal(s.github.posted.length, 1);
+  const { body, comments } = s.github.posted[0];
+  assert.doesNotMatch(body, /size budget/);
+  assert.match(body, new RegExp(`\\n- Coverage: 18 of 18 reviewable files \\(100%\\), [\\d,]+ characters of diff, in ${prompts.length} passes\\.\\n`));
+  assert.deepEqual(parseFindingsBlock(body).coverage, { reviewable: 18, covered: 18, complete: true });
+  // The one finding was drafted, verified and posted inline.
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0].path, "worker/src/m3.js");
+  assert.match(body, /Reviewed 18 files\. 1 finding confirmed: 1 minor\./);
+  // The commit status: pending while it ran, success at the end.
+  assert.equal(s.github.statuses[0].state, "pending");
+  assert.deepEqual(s.github.statuses.at(-1), { sha: HEAD, state: "success", description: "Reviewed all 18 files (100%): 1 confirmed finding." });
+  assert.equal(s.done.at(-1).reviewedSha, HEAD);
+  assert.ok(s.env.LEDGER.map.has(`done:TanksterAI/ai-review#9@${HEAD}`));
+  assert.equal(await activeRun(s.storage), null);
+});
+
+test("batches running together draw on different free models, and the paid one is last", () => {
+  const chain = [{ kind: "gemini", model: "a" }, { kind: "gemini", model: "b" }, { kind: "workers-ai", model: "c" }, { kind: "anthropic", model: "h" }];
+  assert.deepEqual(rotatedChain(chain, 0).map((x) => x.model), ["a", "b", "c", "h"]);
+  assert.deepEqual(rotatedChain(chain, 1).map((x) => x.model), ["b", "c", "a", "h"]);
+  assert.deepEqual(rotatedChain(chain, 5).map((x) => x.model), ["c", "a", "b", "h"]);
+});
+
+test("a model out of quota mid-review hands its batch to the next model at once: nothing waits", async () => {
+  // Flash-Lite answers once, then is out for the day.
+  const models = fakeModels({ gemini: { "gemini-3.5-flash-lite": (n) => (n > 1 ? geminiDay : null) } });
+  const s = setup({ models });
+  await runAll(s);
+  const meta = await s.storage.get("runmeta:job1");
+  assert.equal(meta.outcome.state, "success");
+  assert.ok(!s.github.statuses.some((x) => /Waiting/.test(x.description)), "no batch waited");
+  const body = s.github.posted[0].body;
+  assert.match(body, /\n- Models: `gemini-3\.5-flash-lite` \(\d+ pass(es)?\), `gemma-4-31b-it` \(\d+ pass(es)?\); free tiers first/);
+  assert.match(body, /Coverage: 18 of 18 reviewable files \(100%\)/);
+});
+
+test("only when every drafter is out does a batch wait, and the status says so; it finishes after the reset", async () => {
+  let out = true;
+  const models = fakeModels({
+    gemini: { "gemini-3.5-flash-lite": () => (out ? geminiDay : null), "gemma-4-31b-it": () => (out ? geminiDay : null) },
+    anthropic: (body, asked) => {
+      if (body.output_config?.format) return reply(200, { content: [{ type: "text", text: JSON.stringify({ verdicts: asked.map((f) => ({ id: f.id, verdict: "confirmed", severity: f.severity, suggestion_ok: false, prompt_ok: false, reason: "r" })) }) }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } });
+      return reply(402, { error: { type: "billing_error", message: "Your credit balance is too low" } });
+    },
+  });
+  const s = setup({ models });
+  await startRun(s.storage, s.job, s.getNow());
+  let at = null;
+  for (let i = 0; i < 20; i++) {
+    at = await stepRun(s.ctx, s.job.id);
+    if (at > s.getNow()) break;
+  }
+  assert.ok(at > s.getNow(), "the run waits");
+  assert.match(s.github.statuses.at(-1).description, /^Waiting for a model provider to reset at \d\d:\d\d UTC; 0 of 18 files reviewed so far\.$/);
+  assert.equal(s.github.statuses.at(-1).state, "pending");
+  assert.equal(s.github.posted.length, 0);
+  // The providers reset; the review carries on from where it was.
+  out = false;
+  s.setNow(at);
+  s.env.LEDGER.map.clear();
+  for (let i = 0; i < 100 && at !== null; i++) {
+    at = await stepRun(s.ctx, s.job.id);
+    if (at > s.getNow()) s.setNow(at);
+  }
+  assert.equal(s.github.posted.length, 1);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+});
+
+test("a file GitHub sent without its patch is diffed by the Worker and reviewed; its findings stay in the body", async () => {
+  const oldText = Array.from({ length: 50 }, (_, i) => `const keep${i} = ${i};`).join("\n");
+  const newText = oldText.replace("const keep20 = 20;", "const changed20 = compute(20);");
+  const files = [file("src/huge.js", undefined, { status: "modified", sha: "e".repeat(40) }), file("src/small.js", added(5, "small_"))];
+  const github = fakeGithub({ files, blobs: new Map([["e".repeat(40), newText], ["f".repeat(40), oldText]]), shas: new Map([[`src/huge.js@${MERGE_BASE}`, "f".repeat(40)]]) });
+  const s = setup({ github, models: fakeModels({ flag: "src/huge.js" }) });
+  await runAll(s);
+  const shown = s.models.calls.find((c) => c.files?.includes("src/huge.js"));
+  assert.match(shown.text, /### src\/huge\.js \(modified, \+1 -0\) \[diff computed by the reviewer: comments go in the review body\]/);
+  assert.match(shown.text, /\s21 \+ const changed20 = compute\(20\);/);
+  // The old text came from the merge base, not the base branch's tip.
+  assert.ok(github.calls.includes(`compare:${BASE.slice(0, 1)}...${HEAD.slice(0, 1)}`));
+  const { body, comments } = github.posted[0];
+  assert.equal(comments.length, 0);
+  assert.match(body, /Outside diff range comments \(1\)[\s\S]*Off by one/);
+  assert.match(body, /Coverage: 2 of 2 reviewable files \(100%\)/);
+});
+
+test("a binary file without a patch is not reviewable; lockfiles and deletions are skipped, and none of them count against coverage", async () => {
+  const files = [
+    file("assets/logo.png", undefined, { sha: "1".repeat(40) }),
+    file("data/blob.dat", undefined, { sha: "2".repeat(40) }),
+    file("package-lock.json", added(3, "lock_")),
+    file("old.js", added(3, "old_"), { status: "removed" }),
+    file("src/a.js", added(5, "a_")),
+  ];
+  const github = fakeGithub({ files, blobs: new Map([["2".repeat(40), new Uint8Array([1, 0, 2])]]) });
+  const s = setup({ github });
+  await runAll(s);
+  // The .png is never fetched; the .dat is, and found binary.
+  assert.ok(!github.calls.includes("blob:11"));
+  assert.ok(github.calls.includes("blob:22"));
+  const body = github.posted[0].body;
+  assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+  assert.match(body, /Not reviewable \(4\): /);
+  assert.equal(github.statuses.at(-1).state, "success");
+});
+
+test("every step stays inside Workers Free's 50 subrequests, however big the pull request", async () => {
+  const many = Array.from({ length: 250 }, (_, i) => file(`src/f${i}.js`, added(60, `f${i}_`)));
+  const github = fakeGithub({ files: many });
+  const s = setup({ github });
+  await startRun(s.storage, s.job, s.getNow());
+  let worst = 0;
+  for (let i = 0; i < 500; i++) {
+    const before = github.calls.length + s.models.calls.length + s.env.LEDGER.ops;
+    const at = await stepRun(s.ctx, s.job.id);
+    worst = Math.max(worst, github.calls.length + s.models.calls.length + s.env.LEDGER.ops - before);
+    if (at === null) break;
+    if (at > s.getNow()) s.setNow(at);
+  }
+  assert.equal(github.posted.length, 1);
+  assert.match(github.posted[0].body, /Coverage: 250 of 250 reviewable files \(100%\)/);
+  // GitHub calls are bounded per step by design, model and KV calls by the counter.
+  assert.ok(worst <= 50, `the busiest step made ${worst} subrequests`);
+  assert.ok(STEP_SUBREQUESTS < 50 && DRAFT_PARALLEL >= 2);
+});
+
+test("a closed pull request is not reviewed, and gets no status", async () => {
+  const s = setup({ github: fakeGithub({ pr: { state: "closed" } }) });
+  await runAll(s);
+  assert.equal(s.github.posted.length, 0);
+  assert.equal(s.github.statuses.length, 0);
+  assert.equal(s.models.calls.length, 0);
+});
+
+test("a commit already reviewed is not reviewed again, unless someone asked", async () => {
+  const s = setup();
+  await s.env.LEDGER.put(`done:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
+  await runAll(s);
+  assert.equal(s.github.posted.length, 0);
+  assert.equal(s.done.at(-1).reviewedSha, HEAD);
+  const asked = setup({ job: { requestedBy: "rishitank" } });
+  await asked.env.LEDGER.put(`done:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
+  await runAll(asked);
+  assert.equal(asked.github.posted.length, 1);
+});
+
+test("an incremental review reads only the commits since the last review, and says so", async () => {
+  const since = "d".repeat(40);
+  const github = fakeGithub({ compare: (base) => (base === since ? { status: "ahead", files: [file("worker/src/m3.js", added(4, "inc_"))] } : null) });
+  github.prLinesMap = new Map([["worker/src/m3.js", new Set([1, 2, 3, 4])]]);
+  const s = setup({ github, job: { since } });
+  await runAll(s);
+  assert.ok(!github.calls.some((c) => c.startsWith("listFiles")));
+  const { body, comments } = github.posted[0];
+  assert.equal(comments.length, 1);
+  assert.match(body, /_Incremental review: commits after `ddddddd`\._/);
+  assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+});
+
+test("without the statuses permission the review is still posted, and the status is not asked for again", async () => {
+  const github = fakeGithub({ statusOk: false });
+  const s = setup({ github });
+  await runAll(s);
+  assert.equal(github.posted.length, 1);
+  assert.equal(github.calls.filter((c) => c === "setStatus").length, 1);
+});
+
+test("a batch no model can review after three tries makes the review incomplete, and the status fails", async () => {
+  // Every model answers with something that is not JSON, for the m3 batch only.
+  const broken = (n, text) => (text.includes("### worker/src/m3.js (") ? reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: "no" }] } }] }) : null);
+  const models = fakeModels();
+  const wrapped = async (url, init) => {
+    if (url.includes("generativelanguage")) {
+      const text = JSON.parse(init.body).contents[0].parts[0].text;
+      const r = broken(0, text);
+      if (r) { models.calls.push({ model: "x", files: shownFiles(text), text }); return r; }
+    }
+    return models(url, init);
+  };
+  wrapped.calls = models.calls;
+  const s = setup({ models: wrapped, env: { DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it" } });
+  await runAll(s);
+  const { body } = s.github.posted[0];
+  assert.match(body, /\*\*Incomplete review: \d+ of 18 reviewable files were covered\.\*\*/);
+  assert.match(body, /Not covered \(\d+\): [^\n]*`worker\/src\/m3\.js` \(the model did not return a usable answer; try again later\)/);
+  assert.equal(s.github.statuses.at(-1).state, "failure");
+  assert.match(s.github.statuses.at(-1).description, /^Incomplete: \d+ of 18 files reviewed\./);
+});
+
+test("findings from several batches merge into one review: unique ids, and one seen twice is shown once", () => {
+  const f = (id, path, line, title, severity = "minor") => ({ id, path, line, title, severity });
+  const v = { off: false, weak: false, fallback: false, fallbackBy: [], selfExcluded: [] };
+  const m = mergeResults([
+    { shown: { inline: [f("aa", "x.js", 1, "T")], general: [] }, hidden: [f("hh", "x.js", 2, "H")], verification: v },
+    { shown: { inline: [f("aa", "x.js", 1, "T"), f("aa", "x.js", 9, "T", "major")], general: [] }, hidden: [f("hh", "x.js", 3, "H")], verification: { ...v, weak: true } },
+  ]);
+  assert.deepEqual(m.shown.inline.map((x) => [x.id, x.line]), [["aa-2", 9], ["aa", 1]]);
+  assert.deepEqual(m.hidden.map((x) => x.id), ["hh", "hh-2"]);
+  assert.equal(m.verification.weak, true);
+  assert.equal(m.verification.off, false);
+});
+
+test("worst case, every free model refusing: still within 50 subrequests a step, and Claude drafts so nothing waits", async () => {
+  const many = Array.from({ length: 120 }, (_, i) => file(`src/f${i}.js`, added(80, `w${i}_`)));
+  const github = fakeGithub({ files: many });
+  const models = fakeModels({ gemini: { "gemini-3.5-flash-lite": () => geminiDay, "gemini-3.1-flash-lite": () => geminiDay, "gemma-4-31b-it": () => geminiDay, "gemma-4-26b-a4b-it": () => geminiDay } });
+  const s = setup({ github, models, env: { DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,gemini:gemma-4-31b-it,gemini:gemma-4-26b-a4b-it,workers-ai:@cf/zai-org/glm-4.7-flash,anthropic:claude-haiku-5-5", VERIFY_FALLBACK: "" } });
+  // Workers AI is out for the day too.
+  s.env.AI = { calls: 0, async run() { this.calls++; throw new Error("AiError: 3036: daily free allocation used up"); } };
+  // Claude drafts (no format) and verifies (with the verdict schema).
+  const plain = s.ctx.deps.fetch;
+  s.ctx.deps.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (url.includes("anthropic") && !body.output_config?.format) {
+      models.calls.push({ model: body.model, files: shownFiles(body.messages[0].content), text: body.messages[0].content });
+      return reply(200, { content: [{ type: "text", text: '{"summary":"s","findings":[]}' }], stop_reason: "end_turn", usage: { input_tokens: 15000, output_tokens: 200 } });
+    }
+    return plain(url, init);
+  };
+  await startRun(s.storage, s.job, s.getNow());
+  let worst = 0;
+  for (let i = 0; i < 500; i++) {
+    const before = github.calls.length + models.calls.length + s.env.LEDGER.ops + s.env.AI.calls;
+    const at = await stepRun(s.ctx, s.job.id);
+    worst = Math.max(worst, github.calls.length + models.calls.length + s.env.LEDGER.ops + s.env.AI.calls - before);
+    if (at === null) break;
+    assert.ok(at <= s.getNow() + 1, "no step waits: Claude can always draft");
+  }
+  assert.ok(worst <= 50, `the busiest step made ${worst} subrequests`);
+  assert.match(github.posted[0].body, /Coverage: 120 of 120 reviewable files \(100%\)/);
+  assert.match(github.posted[0].body, /`claude-haiku-5-5`/);
+});
+
+test("an incomplete review marks nothing done, so the next one starts from the last complete review", async () => {
+  const s = setup({ env: { MAX_PR_CHARS: "100000" } });
+  await runAll(s);
+  assert.equal(s.github.statuses.at(-1).state, "failure");
+  assert.equal(s.done.at(-1).reviewedSha, null);
+  assert.ok(!s.env.LEDGER.map.has(`done:TanksterAI/ai-review#9@${HEAD}`));
+  assert.match(s.github.posted[0].body, /Not covered \(\d+\): [^\n]*\(the pull request is over the reviewer's limit of 100,000 characters of diff\)/);
+});
+
+test("batches with nothing to verify are settled without a model call, in the same step", async () => {
+  const s = setup({ models: fakeModels({ flag: "none" }) });
+  await startRun(s.storage, s.job, s.getNow());
+  const stages = [];
+  for (let i = 0; i < 100; i++) {
+    stages.push((await s.storage.get("runmeta:job1")).stage);
+    if ((await stepRun(s.ctx, s.job.id)) === null) break;
+  }
+  // One verify step for all of the batches, and no verifier was asked.
+  assert.equal(stages.filter((x) => x === "verify").length, 1);
+  assert.ok(!s.models.calls.some((c) => c.verify !== undefined));
+  assert.equal(s.github.statuses.at(-1).state, "success");
+});
+
+test("a step that fails is tried again after a pause; failures are counted in a row, and six in a row give up", async () => {
+  let fail = 2;
+  const github = fakeGithub();
+  const listFiles = github.listFiles.bind(github);
+  github.listFiles = async (...a) => { if (fail-- > 0) throw new Error("GitHub 502"); return listFiles(...a); };
+  const s = setup({ github });
+  await runAll(s);
+  assert.equal(github.posted.length, 1, "two failures in a row are retried, and the review goes on");
+  const always = fakeGithub();
+  always.pullRequest = async () => { throw new Error("GitHub 500"); };
+  const t = setup({ github: always });
+  await runAll(t);
+  assert.equal(always.posted.length, 0);
+  assert.equal(t.done.at(-1).gaveUp, true);
+});

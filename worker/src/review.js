@@ -26,7 +26,7 @@ export const ZWSP = String.fromCharCode(0x200b);
 
 // Files that are generated, vendored or lockfiles: noise for a reviewer and
 // expensive in tokens.
-const SKIP = [
+export const SKIP = [
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|go\.sum|flake\.lock)$/,
   /\.min\.(js|css|mjs)$/,
   /\.map$/,
@@ -39,7 +39,7 @@ const SKIP = [
 const DOC = /\.(md|mdx|txt|rst|adoc)$/i;
 const TEST = /(^|\/)(tests?|__tests__|spec|e2e|fixtures?)\/|\.(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py|rs)$|(^|\/)test_[^/]+\.py$/;
 
-function priority(path) {
+export function priority(path) {
   if (DOC.test(path)) return 2;
   if (TEST.test(path)) return 1;
   return 0;
@@ -180,9 +180,12 @@ export function fence(name, tag, text) {
   return `<<<BEGIN ${name} ${tag}>>>\n${safe}\n<<<END ${name} ${tag}>>>`;
 }
 
-export function buildPrompt({ repository, title, body, prepared, tag }) {
+export function buildPrompt({ repository, title, body, prepared, tag, pass = null }) {
   const instructions = [
     `You are a senior software engineer reviewing a pull request in ${repository}.`,
+    ...(pass && pass.total > 1
+      ? [`This is pass ${pass.index} of ${pass.total} of a large pull request. Its other files are reviewed in the other passes: review only the files shown here.`]
+      : []),
     "Review ONLY the changes shown. Report real defects a careful reviewer would block or fix before merging:",
     "bugs and logic errors, security problems (injection, authentication or authorisation gaps, secrets, unsafe handling of untrusted input),",
     "race conditions, resource leaks, missing or wrong error handling, broken edge cases, API misuse, performance problems with real impact,",
@@ -218,9 +221,10 @@ export function buildPrompt({ repository, title, body, prepared, tag }) {
   ].join("\n");
   // File names are chosen by the PR author, so the list of skipped files is
   // data too: fenced, one JSON string per line.
-  const skipped = prepared.omitted.length
-    ? fence("FILES NOT SHOWN", tag, prepared.omitted.slice(0, 40).map((o) => `${JSON.stringify(o.path)} (${o.reason})`).join("\n"))
-    : "All changed files are shown.";
+  const notes = [];
+  if (prepared.omitted.length) notes.push(fence("FILES NOT SHOWN", tag, prepared.omitted.slice(0, 40).map((o) => `${JSON.stringify(o.path)} (${o.reason})`).join("\n")));
+  if (prepared.elsewhere?.length) notes.push(fence("OTHER FILES IN THIS PULL REQUEST", tag, prepared.elsewhere.slice(0, 200).map((p) => JSON.stringify(p)).join("\n")));
+  const skipped = notes.length ? notes.join("\n\n") : "All changed files are shown.";
   const input = [
     `Repository: ${repository}`,
     fence("PR TITLE", tag, String(title ?? "").slice(0, 300)),
@@ -514,7 +518,7 @@ export const MAX_REASON_CHARS = 200;
  * and a reason the Worker wrote. opts.inlineIds: the ids posted as inline
  * comments (by default, every finding in classified.inline).
  */
-export function findingsBlock(classified, headSha, { hidden = [], inlineIds = null, included = null } = {}) {
+export function findingsBlock(classified, headSha, { hidden = [], inlineIds = null, included = null, coverage = null } = {}) {
   const posted = inlineIds ?? new Set(classified.inline.map((f) => f.id));
   const reason = (r) => sanitize(r ?? "", MAX_REASON_CHARS, { inline: true });
   const shown = [...classified.inline, ...classified.general].map((f) => ({
@@ -562,7 +566,9 @@ export function findingsBlock(classified, headSha, { hidden = [], inlineIds = nu
   ];
   let out = "";
   for (const step of steps) {
-    const json = JSON.stringify({ v: 1, head: headSha ?? null, findings: [...shown.map(step), ...quiet] });
+    // coverage: numbers only, the Worker's own, for the merge gate to read.
+    const cov = coverage ? { coverage: { reviewable: Number(coverage.reviewable) || 0, covered: Number(coverage.covered) || 0, complete: coverage.complete === true } } : {};
+    const json = JSON.stringify({ v: 1, head: headSha ?? null, ...cov, findings: [...shown.map(step), ...quiet] });
     out = `<!-- ${FINDINGS_MARKER} ${json.replace(/</g, "\\u003c").replace(/>/g, "\\u003e")} -->`;
     if (out.length <= MAX_BLOCK_CHARS) break;
   }
@@ -690,8 +696,12 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     return c;
   });
   const confirmed = [...classified.inline, ...classified.general];
-  const summary = workerSummary(confirmed, prepared, verification);
-  const block = findingsBlock(classified, meta.headSha, { hidden, inlineIds: new Set(inline.map((f) => f.id)), included: prepared.included });
+  const cov = prepared.coverage ?? null;
+  const incomplete = cov && !cov.complete
+    ? `**Incomplete review: ${cov.covered} of ${plural(cov.reviewable, "reviewable file")} were covered.** `
+    : "";
+  const summary = incomplete + workerSummary(confirmed, prepared, verification);
+  const block = findingsBlock(classified, meta.headSha, { hidden, inlineIds: new Set(inline.map((f) => f.id)), included: prepared.included, coverage: cov });
   const lines = [MARKER, block, "### AI review (advisory)", "", summary, ""];
   const total = inline.length + nitpicks.length + outside.length;
   const below = nitpicks.length + outside.length;
@@ -728,15 +738,28 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     }
     lines.push("", "</details>", "");
   }
+  const listed = (items) => `${items.slice(0, 20).map((o) => `\`${codeSpan(o.path)}\` (${o.reason})`).join(", ")}${items.length > 20 ? ", …" : ""}`;
   const omitted = prepared.omitted.length
-    ? `Not reviewed (${prepared.omitted.length}): ${prepared.omitted.slice(0, 20).map((o) => `\`${codeSpan(o.path)}\` (${o.reason})`).join(", ")}${prepared.omitted.length > 20 ? ", …" : ""}.`
+    ? `Not reviewed (${prepared.omitted.length}): ${listed(prepared.omitted)}.`
     : "Every changed file was reviewed.";
+  // A full-coverage review (coverage.js): how much of the change it covered.
+  // The percentage is rounded down, so an incomplete review never shows 100%.
+  let reviewedLine = `- Reviewed ${prepared.included.length} file${prepared.included.length === 1 ? "" : "s"} (${prepared.chars.toLocaleString("en-GB")} characters of diff). ${omitted}`;
+  if (cov) {
+    const pct = cov.reviewable ? Math.floor((100 * cov.covered) / cov.reviewable) : 100;
+    const passes = cov.passes ? `, in ${cov.passes} pass${cov.passes === 1 ? "" : "es"}` : "";
+    const notReviewable = prepared.omitted.length ? ` Not reviewable (${prepared.omitted.length}): ${listed(prepared.omitted)}.` : "";
+    const uncovered = prepared.uncovered ?? [];
+    const notCovered = uncovered.length ? ` Not covered (${uncovered.length}): ${listed(uncovered)}.` : "";
+    const gate = cov.complete ? "" : " The commit status stays failing until every file is reviewed.";
+    reviewedLine = `- Coverage: ${cov.covered} of ${plural(cov.reviewable, "reviewable file")} (${pct}%), ${prepared.chars.toLocaleString("en-GB")} characters of diff${passes}.${notReviewable}${notCovered}${gate}`;
+  }
   lines.push(
     "<details><summary>About this review</summary>",
     "",
     meta.modelLine ?? `- Model: \`${meta.model}\` on Cloudflare Workers AI, free daily allocation; it never bills.`,
     ...(verification ? [verificationLine(confirmed, hidden, verification)] : []),
-    `- Reviewed ${prepared.included.length} file${prepared.included.length === 1 ? "" : "s"} (${prepared.chars.toLocaleString("en-GB")} characters of diff). ${omitted}`,
+    reviewedLine,
     meta.costLine ?? `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
     "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement.",
     meta.again ?? "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
@@ -748,4 +771,35 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   // A last bound: what is cut is the end of the text, never the block.
   if (body.length > MAX_BODY_CHARS) body = `${body.slice(0, MAX_BODY_CHARS - 40)}\n\n…(cut to GitHub's size limit)`;
   return { body, comments, singleLine };
+}
+
+// A comment's first line (its labels and title), for lists where the whole
+// comment would not read well: suggestion and prompt blocks do not flatten.
+export function titleLine(body) {
+  return String(body).split("\n")[0].slice(0, 300);
+}
+
+/**
+ * For an incremental review: which comments still fit the PR's own diff
+ * (lines: path -> Set of RIGHT-side lines). A suggestion's range must be there
+ * whole; when only its first lines left the diff, the comment stays on its
+ * own line with the body renderReview made without the suggestion (never
+ * edited here: a multi-line replacement must not reach a one-line comment).
+ * Anything else goes in the body.
+ */
+export function placeComments(comments, singleLine, lines) {
+  const inDiff = (c, n) => lines.get(c.path)?.has(n) === true;
+  const kept = [];
+  const off = [];
+  for (const [i, c] of comments.entries()) {
+    if (!inDiff(c, c.line)) { off.push(c); continue; }
+    let whole = true;
+    for (let n = c.start_line ?? c.line; n <= c.line; n++) if (!inDiff(c, n)) whole = false;
+    if (whole) { kept.push(c); continue; }
+    const single = singleLine?.[i];
+    if (typeof single !== "string") { off.push(c); continue; }
+    const { start_line: _s, start_side: _side, ...rest } = c;
+    kept.push({ ...rest, body: `${single}\n\n_The suggestion was left out: some of the lines it replaces are no longer in this pull request's diff._` });
+  }
+  return { kept, off };
 }

@@ -33,13 +33,16 @@
     // Providers in order; an entry whose key is not set is skipped. See
     // README.md, "Model providers". The cheaper drafters are here because every
     // finding is now verified (README.md, "Verified findings").
-    "DRAFT_CHAIN": "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it,workers-ai:@cf/zai-org/glm-4.7-flash,workers-ai:@cf/google/gemma-4-26b-a4b-it,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5",
+    // Each Gemini model has its own free quota, so more of them is more free
+    // capacity: a large pull request's batches spread across them (rotated)
+    // rather than waiting on one model's per-minute limit.
+    "DRAFT_CHAIN": "gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,gemini:gemma-4-31b-it,gemini:gemma-4-26b-a4b-it,workers-ai:@cf/zai-org/glm-4.7-flash,workers-ai:@cf/google/gemma-4-26b-a4b-it,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5",
     // Checks every finding; never the drafter's own model.
     "VERIFY_CHAIN": "anthropic:claude-haiku-5-5",
     // A second check that critical and major findings need.
     "ESCALATE_CHAIN": "anthropic:claude-sonnet-5-5",
     // Verifiers when no VERIFY_CHAIN one can run; another kind than the drafter's first.
-    "VERIFY_FALLBACK": "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash",
+    "VERIFY_FALLBACK": "gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash",
     // Nitpicks: chill (collapsed in the body), assertive (inline) or quiet (left out).
     "REVIEW_PROFILE": "chill",
     // Dollars a day of the plan's Anthropic API credit (it stops at zero; never bills).
@@ -48,7 +51,15 @@
     "REASONING_EFFORT": "medium",
     // Of the account's 10,000 free neurons a day; the rest stays for other Workers.
     "DAILY_NEURON_CAP": "6000",
+    // The single-prompt paths only (v1 and REVIEW_MODE=runner).
     "MAX_DIFF_CHARS": "90000",
+    // worker (default): the PR's Durable Object reviews every file itself, in
+    // steps (review-run.js). runner: the earlier light-lane runner path.
+    "REVIEW_MODE": "worker",
+    // A batch of the diff per model call; past MAX_PR_CHARS the rest is named
+    // as not covered and the commit status fails (never dropped silently).
+    "BATCH_CHARS": "60000",
+    "MAX_PR_CHARS": "5000000",
     // Reasoning counts as output: room for both, all reserved in the budget check.
     "MAX_OUTPUT_TOKENS": "12000"
   },

@@ -50,11 +50,14 @@ export function staticJwks(keys) {
 
 export function memoryKv() {
   const m = new Map();
-  return {
+  const kv = {
     map: m,
-    async get(k) { return m.has(k) ? m.get(k) : null; },
-    async put(k, v) { m.set(k, String(v)); },
+    // Every get and put, as Workers counts them (subrequests).
+    ops: 0,
+    async get(k) { kv.ops++; return m.has(k) ? m.get(k) : null; },
+    async put(k, v) { kv.ops++; m.set(k, String(v)); },
   };
+  return kv;
 }
 
 export function responsesResult(text, usage = { input_tokens: 1000, output_tokens: 500, neurons: 66 }) {

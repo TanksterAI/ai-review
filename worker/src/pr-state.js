@@ -12,6 +12,7 @@ import { appConfig } from "./setup.js";
 import { createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
+import { RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -108,6 +109,11 @@ export class PrState {
     this.effects = deps.effects ?? null;
     // () => {ok} | {ok: false, retryAt}: can any model provider take a review now?
     this.capacity = deps.capacity ?? null;
+    // The Worker's own review (review-run.js) needs a fetch and a timer; tests
+    // pass their own.
+    // (Not this.fetch: that is the object's own request handler.)
+    this.fetchImpl = deps.fetch ?? ((...a) => fetch(...a));
+    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.debounceMs = seconds(env?.REVIEW_DEBOUNCE_S, DEBOUNCE_S) * 1000;
     this.debounceMaxMs = Math.max(this.debounceMs, seconds(env?.REVIEW_DEBOUNCE_MAX_S, DEBOUNCE_MAX_S) * 1000);
   }
@@ -281,6 +287,8 @@ export class PrState {
       await this.ctx.storage.put("state", st);
       await this.ctx.storage.delete("debounce");
       await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
+      // A review in progress stops: nothing is posted on a closed PR.
+      for (const prefix of [RUN_META, RUN]) await this.deleteAll([...(await this.ctx.storage.list({ prefix })).keys()]);
       // Their dispatches would only start runners the Worker then refuses.
       const box = (await this.ctx.storage.get("outbox")) ?? [];
       await this.ctx.storage.put("outbox", box.filter((x) => x.type !== "dispatch"));
@@ -354,6 +362,8 @@ export class PrState {
   async alarm() {
     // A quiet period that is over becomes a job (and a dispatch in the outbox).
     await this.fireDebounce();
+    // One step of the review in progress, if any (review-run.js).
+    const runNext = await this.stepActiveRun();
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     const isDue = (x) => !(x.notBefore > this.now());
     const item = box.find(isDue);
@@ -377,11 +387,12 @@ export class PrState {
       }
     }
     const rest = (await this.ctx.storage.get("outbox")) ?? [];
-    if (rest.some(isDue)) {
+    const run = runNext ?? Infinity;
+    if (rest.some(isDue) || run <= this.now()) {
       await this.ctx.storage.setAlarm(this.now());
     } else {
       const d = await this.ctx.storage.get("debounce");
-      const next = Math.min(d ? d.due : Infinity, ...rest.map((x) => x.notBefore));
+      const next = Math.min(d ? d.due : Infinity, run, ...rest.map((x) => x.notBefore));
       // Never in the past: an alarm with nothing due must not fire at once.
       if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next > this.now() ? next : this.now() + RECHECK_MS);
     }
@@ -409,6 +420,7 @@ export class PrState {
       await this.ctx.storage.delete(`job:${jobId}`);
       return undefined;
     }
+    if (this.mode() === "worker") return this.startWorkerRun(held, st);
     // No model provider can take a review now (sized as the review itself,
     // when it was tried before), or the runner said when one will: hold the
     // dispatch rather than start a runner that can only defer. The job is
@@ -493,6 +505,55 @@ export class PrState {
       return this.dispatchJob(fx, item.jobId);
     }
     return undefined;
+  }
+
+  // "worker" (the default): the review runs here, in this object's alarm, in
+  // steps, and covers every file (review-run.js). "runner": the earlier path,
+  // a runner on the light lane that sends the diff to /v1/runner/review.
+  mode() {
+    return String(this.env?.REVIEW_MODE ?? "").trim().toLowerCase() === "runner" ? "runner" : "worker";
+  }
+
+  // One review at a time per pull request: a job that comes while one runs
+  // waits for it (it then reviews from where that one stopped).
+  async startWorkerRun(job, st) {
+    const active = await activeRun(this.ctx.storage);
+    if (active && active.id !== job.id) return { holdUntil: this.now() + RECHECK_MS };
+    const since = job.full ? null : st.lastReviewed;
+    if (!active) await startRun(this.ctx.storage, { ...job, since }, this.now());
+    const now = this.now();
+    await this.ctx.storage.put(`job:${job.id}`, { ...job, since, claimedBy: "worker", claimedAt: now, dispatchedAt: now, firstRunAt: job.firstRunAt ?? now });
+    console.log(JSON.stringify({ svc: "ai-review", ev: "run_started", pr: job.pr }));
+    await this.armAt(now);
+    return undefined;
+  }
+
+  // Runs one step of the review in progress; returns when the next is due.
+  async stepActiveRun() {
+    const run = await activeRun(this.ctx.storage);
+    if (!run) return null;
+    const app = this.effects ? null : await appConfig(this.env);
+    const fx = this.effects ?? createEffects(this.env, { config: app });
+    const slug = app?.slug ?? DEFAULT_SLUG;
+    const ctx = {
+      storage: this.ctx.storage, env: this.env, cfg: config(this.env), fx,
+      deps: { now: this.now, sleep: this.sleep, fetch: this.fetchImpl, log: (e) => console.log(JSON.stringify({ svc: "ai-review", ...e })) },
+      again: `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`,
+      onDone: (r, out) => this.runDone(r, out),
+    };
+    return stepRun(ctx, run.id);
+  }
+
+  // A run is over: its job completes (moving lastReviewed on) or is dropped,
+  // and its stored state goes. One given up says so on the PR.
+  async runDone(run, { reviewedSha, gaveUp, description }) {
+    if (reviewedSha) await this.complete({ jobId: run.id, runId: "worker", reviewedSha });
+    else await this.ctx.storage.delete(`job:${run.id}`);
+    await dropRun(this.ctx.storage, run.id);
+    if (gaveUp) {
+      const why = String(description ?? "the review kept failing").replace(/[`\n]/g, " ").slice(0, 200);
+      await this.outbox({ type: "comment", template: "gave_up", reason: why, tries: 3, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
+    }
   }
 
   async capacityNow(chars, skip = []) {

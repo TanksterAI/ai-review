@@ -2,7 +2,7 @@
 
 Line-by-line AI review on every TanksterAI pull request: £0, and no secrets anywhere.
 
-It gives each pull request what CodeRabbit's Free plan does not: inline comments on real defects. CodeRabbit still posts its summary, and the Claude review in the merge gate is unchanged. This is a second, independent opinion from a different model, and it is advisory only: it never approves and never blocks.
+It gives each pull request what CodeRabbit's Free plan does not: inline comments on real defects. CodeRabbit still posts its summary, and the Claude review in the merge gate is unchanged. This is a second, independent opinion from a different model. Its review is advisory: it never approves and never requests changes. Its commit status, **Tankster AI Review**, reports whether every reviewable file was covered, and the merge gate requires that to pass (see "Full coverage").
 
 ## How it works
 
@@ -73,12 +73,29 @@ This repository's own pull requests are reviewed by hand. Its `ai-review.yml` ru
 v2 moves to an org-wide GitHub App, **Tankster AI Review**. It needs no caller file in each repository, and it adds chat, commands and incremental reviews. The aim is parity with CodeRabbit and beyond. The design is in the Tankster AI project notes (`ai-review-v2-coderabbit-parity-design-2026-11-12.md`), and the work is tracked in Linear project "ai-review v2: CodeRabbit parity".
 
 ```
-GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Object ──alarm──▶ workflow_dispatch
-                    (HMAC verified)                (state, single-use jobs)     │
-                                                                                ▼
-                    Worker /v1/runner/review ◀── runner.yml (this repo, light lane, OIDC)
-                    model, then posts as tankster-ai-review[bot]
+GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Object (state, single-use jobs)
+                    (HMAC verified)                │ alarm, in steps (REVIEW_MODE=worker, the default)
+                                                   ▼
+                    read the PR and every file ─▶ batches ─▶ draft ─▶ ground ─▶ verify ─▶ one review
+                    (read-only App token)          (coverage.js)                         + commit status
+                                                                                         "Tankster AI Review"
+
+REVIEW_MODE=runner (the earlier path): the alarm starts runner.yml (light lane, OIDC), which
+sends the diff to Worker /v1/runner/review in one request (one prompt, at most 90,000 characters).
 ```
+
+### Full coverage: every file, however big the pull request
+
+The review used to put the whole diff in one prompt of at most 90,000 characters (20,000 a file), and skip whatever did not fit as "over the size budget". On large pull requests that left out every test file and the README, and still said "No material problems found". Now (PR C, TAN-278) the PR's Durable Object reviews the pull request itself, in steps of its alarm, and nothing is left out for size:
+
+- **Every file is read.** The Worker lists the pull request's files with a read-only App token (GitHub lists up to 3,000). For a file GitHub sends without a patch (its API leaves the patch out of very large diffs), it fetches the old text (at the merge base) and the new text and works the diff out itself (`linediff.js`). Those findings go in the review body, since GitHub may not accept comments on lines of a diff it did not make.
+- **Batches.** The whole diff is cut into batches of at most `BATCH_CHARS` (60,000) characters, one model call each (`coverage.js`): small prompts are more accurate. A file bigger than a batch is split at hunk boundaries, and a hunk bigger than a batch between lines, so every line is shown once, with its true line number. Code comes first, then tests, then docs, and each pass is told which other files are reviewed in the other passes.
+- **No waiting while anything can work.** Up to 4 batches are drafted at once. Each batch tries the whole chain of free models, rotated so that batches running together use different free quotas; each Gemini model has its own. A model out of quota hands the batch to the next at once. Claude Haiku, on the plan's credit (`ANTHROPIC_DAILY_USD_CAP`), is last. A batch waits only when every drafter (or every verifier) is out, and only until the first resets; the commit status says so meanwhile.
+- **Every finding is verified**, batch by batch, as in "Verified findings" below, and all of them go into one review.
+- **What is never reviewed** is still named: deleted files, lockfiles and generated files (as CodeRabbit's default path filters skip them), and binary files.
+- **Coverage is a gate.** The footer gives the coverage ("18 of 18 reviewable files (100%) … in 4 passes"), and the hidden findings block records it (`coverage: {reviewable, covered, complete}`). The commit status **Tankster AI Review** is `success` only when every reviewable file was covered, `failure` otherwise (an incomplete review also says so in its first line), and `pending` while the review runs or waits. The merge gate requires it.
+- **Limits, stated rather than hidden.** Past `MAX_PR_CHARS` (5,000,000 characters of diff), past GitHub's 3,000-file list, or for a file over 5 MB, the rest is named as not covered and the status fails. A run waits at most three days for providers.
+- **Steps stay inside Workers Free.** Each alarm makes at most 45 subrequests (Workers Free allows 50); an alarm may run for 15 minutes with 30 s of CPU. A step that fails is retried; the run's state is in the Durable Object's storage (`run:<job id>`). One review runs at a time per pull request; a push or command meanwhile waits for it, then reviews from where it stopped. Closing the pull request stops a review in progress.
 
 - **When it reviews** (as CodeRabbit does):
   - **Opened, reopened, or marked ready for review:** at once. That covers the whole PR the first time, and the commits since the last review after that. Drafts wait until they are marked ready, and converting a PR to a draft drops a push that is still waiting.
@@ -106,11 +123,11 @@ GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Obj
   - PRs from forks, outside authors and bots wait until someone with write access comments `@tankster-ai-review review`.
 - **Failures and retries.** The Durable Object performs one side effect per alarm. An item stays stored until its effect succeeds, and is retried up to five times.
 - **Rate limits.** Replies to people without write access, and `help`, go out at most once an hour per person. Text that is not a command gets no reply.
-- **What the App needs.** The manifest asks only for what P1 uses:
-  - repository permissions: Metadata read, Contents read, Pull requests read and write, Issues read (for `issue_comment` events), and Actions read and write (to start `runner.yml`);
+- **What the App needs.** The manifest asks only for what it uses:
+  - repository permissions: Metadata read, Contents read, Pull requests read and write, Issues read (for `issue_comment` events), Actions read and write (to start `runner.yml`), and Commit statuses read and write (the coverage status);
   - events: `pull_request`, `issue_comment`, `pull_request_review_comment`.
 
-  Later phases add permissions, and GitHub asks the owner to approve each addition.
+  Later phases add permissions, and GitHub asks the owner to approve each addition. **Commit statuses** came with full coverage: the App created before it must be given it once (App settings → Permissions & events → Commit statuses: Read and write, then accept the request on the organisation's installation). Until then reviews are still posted, and the Worker logs `status_unavailable` instead of setting the status.
 - **Commands.** `review`, `full review`, `pause`, `resume` and `help`. Everything except `help` needs write access, checked through the API.
 - **Secrets: nobody handles them.** The App is created once, from a manifest:
   - Open `https://tankster-ai-review.rishi-tank.workers.dev/v1/setup/github-app` and press the button. GitHub creates the App in TanksterAI.
@@ -149,7 +166,7 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
 | Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `DRAFT_CHAIN`, `VERIFY_CHAIN`, `ESCALATE_CHAIN`, `VERIFY_FALLBACK`, `REVIEW_PROFILE`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) `VERIFY_BUDGET_MS` (verification's time limit, 150,000 ms by default) and `REVIEW_DEADLINE_MS` (the whole review's, 270,000 ms) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `REVIEW_MODE`, `BATCH_CHARS`, `MAX_PR_CHARS`, `DRAFT_CHAIN`, `VERIFY_CHAIN`, `ESCALATE_CHAIN`, `VERIFY_FALLBACK`, `REVIEW_PROFILE`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) `VERIFY_BUDGET_MS` (verification's time limit, 150,000 ms by default) and `REVIEW_DEADLINE_MS` (the whole review's, 270,000 ms) |
 | Secrets | None needed. Optional: `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` add those providers (see below); `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
 `GET /healthz` shows today's neuron spend and each provider: whether it is set up and, if it is out of quota, until when. It never shows a key.
@@ -263,9 +280,9 @@ These are Worker settings for now; a per-repository key (`reviews.profile` in `.
 
 ## Limits worth knowing
 
-- **What it reads.** It sees the diff, not the whole repository, so it can miss problems that need wider context. It reads up to 90,000 characters of diff, 20,000 per file. Code comes before tests and docs, and lockfiles and generated files are skipped. The review lists what it did not read.
+- **What it reads.** It sees the diff, not the whole repository, so it can miss problems that need wider context. The App's review (REVIEW_MODE=worker) reads every reviewable file, in batches (see "Full coverage"). The single-prompt paths (v1's `review.yml`, and REVIEW_MODE=runner) still read at most 90,000 characters of diff, 20,000 per file, and list what they did not read; they set no coverage status, so they never satisfy the merge gate.
 - **Light runner.** It cannot start a Node binary downloaded by `actions/setup-node` (its image has no `libatomic.so.1`), so this repository's CI runs the tests on the Node 24 that the runner ships for JavaScript actions. The review job is a JavaScript action and is unaffected.
-- **CPU.** Workers Free allows 10 ms of CPU per request. The workflow therefore sends at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it. The grounding gate collects the diff's words once and reads only a few lines per finding.
+- **CPU.** Workers Free allows 10 ms of CPU per request, so the single-prompt paths' workflows send at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it. A Durable Object alarm has 30 s, which is why the full-coverage review runs there. The grounding gate collects the diff's words once and reads only a few lines per finding.
 - **Verification narrows errors; it cannot end them.**
   - Two models can agree on a wrong finding.
   - The verifier sees the diff, not the whole file, so it can miss context that lies elsewhere (full files come with the Worker-side review, PR C).
@@ -294,6 +311,7 @@ This runs the following, against stand-ins:
 - the one-time manifest setup, including its guards;
 - webhook signatures and normalisation;
 - the PR Durable Object, including outbox retries, rate limits and job claims;
+- full coverage: batching and splitting (`coverage.test.js`), the line diff (`linediff.test.js`, against random edits), the review in steps (`review-run.test.js`: PR #9's shape at 100%, quota hand-over, waiting only when everything is out, files without a patch, the 50-subrequest bound, incremental reviews) and the PR object running it (`worker-mode.test.js`, including a PR closed mid-step);
 - the GitHub side effects;
 - the workflows' own `github-script` steps, exactly as written in `review.yml`, `release-v1.yml` and `runner.yml`.
 

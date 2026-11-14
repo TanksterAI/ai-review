@@ -45,6 +45,9 @@ export function manifest(origin) {
       pull_requests: "write",
       issues: "read",
       actions: "write",
+      // The "Tankster AI Review" commit status: success only when every
+      // reviewable file of the pull request was covered (the merge gate).
+      statuses: "write",
     },
     default_events: ["pull_request", "issue_comment", "pull_request_review_comment"],
   };

@@ -7,6 +7,12 @@ export function config(env) {
     effort: ["low", "medium", "high"].includes(env.REASONING_EFFORT) ? env.REASONING_EFFORT : "medium",
     cap: num(env.DAILY_NEURON_CAP, 6000),
     maxChars: num(env.MAX_DIFF_CHARS, 90_000),
+    // The Worker's own review (review-run.js) covers every file: the diff is
+    // cut into batches of at most this many characters, one model call each.
+    batchChars: num(env.BATCH_CHARS, 60_000),
+    // Past this much diff in one pull request, the rest is named as not
+    // covered (and the commit status fails) rather than reviewed.
+    maxPrChars: num(env.MAX_PR_CHARS, 5_000_000),
     maxOutput: num(env.MAX_OUTPUT_TOKENS, 12_000),
     // The whole review's time limit, drafting and verifying (milliseconds).
     reviewDeadlineMs: num(env.REVIEW_DEADLINE_MS, 270_000),

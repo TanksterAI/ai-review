@@ -864,3 +864,38 @@ test("classifyFindings keeps the grounding fields, bounded: claim inline, eviden
   const r = renderReview({ answer: { summary: "s" }, classified: c, prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
   assert.doesNotMatch(r.comments[0].body, /const y = x \/ 0;/);
 });
+
+// --- full coverage (PR C) ---------------------------------------------------
+
+const coverageMeta = { model: "m", modelLine: "- Model: `m`", costLine: "- Cost: nothing (free tier).", headSha: "d".repeat(40) };
+const coveragePrepared = (coverage, omitted = []) => ({ included: ["src/a.js", "src/b.js"], omitted, chars: 214_630, coverage });
+
+test("a complete review says every reviewable file was covered, and in how many passes", () => {
+  const r = renderReview({
+    answer: null, classified: { inline: [], general: [] },
+    prepared: coveragePrepared({ reviewable: 2, covered: 2, complete: true, passes: 4 }, [{ path: "package-lock.json", reason: "generated or lockfile" }]),
+    verification: { off: false }, meta: coverageMeta,
+  });
+  assert.match(r.body, /\n- Coverage: 2 of 2 reviewable files \(100%\), 214,630 characters of diff, in 4 passes\. Not reviewable \(1\): `package-lock\.json` \(generated or lockfile\)\.\n/);
+  assert.doesNotMatch(r.body, /Incomplete/);
+  assert.deepEqual(parseFindingsBlock(r.body).coverage, { reviewable: 2, covered: 2, complete: true });
+});
+
+test("an incomplete review says so first, names what was not covered, and its block records it", () => {
+  const r = renderReview({
+    answer: null, classified: { inline: [], general: [] },
+    prepared: { ...coveragePrepared({ reviewable: 3, covered: 2, complete: false, passes: 2 }), uncovered: [{ path: "src/c.js", reason: "its diff was not sent" }] },
+    verification: { off: false }, meta: coverageMeta,
+  });
+  assert.match(r.body, /### AI review \(advisory\)\n\n\*\*Incomplete review: 2 of 3 reviewable files were covered\.\*\* /);
+  assert.match(r.body, /\n- Coverage: 2 of 3 reviewable files \(66%\), 214,630 characters of diff, in 2 passes\. Not covered \(1\): `src\/c\.js` \(its diff was not sent\)\. The commit status stays failing until every file is reviewed\.\n/);
+  assert.deepEqual(parseFindingsBlock(r.body).coverage, { reviewable: 3, covered: 2, complete: false });
+});
+
+test("one pass of several tells the model the other files exist and are reviewed elsewhere", () => {
+  const p = prepareFiles([{ filename: "src/a.js", patch: PATCH }]);
+  const { instructions, input } = buildPrompt({ repository: "TanksterAI/x", title: "t", body: "b", prepared: { ...p, elsewhere: ["src/b.js", "README.md"] }, pass: { index: 2, total: 3 }, tag: "t1" });
+  assert.match(instructions, /This is pass 2 of 3 of a large pull request\./);
+  assert.match(input, /<<<BEGIN OTHER FILES IN THIS PULL REQUEST t1>>>\n"src\/b\.js"\n"README\.md"\n<<<END OTHER FILES IN THIS PULL REQUEST t1>>>/);
+  assert.doesNotMatch(input, /All changed files are shown/);
+});

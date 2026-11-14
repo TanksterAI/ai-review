@@ -398,9 +398,13 @@ test("production settings: verification is on, with every chain and the placemen
   assert.equal(vars.UNCONFIRMED, undefined, "unconfirmed findings are always hidden");
   assert.equal(vars.VERIFY_CHAIN, "anthropic:claude-haiku-5-5");
   assert.equal(vars.ESCALATE_CHAIN, "anthropic:claude-sonnet-5-5");
-  assert.equal(vars.VERIFY_FALLBACK, "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash");
+  assert.equal(vars.VERIFY_FALLBACK, "gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash");
   assert.equal(vars.REVIEW_PROFILE, "chill");
-  assert.equal(vars.DRAFT_CHAIN, "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it,workers-ai:@cf/zai-org/glm-4.7-flash,workers-ai:@cf/google/gemma-4-26b-a4b-it,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5");
+  assert.equal(vars.DRAFT_CHAIN, "gemini:gemini-3.5-flash-lite,gemini:gemini-3.1-flash-lite,gemini:gemma-4-31b-it,gemini:gemma-4-26b-a4b-it,workers-ai:@cf/zai-org/glm-4.7-flash,workers-ai:@cf/google/gemma-4-26b-a4b-it,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5");
+  // Full coverage: the PR's Durable Object reviews every file itself.
+  assert.equal(vars.REVIEW_MODE, "worker");
+  assert.equal(vars.BATCH_CHARS, "60000");
+  assert.equal(vars.MAX_PR_CHARS, "5000000");
 });
 
 test("four batches against a nearly spent cap: they go in turn, the cap holds, and the ledger is what was spent", async () => {
