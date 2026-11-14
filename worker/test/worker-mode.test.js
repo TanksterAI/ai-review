@@ -172,3 +172,45 @@ test("a run step that throws does not hold up the outbox: commands are still ans
   assert.ok(m.fx.calls.some((c) => c[0] === "comment" && /paused/.test(c[1])));
   assert.ok(m.storage.alarm > m.now(), "the run is looked at again later");
 });
+
+test("a review that waits for hours still records its finish: the next review is incremental from it", async () => {
+  const m = make();
+  let out = true;
+  const day = reply(429, { error: { details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }] } });
+  m.obj.fetchImpl = async (url, init) => (out && url.includes("generativelanguage") ? day : models(url, init));
+  m.env.ANTHROPIC_API_KEY = "";
+  await m.obj.onEvent({ delivery: "d1", ev: ev() });
+  await settle(m, NOW + 600_000);
+  // Hours later, a push; then the quota comes back.
+  m.set(NOW + 3 * 3600_000);
+  m.state.head = sha("e");
+  m.state.compare = (base) => (base === sha("a") ? { status: "ahead", files: [{ filename: "src/new.js", status: "added", additions: 2, deletions: 0, patch: added(2, "new_") }] } : null);
+  await m.obj.onEvent({ delivery: "d2", ev: ev({ action: "synchronize" }) });
+  // The run still reads head a (it read it before the wait); the quota is
+  // back at the reset.
+  out = false;
+  await settle(m, NOW + 2 * 24 * 3600_000);
+  const st = await m.storage.get("state");
+  assert.equal(m.fx.posted.length, 2, "the waiting review, then the push's");
+  assert.match(m.fx.posted[1].body, /_Incremental review: commits after `aaaaaaa`\._/);
+  assert.equal(st.lastCompleteReviewed, sha("e"));
+});
+
+test("a run step failing before it starts (no App configured) backs off and is given up, never looping", async () => {
+  const m = make();
+  await m.obj.onEvent({ delivery: "d1", ev: ev() });
+  m.storage.alarm = null;
+  await m.obj.alarm(); // the run starts
+  assert.ok(await m.storage.get("runmeta:" + (await m.storage.list({ prefix: "job:" })).keys().next().value.slice(4)));
+  m.obj.effects = null; // from now on createEffects throws: the App is not set up
+  let wakes = 0;
+  for (let i = 0; i < 500 && m.storage.alarm !== null && m.storage.alarm !== undefined; i++) {
+    if (m.storage.alarm > m.now()) m.set(m.storage.alarm);
+    m.storage.alarm = null;
+    await m.obj.alarm();
+    wakes++;
+  }
+  assert.ok(wakes <= 8, `${wakes} wake-ups`);
+  assert.ok(m.now() - NOW > 60_000, "it backed off");
+  assert.deepEqual([...(await m.storage.list({ prefix: "run" })).keys()], []);
+});

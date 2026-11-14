@@ -28,7 +28,7 @@ export const MAX_PR_CHARS = 5_000_000;
 const HEADER_ROOM = 160;
 const LINE_NO = /^\s*(\d+) [+ ] /;
 
-function longestLine(text) {
+export function longestLine(text) {
   let max = 0;
   for (let at = 0; at < text.length;) {
     const end = text.indexOf("\n", at);
@@ -141,13 +141,12 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
     const path = f.filename;
     const skip = skipReason(f);
     if (skip) { skipped.push({ path, reason: skip }); continue; }
+    const long = `a line over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters: minified or generated`;
+    if (f.minified === true) { skipped.push({ path, reason: long }); continue; }
     if (typeof f.unfetched === "string") { uncovered.push({ path, reason: f.unfetched }); continue; }
     if (f.patch_omitted === true) { uncovered.push({ path, reason: "its diff was not sent" }); continue; }
     if (typeof f.patch !== "string" || f.patch.length === 0) { skipped.push({ path, reason: "binary or no textual diff" }); continue; }
-    if (longestLine(f.patch) > LONG_LINE_BATCHES * batchChars) {
-      skipped.push({ path, reason: `a line over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters: minified or generated` });
-      continue;
-    }
+    if (longestLine(f.patch) > LONG_LINE_BATCHES * batchChars) { skipped.push({ path, reason: long }); continue; }
     // The limit is checked on the raw patch first, so a file far past it is
     // never annotated (annotation adds about 8 characters a line).
     if (chars + f.patch.length > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }

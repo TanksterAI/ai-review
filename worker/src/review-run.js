@@ -27,7 +27,7 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
-import { batchPrepared, coverageOf, planReview, prLimitReason, skipReason } from "./coverage.js";
+import { BATCH_CHARS, LONG_LINE_BATCHES, batchPrepared, coverageOf, longestLine, planReview, prLimitReason, skipReason } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
 import { createProviders, draftChain } from "./providers.js";
@@ -81,14 +81,19 @@ export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.hea
 // A file's record holds its patch's length, never the patch: the patch is in
 // pieces of its own, so the plan can choose what fits the pull request's
 // limit before it loads any text.
-const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries"];
+const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries", "minified"];
 
 async function putFile(storage, id, i, f) {
   const rec = {};
   for (const k of META_FIELDS) if (f[k] !== undefined) rec[k] = f[k];
   const patch = typeof f.patch === "string" ? f.patch : null;
   rec.patchLen = patch === null ? -1 : patch.length;
-  if (patch !== null) { let n = 1; for (let k = patch.indexOf("\n"); k >= 0; k = patch.indexOf("\n", k + 1)) n++; rec.patchLines = n; }
+  if (patch !== null) {
+    let n = 1;
+    for (let k = patch.indexOf("\n"); k >= 0; k = patch.indexOf("\n", k + 1)) n++;
+    rec.patchLines = n;
+    rec.longest = longestLine(patch);
+  }
   rec.pieces = patch === null ? 0 : Math.max(1, Math.ceil(patch.length / PIECE));
   for (let k = 0; k < rec.pieces; k++) await storage.put(pieceKey(id, i, k), patch.slice(k * PIECE, (k + 1) * PIECE));
   await storage.put(fileKey(id, i), rec);
@@ -100,11 +105,14 @@ const getMeta = (storage, id, i) => storage.get(fileKey(id, i));
 // gains its number (about 8 characters), and each part a header.
 export const ANNOTATION_PER_LINE = 8;
 const costOf = (len, lines) => len + ANNOTATION_PER_LINE * lines + 200;
+// A file planReview will skip as minified or generated (coverage.js): it
+// never counts against the limit, wherever it is in the list.
+const tooLong = (longest, cfg) => longest > LONG_LINE_BATCHES * (cfg.batchChars ?? BATCH_CHARS);
 
 async function getFile(storage, id, i) {
   const rec = await getMeta(storage, id, i);
   if (!rec) return rec;
-  const { pieces, patchLen, patchLines: _n, ...f } = rec;
+  const { pieces, patchLen, patchLines: _n, longest: _l, ...f } = rec;
   if (patchLen < 0) return f;
   const parts = [];
   for (let k = 0; k < pieces; k++) parts.push(await storage.get(pieceKey(id, i, k)));
@@ -300,7 +308,7 @@ async function stageContent(ctx, run, save) {
     run.patchChars = 0;
     for (let i = 0; i < run.files; i++) {
       const m = await getMeta(ctx.storage, run.id, i);
-      if (m && m.patchLen > 0 && !skipReason(m)) run.patchChars += costOf(m.patchLen, m.patchLines ?? 0);
+      if (m && m.patchLen > 0 && !skipReason(m) && !tooLong(m.longest ?? 0, ctx.cfg)) run.patchChars += costOf(m.patchLen, m.patchLines ?? 0);
     }
   }
   if (!run.mergeBase) {
@@ -343,7 +351,9 @@ async function stageContent(ctx, run, save) {
           f.unfetched = "its diff could not be worked out";
         }
         const lines = patch ? patch.split("\n").length : 0;
-        if (patch && costOf(patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+        // Minified or generated data: named as such, never kept or counted.
+        if (patch && tooLong(longestLine(patch), ctx.cfg)) f.minified = true;
+        else if (patch && costOf(patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
         else if (patch) { f.patch = patch; f.synthetic = true; run.patchChars += costOf(patch.length, lines); }
       }
       f.checked = true;
@@ -369,7 +379,8 @@ async function stagePlan(ctx, run, save) {
   const files = [];
   let budget = ctx.cfg.maxPrChars;
   for (const { i, m } of metas) {
-    const { pieces: _p, patchLen: _l, patchLines: _n, ...rec } = m;
+    const { pieces: _p, patchLen: _l, patchLines: _n, longest: _g, ...rec } = m;
+    if (m.patchLen > 0 && tooLong(m.longest ?? 0, ctx.cfg)) { files.push({ ...rec, minified: true }); continue; }
     if (m.patchLen > 0 && !skipReason(m) && m.unfetched === undefined) {
       const cost = costOf(m.patchLen, m.patchLines ?? 0);
       if (cost > budget) { files.push({ ...rec, unfetched: prLimitReason(ctx.cfg.maxPrChars) }); continue; }

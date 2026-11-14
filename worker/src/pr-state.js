@@ -259,7 +259,9 @@ export class PrState {
   async newJob(ev, st, { full = false, requestedBy = null, queue = true } = {}) {
     // Drop jobs that can no longer be claimed, so they never pile up.
     const old = await this.ctx.storage.list({ prefix: "job:" });
-    await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS).map(([k]) => k));
+    // Never the job of the review in progress: it may wait hours for a provider.
+    const running = (await activeRun(this.ctx.storage))?.id;
+    await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running).map(([k]) => k));
     const id = jobIdFor(`${ev.repo.full}#${ev.pr}`);
     const job = {
       id,
@@ -366,12 +368,27 @@ export class PrState {
     // One step of the review in progress, if any (review-run.js). A step that
     // throws must not hold up the outbox: commands are still answered, and the
     // run is looked at again shortly.
+    // Failures here (before the run's own step, which counts its own) back
+    // off, and six in a row give the run up: it must never wake for ever.
     let runNext;
     try {
       runNext = await this.stepActiveRun();
+      await this.ctx.storage.delete("runFailures");
     } catch (e) {
-      console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", error: String(e?.message ?? e).slice(0, 200) }));
-      runNext = this.now() + RECHECK_MS;
+      const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
+      console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
+      if (n >= 6) {
+        const run = await activeRun(this.ctx.storage);
+        if (run) {
+          await dropRun(this.ctx.storage, run.id);
+          await this.ctx.storage.delete(`job:${run.id}`);
+        }
+        await this.ctx.storage.delete("runFailures");
+        runNext = null;
+      } else {
+        await this.ctx.storage.put("runFailures", n);
+        runNext = this.now() + Math.min(3600_000, RECHECK_MS * 2 ** (n - 1));
+      }
     }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     const isDue = (x) => !(x.notBefore > this.now());
@@ -527,7 +544,9 @@ export class PrState {
   // waits for it (it then reviews from where that one stopped).
   async startWorkerRun(job, st) {
     const active = await activeRun(this.ctx.storage);
-    if (active && active.id !== job.id) return { holdUntil: this.now() + RECHECK_MS };
+    // Held until the running review can next move (no sooner than RECHECK_MS):
+    // a review waiting hours for a provider must not wake this every 30 s.
+    if (active && active.id !== job.id) return { holdUntil: Math.max(this.now() + RECHECK_MS, active.waitUntil || 0) };
     // Only a full-coverage review's commit is a starting point: the runner and
     // v1 move lastReviewed too, but read at most 90,000 characters.
     const since = job.full ? null : (st.lastCompleteReviewed ?? null);
@@ -543,6 +562,10 @@ export class PrState {
   async stepActiveRun() {
     const run = await activeRun(this.ctx.storage);
     if (!run) return null;
+    // A run may wait hours for a provider: its job is kept fresh meanwhile, or
+    // newJob would prune it (JOB_TTL_MS) and the finish could not be recorded.
+    const job = await this.ctx.storage.get(`job:${run.id}`);
+    if (job) await this.ctx.storage.put(`job:${run.id}`, { ...job, createdAt: this.now() });
     const app = this.effects ? null : await appConfig(this.env);
     const fx = this.effects ?? createEffects(this.env, { config: app });
     const slug = app?.slug ?? DEFAULT_SLUG;
