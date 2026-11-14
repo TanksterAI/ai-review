@@ -30,6 +30,12 @@
     // Comma-separated; an entry ending in * is a prefix. Whoever can move v1
     // or push to main (write access to ai-review) is trusted: see README.md.
     "WORKFLOW_REFS": "TanksterAI/ai-review/.github/workflows/review.yml@refs/tags/v1,TanksterAI/ai-review/.github/workflows/review.yml@refs/heads/main",
+    // Providers in order; an entry whose key is not set is skipped. See
+    // README.md, "Model providers". Cheaper Workers AI models join the chain
+    // with the finding verifier (TAN-299), not before.
+    "DRAFT_CHAIN": "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5",
+    // Dollars a day of the plan's Anthropic API credit (it stops at zero; never bills).
+    "ANTHROPIC_DAILY_USD_CAP": "5",
     "MODEL": "@cf/openai/gpt-oss-120b",
     "REASONING_EFFORT": "medium",
     // Of the account's 10,000 free neurons a day; the rest stays for other Workers.
