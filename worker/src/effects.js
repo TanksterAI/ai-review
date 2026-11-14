@@ -68,8 +68,10 @@ export function createEffects(env, deps = {}) {
     },
 
     // Read-only, for the runner's clone: contents and pull requests of one repo.
+    // Fresh for every run: the runner revokes it when it ends, so a cached,
+    // shared token would fail with 401 for every other run on that repository.
     async cloneToken(repoFull) {
-      return app.installationToken([nameOf(repoFull)], { contents: "read", pull_requests: "read" });
+      return app.installationToken([nameOf(repoFull)], { contents: "read", pull_requests: "read" }, { fresh: true });
     },
 
     // The lines a review comment may sit on: the RIGHT side of the PR's own
