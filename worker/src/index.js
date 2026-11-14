@@ -23,7 +23,7 @@
 // with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
-import { buildPrompt, classifyFindings, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
+import { buildPrompt, classifyFindings, codeSpan, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
 import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
 import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { prKeyOfJob } from "./pr-state.js";
@@ -146,6 +146,37 @@ export async function handleReview(request, env, deps = {}) {
   return json(out.status, out.body);
 }
 
+// A comment's first line (its labels and title), for lists where the whole
+// comment would not read well: suggestion and prompt blocks do not flatten.
+export function titleLine(body) {
+  return String(body).split("\n")[0].slice(0, 300);
+}
+
+/**
+ * For an incremental review: which comments still fit the PR's own diff
+ * (lines: path -> Set of RIGHT-side lines). A suggestion's range must be there
+ * whole; when only its first lines left the diff, the comment stays on its
+ * own line with the body renderReview made without the suggestion (never
+ * edited here: a multi-line replacement must not reach a one-line comment).
+ * Anything else goes in the body.
+ */
+export function placeComments(comments, singleLine, lines) {
+  const inDiff = (c, n) => lines.get(c.path)?.has(n) === true;
+  const kept = [];
+  const off = [];
+  for (const [i, c] of comments.entries()) {
+    if (!inDiff(c, c.line)) { off.push(c); continue; }
+    let whole = true;
+    for (let n = c.start_line ?? c.line; n <= c.line; n++) if (!inDiff(c, n)) whole = false;
+    if (whole) { kept.push(c); continue; }
+    const single = singleLine?.[i];
+    if (typeof single !== "string") { off.push(c); continue; }
+    const { start_line: _s, start_side: _side, ...rest } = c;
+    kept.push({ ...rest, body: `${single}\n\n_The suggestion was left out: some of the lines it replaces are no longer in this pull request's diff._` });
+  }
+  return { kept, off };
+}
+
 // The review itself, shared by the v1 endpoint (/v1/review) and the App's
 // runner endpoint. Returns {status, body}; callers turn it into a Response.
 // again: the review's "Review again" line, set by the Worker (never taken from
@@ -187,18 +218,23 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   // Up to two model calls:
   //   - out of capacity (3040): try once more after a 3 s pause;
   //   - an answer cut short (status "incomplete", reasoning used the room):
-  //     try once more with low reasoning effort, if the budget allows.
+  //     try once more with low reasoning effort, if the budget allows;
+  //   - an answer that tried to be JSON but does not parse (escaping code in
+  //     a suggestion is where models slip): try once more, if the budget allows.
+  //   Either retry asks for no suggestions, which makes the answer shorter and
+  //   its JSON simpler.
   // The account's daily allocation used up (3036) is a deferral, like our cap.
   let effort = cfg.effort;
   let neurons = 0;
   let spent = spentBefore;
   let answer = null;
   let lastStatus;
+  let note = "";
   for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
     let result;
     try {
       result = await env.AI.run(cfg.model, {
-        instructions,
+        instructions: instructions + note,
         input: modelInput,
         reasoning: { effort },
         max_output_tokens: cfg.maxOutput,
@@ -230,11 +266,14 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     neurons += used;
     spent = await ledger.add(used);
     lastStatus = result?.status;
-    answer = parseAnswer(extractText(result));
+    const text = extractText(result);
+    answer = parseAnswer(text);
     if (!answer) {
       log({ ev: "unparseable", repository, pr, attempt, neurons: Math.round(used), status: lastStatus });
-      if (lastStatus !== "incomplete" || spent + estimate > cfg.cap) break;
-      effort = "low";
+      const cut = lastStatus === "incomplete";
+      if ((!cut && !text.includes("{")) || spent + estimate > cfg.cap) break;
+      if (cut) effort = "low";
+      note = "\nYour previous answer could not be used. Answer again, shorter, and leave out every \"suggestion\" key.";
     }
   }
   if (!answer) {
@@ -243,8 +282,8 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
       : "the model did not return a usable answer; try again later";
     return res(502, { status: "failed", reason });
   }
-  const classified = classifyFindings(answer, prepared.commentable);
-  const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap, again } });
+  const classified = classifyFindings(answer, prepared.commentable, prepared.lineText);
+  const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap, again, headSha } });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
     ev: "reviewed",
@@ -373,12 +412,11 @@ export async function handleRunnerReview(request, env, deps = {}) {
       // Inline comments may only sit on lines of the PR's own diff; findings on
       // lines a later commit undid go in the body instead.
       const lines = await fx.prLines(job.repo.full, job.pr, comments.map((c) => c.path));
-      const off = comments.filter((c) => !lines.get(c.path)?.has(c.line));
-      comments = comments.filter((c) => lines.get(c.path)?.has(c.line));
+      const { kept, off } = placeComments(comments, review.singleLine, lines);
+      comments = kept;
       if (off.length) {
-        text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off
-          .map((c) => `- \`${c.path}:${c.line}\`: ${String(c.body).replace(/\n+/g, " ")}`)
-          .join("\n")}`;
+        // The path is the PR author's: through codeSpan, like every path shown.
+        text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
       }
       text += `\n\n_Incremental review: commits after \`${since.slice(0, 7)}\`._`;
     }
