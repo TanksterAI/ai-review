@@ -206,6 +206,59 @@ test("incremental: findings off the PR's own diff move to the body", async () =>
   assert.match(post.body, /Incremental review: commits after `aaaaaaa`/);
 });
 
+test("incremental: a suggestion's whole range must still be in the PR's diff", async () => {
+  const e = env({ AI: { async run() {
+    return responsesResult(JSON.stringify({ summary: "s", findings: [
+      { path: "src/a.js", start_line: 2, line: 3, severity: "major", category: "bug", title: "Range", body: "b\n\n```suggestion\nconst y = 9;\n```", suggestion: "const x = 3;\nconst y = 1;" },
+      { path: "src/a.js", line: 3, severity: "minor", category: "bug", title: "Single", body: "b", suggestion: "const y = 1;" },
+    ] }));
+  } } });
+  const first = await openPr(e);
+  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  await handleRunnerReview(await runnerReq("/v1/runner/review", { job: first, head_sha: "a".repeat(40), files }), e, deps(e));
+  const full = e.fx.calls.filter((c) => c[0] === "postReview")[0][3];
+  assert.deepEqual(full.comments.map((c) => [c.start_line, c.line]), [[2, 3], [undefined, 3]]);
+  await handleWebhook(hook(prBody("synchronize")), e);
+  e.clock.t += 180_000;
+  await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
+  await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
+  const next = e.fx.calls.filter((c) => c[0] === "dispatch")[1][1];
+  // Line 2 left the PR's diff; line 3 is still there.
+  e.fx.prLinesMap = new Map([["src/a.js", new Set([3])]]);
+  await handleRunnerReview(await runnerReq("/v1/runner/review", {
+    job: next, head_sha: "e".repeat(40), since: "a".repeat(40), files,
+  }, { run_id: "8000" }), e, deps(e));
+  const post = e.fx.calls.filter((c) => c[0] === "postReview")[1][3];
+  // Line 3 is still there: the range comment stays on it, without its
+  // suggestion (and without a range); the single-line one is unchanged.
+  assert.deepEqual(post.comments.map((c) => [c.start_line, c.start_side, c.line]), [[undefined, undefined, 3], [undefined, undefined, 3]]);
+  // Neither the Worker's two-line suggestion nor a block the model wrote.
+  assert.doesNotMatch(post.comments[0].body, /^`{3,}suggestion$/m);
+  assert.doesNotMatch(post.comments[0].body, /const x = 3;/);
+  assert.match(post.comments[0].body, /The suggestion was left out/);
+  assert.match(post.comments[0].body, /Prompt for AI agents|finding `/);
+  assert.match(post.comments[1].body, /```suggestion\nconst y = 1;\n```/);
+  assert.doesNotMatch(post.body, /Also noted/);
+  // The findings block records the commit reviewed.
+  assert.match(post.body, /tankster-ai-review:findings \{"v":1,"head":"e{40}"/);
+
+  // When the comment's own line has left the diff too, it goes in the body,
+  // as its first line only.
+  e.fx.prLinesMap = new Map([["src/a.js", new Set([1])]]);
+  await handleWebhook(hook(prBody("synchronize")), e);
+  e.clock.t += 180_000;
+  await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
+  await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
+  const third = e.fx.calls.filter((c) => c[0] === "dispatch")[2][1];
+  await handleRunnerReview(await runnerReq("/v1/runner/review", {
+    job: third, head_sha: "f".repeat(40), since: "e".repeat(40), files,
+  }, { run_id: "9000" }), e, deps(e));
+  const last = e.fx.calls.filter((c) => c[0] === "postReview")[2][3];
+  assert.equal(last.comments.length, 0);
+  assert.match(last.body, /Also noted[\s\S]*- `src\/a\.js:3`: \*\*Major \(bug\): Range\*\*\n/);
+  assert.doesNotMatch(last.body.split("Also noted")[1], /suggestion/);
+});
+
 test("a re-run of the runner reviews again after a failed post; other events cannot claim", async () => {
   const e = env();
   const jobId = await openPr(e);
