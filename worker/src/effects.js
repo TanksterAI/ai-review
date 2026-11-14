@@ -1,6 +1,7 @@
 // Everything the Worker does to GitHub, as the Tankster AI Review App.
 // Each call mints (or reuses) a token for exactly one repository and only the
-// permissions that call needs. The runner never receives any of these.
+// permissions that call needs. The runner receives only cloneToken's read-only
+// token, minted fresh for each run and never reused (it revokes it at the end).
 
 import { createGithubApp } from "./github-app.js";
 import { annotatePatch, codeSpan } from "./review.js";
@@ -79,8 +80,10 @@ export function createEffects(env, deps = {}) {
     },
 
     // Read-only, for the runner's clone: contents and pull requests of one repo.
+    // Fresh for every run: the runner revokes it when it ends, so a cached,
+    // shared token would fail with 401 for every other run on that repository.
     async cloneToken(repoFull) {
-      return app.installationToken([nameOf(repoFull)], { contents: "read", pull_requests: "read" });
+      return app.installationToken([nameOf(repoFull)], { contents: "read", pull_requests: "read" }, { fresh: true });
     },
 
     // The lines a review comment may sit on: the RIGHT side of the PR's own
