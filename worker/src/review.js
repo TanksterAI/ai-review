@@ -13,6 +13,12 @@ export const MAX_FINDINGS = 12;
 export const MAX_SUGGESTION_LINES = 40;
 export const MAX_SUGGESTION_CHARS = 3000;
 export const MAX_PROMPT_CHARS = 600;
+// A finding's grounding (TAN-299): the lines it is about, its claim in one
+// sentence, and the names it depends on, all checked before it is shown.
+export const MAX_EVIDENCE_LINES = 5;
+export const MAX_CLAIM_CHARS = 300;
+export const MAX_SYMBOLS = 12;
+export const MAX_SYMBOL_CHARS = 80;
 // The hidden, machine-readable copy of the findings in the review body.
 export const FINDINGS_MARKER = "tankster-ai-review:findings";
 // A zero-width space, written as a code point so it is visible in review.
@@ -105,6 +111,9 @@ export function prepareFiles(files, limits = {}) {
   const omitted = [];
   const commentable = new Map();
   const lineText = new Map();
+  // Each shown file's own annotated block, for a verifier that checks one
+  // file's findings at a time.
+  const fileText = new Map();
   const ordered = [...files]
     .filter((f) => f && typeof f.filename === "string")
     .map((f, i) => ({ f, i }))
@@ -146,6 +155,7 @@ export function prepareFiles(files, limits = {}) {
     if (used + block.length > maxChars) { omitted.push({ path, reason: "over the size budget" }); continue; }
     used += block.length;
     blocks.push(block);
+    fileText.set(path, block);
     // Only lines actually shown to the model are commentable.
     if (body.length === text.length) {
       commentable.set(path, lines);
@@ -160,12 +170,12 @@ export function prepareFiles(files, limits = {}) {
     lineText.set(path, content);
     included.push(path);
   }
-  return { text: blocks.join("\n"), chars: used, included, omitted, commentable, lineText };
+  return { text: blocks.join("\n"), chars: used, included, omitted, commentable, lineText, fileText };
 }
 
 // Untrusted text goes inside tagged fences; anything that looks like a fence
 // is defused so the content cannot close it early.
-function fence(name, tag, text) {
+export function fence(name, tag, text) {
   const safe = String(text ?? "").replace(/<<</g, `<<${ZWSP}<`).replace(/>>>/g, `>>${ZWSP}>`);
   return `<<<BEGIN ${name} ${tag}>>>\n${safe}\n<<<END ${name} ${tag}>>>`;
 }
@@ -186,13 +196,23 @@ export function buildPrompt({ repository, title, body, prepared, tag }) {
     "When a fix is local, certain and complete, give it as \"suggestion\": the exact new code that replaces lines start_line to line of the new file",
     "(start_line defaults to line), keeping the indentation, with nothing elided. Otherwise leave the \"suggestion\" key out: never an empty string.",
     "Give \"agent_prompt\": one or two sentences telling an AI coding agent exactly what to change and where.",
+    "Every finding must carry \"evidence\": the exact line or lines (at most 5) of the new file that it is about, copied verbatim from the diff,",
+    "without the line-number prefix, and from within 3 lines of the line it cites. Findings without verbatim evidence are discarded.",
+    "Quote a line distinctive enough to find in the file. When the cited line is generic (a lone brace, \"return null;\", \"} else {\"),",
+    "add a neighbouring line that is not.",
+    "Give \"claim\": one sentence saying what is wrong, and \"symbols\": the identifiers (functions, variables, fields) the finding depends on,",
+    "spelled exactly as in the code. Name nothing the diff, the title or the description does not contain.",
+    "An independent reviewer checks every finding against the code shown, and drops any it cannot confirm.",
     'Example finding: {"path": "src/a.js", "line": 3, "severity": "major", "type": "issue", "category": "bug", "title": "Division by zero",',
+    '  "evidence": "const y = x / 0;", "claim": "y divides x by the constant 0, so it is always Infinity or NaN.", "symbols": ["x", "y"],',
     '  "body": "y divides by a constant 0, so it is always Infinity.", "suggestion": "const y = x / 2;", "agent_prompt": "In src/a.js line 3, divide by 2, not 0."}',
     "Answer with ONE JSON object and nothing else:",
-    '{"summary": "2-4 sentences: what the change does and its overall risk",',
+    '{"summary": "one sentence: what the change does",',
     ' "findings": [{"path": "file path", "line": 123, "start_line": 120, "severity": "critical|major|minor|trivial|info",',
     '   "type": "issue|nitpick|refactor", "category": "bug|security|reliability|performance|tests|maintainability",',
-    '   "title": "at most 100 characters", "body": "the problem, why it matters, and the fix; at most 800 characters",',
+    `   "title": "at most 100 characters", "evidence": "the exact line or lines of the new file, verbatim; at most ${MAX_EVIDENCE_LINES} lines",`,
+    '   "claim": "one sentence, at most 300 characters", "symbols": ["identifiers the finding depends on"],',
+    '   "body": "the problem, why it matters, and the fix; at most 800 characters",',
     `   "suggestion": "replacement code, optional; at most ${MAX_SUGGESTION_LINES} lines", "agent_prompt": "at most 400 characters"}]}`,
     `At most ${MAX_FINDINGS} findings, most severe first.`,
   ].join("\n");
@@ -365,6 +385,29 @@ function agentPrompt(v) {
   return t.length > MAX_PROMPT_CHARS ? `${t.slice(0, MAX_PROMPT_CHARS - 1)}…` : t;
 }
 
+// The evidence stays raw: it is compared with the diff, never rendered. A
+// string or an array of strings, as lines; blank lines go, and only the first
+// MAX_EVIDENCE_LINES are kept. Each piece is cut before it is split, so a
+// huge answer costs no more than a small one.
+function evidenceLines(v) {
+  const parts = Array.isArray(v) ? v.filter((x) => typeof x === "string") : typeof v === "string" ? [v] : [];
+  const out = [];
+  for (const part of parts.slice(0, MAX_EVIDENCE_LINES)) {
+    for (const line of part.slice(0, 4000).replace(/\r/g, "").split("\n")) {
+      if (out.length >= MAX_EVIDENCE_LINES) return out;
+      if (line.trim()) out.push(line.slice(0, 1000));
+    }
+  }
+  return out;
+}
+
+// Names only: trimmed and bounded. A cut name no longer matches the code, so
+// the grounding gate drops the finding rather than skip the name.
+function symbolList(v) {
+  const list = Array.isArray(v) ? v : typeof v === "string" ? [v] : [];
+  return list.filter((x) => typeof x === "string").slice(0, MAX_SYMBOLS).map((x) => x.trim().slice(0, MAX_SYMBOL_CHARS)).filter(Boolean);
+}
+
 /**
  * Splits findings into inline comments (path and line the diff shows) and
  * general ones, and drops anything malformed. lineText (from prepareFiles)
@@ -398,7 +441,11 @@ export function classifyFindings(answer, commentable, lineText = null) {
     for (let n = 2; ids.has(id); n++) id = `${findingId(path, category, named)}-${n}`;
     ids.add(id);
     const prompt = agentPrompt(f.agent_prompt);
-    const item = { id, path, line, severity, type, category, title, body, prompt, suggestion: null };
+    const claim = sanitize(f.claim, MAX_CLAIM_CHARS, { inline: true });
+    const item = {
+      id, path, line, severity, type, category, title, body, prompt, suggestion: null,
+      claim, evidence: evidenceLines(f.evidence), symbols: symbolList(f.symbols),
+    };
     if (path && Number.isInteger(line) && commentable.get(path)?.has(line)) {
       item.suggestion = validSuggestion(f, path, line, commentable, lineText);
       inline.push(item);
@@ -457,18 +504,49 @@ function commentBody(f, { withSuggestion = true } = {}) {
 export const MAX_BLOCK_CHARS = 20_000;
 export const MAX_BODY_CHARS = 65_000;
 
-export function findingsBlock(classified, headSha) {
-  const all = [...classified.inline, ...classified.general].map((f) => ({
+// What the verifier decided about a finding, as the block records it.
+export const STATUSES = ["confirmed", "unconfirmed", "refuted", "dropped"];
+export const MAX_REASON_CHARS = 200;
+
+/**
+ * classified: the confirmed findings. opts.hidden: findings not shown
+ * (unconfirmed, refuted, or dropped by the grounding gate), each with a status
+ * and a reason the Worker wrote. opts.inlineIds: the ids posted as inline
+ * comments (by default, every finding in classified.inline).
+ */
+export function findingsBlock(classified, headSha, { hidden = [], inlineIds = null, included = null } = {}) {
+  const posted = inlineIds ?? new Set(classified.inline.map((f) => f.id));
+  const reason = (r) => sanitize(r ?? "", MAX_REASON_CHARS, { inline: true });
+  const shown = [...classified.inline, ...classified.general].map((f) => ({
     id: f.id,
     path: String(f.path).slice(0, 200),
     line: Number.isInteger(f.line) ? f.line : null,
-    inline: classified.inline.includes(f),
+    inline: posted.has(f.id),
     severity: f.severity,
     type: f.type,
     category: f.category,
     title: f.title,
     prompt: f.prompt,
     suggestion: f.suggestion ? { start_line: f.suggestion.start, end_line: f.suggestion.end, original: f.suggestion.original, replacement: f.suggestion.code } : null,
+    status: "confirmed",
+    verified_by: Array.isArray(f.verifiedBy) ? f.verifiedBy.map(String).slice(0, 4) : [],
+    ...(f.weak ? { weak: true } : {}),
+    reason: reason(f.reason),
+  }));
+  // A hidden finding keeps its place and labels only: none of its text (title,
+  // body, claim, evidence, prompt, suggestion) is in the body, even here. Its
+  // path is kept only when it names a file in the change: otherwise it is the
+  // model's own text too.
+  const inChange = new Set(included ?? []);
+  const quiet = hidden.map((f) => ({
+    id: f.id,
+    path: inChange.has(f.path) ? String(f.path).slice(0, 120) : null,
+    line: Number.isInteger(f.line) ? f.line : null,
+    severity: f.severity,
+    type: f.type,
+    category: f.category,
+    status: STATUSES.includes(f.status) && f.status !== "confirmed" ? f.status : "unconfirmed",
+    reason: reason(f.reason),
   }));
   // GitHub caps a review body at 65,536 characters. Past MAX_BLOCK_CHARS the
   // block sheds detail in steps (the inline comments still carry it): the
@@ -477,11 +555,14 @@ export function findingsBlock(classified, headSha) {
     (f) => f,
     (f) => ({ ...f, suggestion: f.suggestion ? { start_line: f.suggestion.start_line, end_line: f.suggestion.end_line } : null }),
     (f) => ({ ...f, suggestion: f.suggestion ? { start_line: f.suggestion.start_line, end_line: f.suggestion.end_line } : null, prompt: "" }),
-    (f) => ({ id: f.id, path: f.path.slice(0, 120), line: f.line, inline: f.inline, severity: f.severity, type: f.type, category: f.category, title: f.title.slice(0, 40), prompt: "", suggestion: null }),
+    (f) => ({
+      id: f.id, path: f.path.slice(0, 120), line: f.line, inline: f.inline, severity: f.severity, type: f.type, category: f.category,
+      title: f.title.slice(0, 40), prompt: "", suggestion: null, status: f.status, verified_by: f.verified_by, ...(f.weak ? { weak: true } : {}), reason: f.reason,
+    }),
   ];
   let out = "";
   for (const step of steps) {
-    const json = JSON.stringify({ v: 1, head: headSha ?? null, findings: all.map(step) });
+    const json = JSON.stringify({ v: 1, head: headSha ?? null, findings: [...shown.map(step), ...quiet] });
     out = `<!-- ${FINDINGS_MARKER} ${json.replace(/</g, "\\u003c").replace(/>/g, "\\u003e")} -->`;
     if (out.length <= MAX_BLOCK_CHARS) break;
   }
@@ -510,11 +591,95 @@ export function codeSpan(text) {
   return sanitize(String(text ?? "").replace(/[`\r\n]/g, "'"), 200, { inline: true });
 }
 
-export function renderReview({ answer, classified, prepared, meta }) {
+// Placement profiles (CodeRabbit's reviews.profile): chill puts nitpicks in a
+// collapsed section, assertive puts them inline, quiet leaves them out.
+export const PROFILES = ["chill", "assertive", "quiet"];
+
+const minorish = (f) => f.type === "nitpick" || f.severity === "trivial" || f.severity === "info";
+const at = (f) => (f.path ? `\`${codeSpan(f.path)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general");
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const modelOf = (id) => String(id).slice(String(id).indexOf(":") + 1);
+// Provider ids come from the Worker's own settings, not from a model, so they
+// are shown as the Model line shows them: in a code span, which they cannot leave.
+const names = (ids) => [...new Set(ids)].map((id) => `\`${modelOf(id).replace(/[`\r\n]/g, "")}\``).join(" and ");
+
+// The review's summary, written by the Worker from the confirmed findings
+// only. The drafter's own summary is never shown: nothing has verified it.
+function workerSummary(confirmed, prepared, verification) {
+  const files = plural(prepared.included.length, "file");
+  const off = Boolean(verification?.off);
+  const nits = confirmed.filter(minorish);
+  const real = confirmed.filter((f) => !minorish(f));
+  if (!confirmed.length) return off ? `No findings in the ${files} reviewed (not verified).` : `No problems confirmed in the ${files} reviewed.`;
+  const word = off ? "found (not verified)" : "confirmed";
+  if (!real.length) return `Reviewed ${files}. ${plural(nits.length, "nitpick")} ${word}.`;
+  const by = SEVERITIES.map((sev) => [real.filter((f) => f.severity === sev).length, sev]).filter(([n]) => n).map(([n, sev]) => `${n} ${sev}`).join(", ");
+  const extra = nits.length ? ` (plus ${plural(nits.length, "nitpick")})` : "";
+  return `Reviewed ${files}. ${plural(real.length, "finding")} ${word}: ${by}${extra}.`;
+}
+
+// The footer's verification line: what was confirmed, by whom, and how many
+// findings were not shown and why (counts only).
+function verificationLine(confirmed, hidden, v) {
+  if (v.off) return "- Not verified (verification is switched off).";
+  const first = confirmed.map((f) => f.verifiedBy?.[0]).filter(Boolean);
+  const second = confirmed.map((f) => f.verifiedBy?.[1]).filter(Boolean);
+  const count = (pred) => hidden.filter(pred).length;
+  const dropped = (re) => count((f) => f.status === "dropped" && re.test(f.reason ?? ""));
+  const why = [
+    [count((f) => f.status === "refuted"), "refuted"],
+    [count((f) => f.status === "unconfirmed"), "unconfirmed"],
+    [dropped(/evidence/), "failed the evidence check"],
+    [dropped(/^not about a file/), "not about a file in the change"],
+    [dropped(/^names something/), "named something not in the change"],
+  ].filter(([n]) => n > 0).map(([n, w]) => `${n} ${w}`);
+  const notShown = hidden.length ? `${hidden.length} not shown (${why.join(", ")})` : "nothing hidden";
+  let line;
+  if (!confirmed.length && !hidden.length) line = "- Verified: there were no findings to check.";
+  else if (!confirmed.length) line = `- Verified: no finding was confirmed; ${notShown}.`;
+  else {
+    const by = first.length ? ` by ${names(first)}` : "";
+    const also = second.length ? ` (${second.length} also by ${names(second)})` : "";
+    line = `- Verified: ${plural(confirmed.length, "finding")} confirmed${by}${also}; ${notShown}.`;
+  }
+  if (v.fallback && v.selfExcluded?.length) {
+    // The usual verifier wrote the findings, so it could not check them.
+    line += ` Verified by ${v.fallbackBy?.length ? names(v.fallbackBy) : "a fallback model"}, since ${names(v.selfExcluded)} wrote the findings.`;
+  } else if (v.fallback) {
+    line += ` Some findings were checked by a fallback model${v.fallbackBy?.length ? ` (${names(v.fallbackBy)})` : ""}, because the usual verifier could not run.`;
+  }
+  if (v.weak) line += " Some were checked by a model of the same kind as the one that wrote them, which is a weaker check.";
+  return line;
+}
+
+/**
+ * classified: the confirmed findings. hidden: the rest (unconfirmed, refuted,
+ * dropped), each with status and the Worker's reason; none of their text is
+ * shown. verification: {off, weak, fallback, fallbackBy, selfExcluded}, or
+ * null when nothing was verified (callers that predate verification).
+ * meta.profile chooses the placement. The summary is the Worker's own.
+ */
+// answer: the drafter's answer. Its summary is ignored: it is unverified
+// model text, so the Worker writes the summary itself.
+export function renderReview({ answer: _drafted, classified, prepared, meta, hidden = [], verification = null }) {
+  const profile = PROFILES.includes(meta.profile) ? meta.profile : "chill";
+  const inline = [];
+  const nitpicks = [];
+  const outside = [];
+  let left = 0;
+  for (const f of classified.inline) {
+    if (!minorish(f) || profile === "assertive") inline.push(f);
+    else if (profile === "chill") nitpicks.push(f);
+    else left++;
+  }
+  for (const f of classified.general) {
+    if (profile === "quiet" && minorish(f)) left++;
+    else outside.push(f);
+  }
   // singleLine[i]: comment i's body without its suggestion, for when only its
   // own line can be kept (an incremental review whose range left the diff).
   const singleLine = [];
-  const comments = classified.inline.map((f) => {
+  const comments = inline.map((f) => {
     const c = { path: f.path, line: f.line, side: "RIGHT", body: commentBody(f) };
     singleLine.push(null);
     // A suggestion over several lines is a multi-line comment on that range.
@@ -524,19 +689,45 @@ export function renderReview({ answer, classified, prepared, meta }) {
     }
     return c;
   });
-  const summary = sanitize(answer?.summary, 1200) || "No summary returned.";
-  const lines = [MARKER, findingsBlock(classified, meta.headSha), "### AI review (advisory)", "", summary, ""];
-  const total = classified.inline.length + classified.general.length;
-  if (total === 0) {
-    lines.push("No material problems found in the reviewed files.", "");
+  const confirmed = [...classified.inline, ...classified.general];
+  const summary = workerSummary(confirmed, prepared, verification);
+  const block = findingsBlock(classified, meta.headSha, { hidden, inlineIds: new Set(inline.map((f) => f.id)), included: prepared.included });
+  const lines = [MARKER, block, "### AI review (advisory)", "", summary, ""];
+  const total = inline.length + nitpicks.length + outside.length;
+  const below = nitpicks.length + outside.length;
+  const quiet = left ? ` ${plural(left, "nitpick")} left out (quiet profile).` : "";
+  if (total > 0) {
+    lines.push(`${plural(total, "finding")}: ${inline.length} inline${below ? `, ${below} below` : ""}.${quiet}`, "");
+  } else if (left) {
+    lines.push(`No findings to show;${quiet}`, "");
+  } else if (hidden.length) {
+    lines.push("No confirmed problems in the reviewed files.", "");
   } else {
-    lines.push(`${total} finding${total === 1 ? "" : "s"}: ${classified.inline.length} inline${classified.general.length ? `, ${classified.general.length} below` : ""}.`, "");
+    lines.push("No material problems found in the reviewed files.", "");
   }
-  for (const f of classified.general) {
-    const at = f.path ? `\`${codeSpan(f.path)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general";
-    lines.push(`- **${LABEL[f.severity]} (${f.category}): ${f.title}** (${at}, finding \`${f.id}\`)  `, `  ${f.body.replace(/\n/g, "\n  ")}`);
+  if (nitpicks.length) {
+    lines.push("<details>", `<summary>🧹 Nitpick comments (${nitpicks.length})</summary>`, "");
+    for (const f of nitpicks) {
+      lines.push(`- **${LABEL[f.severity]} (${f.category}): ${f.title}** (${at(f)}, finding \`${f.id}\`)  `);
+      // As in an inline comment, the agent prompt (verbatim, in the Worker's
+      // own fence) comes before the body: every line indented, so it stays in
+      // this list item. No suggestion block: one cannot be committed here.
+      if (f.prompt) {
+        const text = `In ${where(f)}: ${f.prompt}`;
+        const fence = fenceFor(text);
+        lines.push("  Prompt for AI agents:", `  ${fence}text`, `  ${text.replace(/\n/g, "\n  ")}`, `  ${fence}`, "");
+      }
+      lines.push(`  ${f.body.replace(/\n/g, "\n  ")}`);
+    }
+    lines.push("", "</details>", "");
   }
-  if (classified.general.length) lines.push("");
+  if (outside.length) {
+    lines.push("<details>", `<summary>Outside diff range comments (${outside.length})</summary>`, "");
+    for (const f of outside) {
+      lines.push(`- **${LABEL[f.severity]} (${f.category}): ${f.title}** (${at(f)}, finding \`${f.id}\`)  `, `  ${f.body.replace(/\n/g, "\n  ")}`);
+    }
+    lines.push("", "</details>", "");
+  }
   const omitted = prepared.omitted.length
     ? `Not reviewed (${prepared.omitted.length}): ${prepared.omitted.slice(0, 20).map((o) => `\`${codeSpan(o.path)}\` (${o.reason})`).join(", ")}${prepared.omitted.length > 20 ? ", …" : ""}.`
     : "Every changed file was reviewed.";
@@ -544,6 +735,7 @@ export function renderReview({ answer, classified, prepared, meta }) {
     "<details><summary>About this review</summary>",
     "",
     meta.modelLine ?? `- Model: \`${meta.model}\` on Cloudflare Workers AI, free daily allocation; it never bills.`,
+    ...(verification ? [verificationLine(confirmed, hidden, verification)] : []),
     `- Reviewed ${prepared.included.length} file${prepared.included.length === 1 ? "" : "s"} (${prepared.chars.toLocaleString("en-GB")} characters of diff). ${omitted}`,
     meta.costLine ?? `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
     "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement.",
