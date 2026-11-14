@@ -943,3 +943,16 @@ test("providers that failed a job are skipped on its later tries and by the capa
   job = await storage.get(`job:${out.jobId}`);
   assert.equal(job, undefined);
 });
+
+test("capacity check before dispatch: a drafter is not enough, a verifier must be able to run too", async () => {
+  const { memoryKv } = await import("./helpers.js");
+  const { markExhausted } = await import("../src/budget.js");
+  const kv = memoryKv();
+  const env = { LEDGER: kv, AI: {}, GEMINI_API_KEY: "k", DRAFT_CHAIN: "workers-ai:@cf/zai-org/glm-4.7-flash", VERIFY_CHAIN: "anthropic:claude-haiku-5-5", VERIFY_FALLBACK: "gemini:gemini-3.5-flash-lite" };
+  const obj = new PrState({ storage: memoryStorage() }, env, { now: () => NOW, effects: fakeEffects() });
+  assert.equal((await obj.capacityNow(10_000)).ok, true);
+  await markExhausted(kv, "gemini:gemini-3.5-flash-lite", NOW + 2 * 3600_000, NOW);
+  assert.deepEqual(await obj.capacityNow(10_000), { ok: false, retryAt: NOW + 2 * 3600_000 });
+  const off = new PrState({ storage: memoryStorage() }, { ...env, VERIFY: "off" }, { now: () => NOW, effects: fakeEffects() });
+  assert.equal((await off.capacityNow(10_000)).ok, true);
+});
