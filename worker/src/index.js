@@ -5,10 +5,11 @@
 //   200 {status: "reviewed", review: {body, comments}, usage}
 //   200 {status: "skipped", reason}               nothing reviewable
 //   409 {status: "duplicate"}                     this head commit was already reviewed
-//   429 {status: "deferred", reason, resets_at}   today's review budget is spent
-//   503 {status: "unavailable", reason}           Workers AI is out of capacity
+//   429 {status: "deferred", reason, resets_at, chars}  every model provider is out
+//                                                 of quota or busy until resets_at
+//   503 {status: "unavailable", reason}           a provider is busy, with no time given
 //   401 / 400 / 413 / 502                         see `reason`
-// GET /healthz  -> {ok, model, budget}
+// GET /healthz  -> {ok, model, budget, providers}
 //
 // v1: the reviewing workflow (TanksterAI/ai-review .github/workflows/review.yml)
 // fetches the diff with its own GITHUB_TOKEN and posts the review.
@@ -23,8 +24,10 @@
 // with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
-import { buildPrompt, classifyFindings, codeSpan, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
-import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
+import { buildPrompt, classifyFindings, codeSpan, parseAnswer, prepareFiles, renderReview } from "./review.js";
+import { createLedger, nextUtcMidnight, utcDay } from "./budget.js";
+import { ProviderError, createProviders, draftChain } from "./providers.js";
+import { config } from "./config.js";
 import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { prKeyOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
@@ -35,7 +38,6 @@ export { AppSecrets } from "./setup.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 3000;
-const CAPACITY_RETRY_MS = 3000;
 const jwks = createJwksCache();
 
 function json(status, body) {
@@ -43,26 +45,6 @@ function json(status, body) {
     status,
     headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
   });
-}
-
-function config(env) {
-  const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
-  return {
-    model: env.MODEL || "@cf/openai/gpt-oss-120b",
-    effort: ["low", "medium", "high"].includes(env.REASONING_EFFORT) ? env.REASONING_EFFORT : "medium",
-    cap: num(env.DAILY_NEURON_CAP, 6000),
-    maxChars: num(env.MAX_DIFF_CHARS, 90_000),
-    maxOutput: num(env.MAX_OUTPUT_TOKENS, 12_000),
-    audience: env.AUDIENCE,
-    ownerId: env.OWNER_ID,
-    // Comma-separated job_workflow_ref values; an entry ending in * is a prefix.
-    workflowRefs: String(env.WORKFLOW_REFS ?? "").split(",").map((x) => x.trim()).filter(Boolean),
-  };
-}
-
-function nextUtcMidnight(nowMs) {
-  const d = new Date(nowMs);
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1)).toISOString();
 }
 
 function log(event) {
@@ -142,7 +124,7 @@ export async function handleReview(request, env, deps = {}) {
     return json(400, { status: "rejected", reason: `files must be an array of at most ${MAX_FILES}` });
   }
 
-  const out = await runReview({ cfg, env, repository, pr, headSha, input, now, sleep });
+  const out = await runReview({ cfg, env, repository, pr, headSha, input, now, sleep, fetchImpl: deps.fetch });
   return json(out.status, out.body);
 }
 
@@ -181,9 +163,8 @@ export function placeComments(comments, singleLine, lines) {
 // runner endpoint. Returns {status, body}; callers turn it into a Response.
 // again: the review's "Review again" line, set by the Worker (never taken from
 // a request body); without it the v1 line is used.
-export async function runReview({ cfg, env, repository, pr, headSha, input, now, sleep, again }) {
+export async function runReview({ cfg, env, repository, pr, headSha, input, now, sleep, again, fetchImpl, skip = [] }) {
   const res = (status, body) => ({ status, body });
-  const ledger = createLedger(env.LEDGER, now);
   const doneKey = `done:${repository}#${pr}@${headSha}`;
   if (!input.force && (await env.LEDGER.get(doneKey))) {
     return res(409, { status: "duplicate", reason: "this commit was already reviewed; pass force to review it again" });
@@ -202,106 +183,114 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     prepared,
     tag: randomTag(),
   });
-  // The reserve is the whole output allowance: reasoning counts as output.
-  const estimate = estimateNeurons(cfg.model, instructions.length + modelInput.length, cfg.maxOutput);
-  const spentBefore = await ledger.spent();
-  if (spentBefore + estimate > cfg.cap) {
-    log({ ev: "deferred", repository, pr, spent: Math.round(spentBefore), estimate: Math.round(estimate) });
-    return res(429, {
-      status: "deferred",
-      reason: `today's review budget is spent (${Math.round(spentBefore)} of ${cfg.cap} neurons; this review needs about ${Math.round(estimate)})`,
-      resets_at: nextUtcMidnight(now()),
-    });
-  }
+  const chars = instructions.length + modelInput.length;
+  const deps = { now, sleep, fetch: fetchImpl ?? ((...a) => fetch(...a)), log };
+  // Providers that failed this review outright before are not asked again.
+  const skipped = new Set(skip);
+  const providers = createProviders(env, cfg, draftChain(env, cfg).filter((x) => !skipped.has(`${x.kind}:${x.model}`)), deps);
 
-  const started = now();
-  // Up to two model calls:
-  //   - out of capacity (3040): try once more after a 3 s pause;
-  //   - an answer cut short (status "incomplete", reasoning used the room):
-  //     try once more with low reasoning effort, if the budget allows;
+  // Each provider in turn, until one answers: one that is out of quota,
+  // busy, or failing hands over to the next. On one provider, up to two calls:
+  //   - an answer cut short (reasoning used the room): once more, with low
+  //     reasoning effort, if the budget allows;
   //   - an answer that tried to be JSON but does not parse (escaping code in
-  //     a suggestion is where models slip): try once more, if the budget allows.
-  //   Either retry asks for no suggestions, which makes the answer shorter and
-  //   its JSON simpler.
-  // The account's daily allocation used up (3036) is a deferral, like our cap.
-  let effort = cfg.effort;
-  let neurons = 0;
-  let spent = spentBefore;
+  //     a suggestion is where models slip): once more, if the budget allows.
+  //   Either retry asks for no suggestions, which makes the answer shorter
+  //   and its JSON simpler.
+  const started = now();
+  const outcomes = [];
   let answer = null;
-  let lastStatus;
-  let note = "";
-  for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
-    let result;
-    try {
-      result = await env.AI.run(cfg.model, {
-        instructions: instructions + note,
-        input: modelInput,
-        reasoning: { effort },
-        max_output_tokens: cfg.maxOutput,
-      });
-    } catch (e) {
-      const message = String(e?.message ?? e);
-      log({ ev: "model_error", repository, pr, attempt, error: message.slice(0, 200) });
-      if (/\b3036\b|daily free allocation/i.test(message)) {
-        return res(429, {
-          status: "deferred",
-          reason: "the account's free Workers AI allocation for today is used up",
-          resets_at: nextUtcMidnight(now()),
-        });
-      }
-      if (/\b3040\b|capacity temporarily exceeded/i.test(message)) {
-        if (attempt < 2) {
-          // A pause, not CPU: waiting on a timer costs nothing on Workers.
-          await sleep(CAPACITY_RETRY_MS);
-          continue;
-        }
-        return res(503, { status: "unavailable", reason: "Workers AI is out of capacity; try again later" });
-      }
-      return res(502, { status: "failed", reason: "the model call failed; try again later" });
+  let used = null;
+  let neurons = 0;
+  let usd = 0;
+  let last = {};
+  for (const p of providers) {
+    if (!p.configured) continue;
+    const until = await p.exhausted();
+    if (until) { outcomes.push({ id: p.id, kind: "deferred", reason: `${p.id} is out of quota`, resetAt: until }); continue; }
+    const first = await p.affordable(chars, cfg.maxOutput);
+    if (!first.ok) {
+      log({ ev: "deferred", repository, pr, provider: p.id, spent: first.spent, estimate: first.estimate });
+      // No reset time means it can never take this review (too long for it).
+      outcomes.push(first.resetAt === null
+        ? { id: p.id, kind: "failed", reason: first.reason }
+        : { id: p.id, kind: "deferred", reason: first.reason, resetAt: first.resetAt ?? nextUtcMidnight(now()) });
+      continue;
     }
-    const usage = result?.usage ?? {};
-    const used = Number.isFinite(usage.neurons)
-      ? usage.neurons
-      : neuronsFor(cfg.model, usage.input_tokens ?? usage.prompt_tokens ?? 0, usage.output_tokens ?? usage.completion_tokens ?? 0);
-    neurons += used;
-    spent = await ledger.add(used);
-    lastStatus = result?.status;
-    const text = extractText(result);
-    answer = parseAnswer(text);
-    if (!answer) {
-      log({ ev: "unparseable", repository, pr, attempt, neurons: Math.round(used), status: lastStatus });
-      const cut = lastStatus === "incomplete";
-      if ((!cut && !text.includes("{")) || spent + estimate > cfg.cap) break;
-      if (cut) effort = "low";
+    let note = "";
+    let low = false;
+    let lastStatus = null;
+    for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
+      let r;
+      try {
+        r = await p.complete({ system: instructions + note, user: modelInput, maxOutput: cfg.maxOutput, low });
+      } catch (e) {
+        if (!(e instanceof ProviderError)) throw e;
+        outcomes.push({ id: p.id, kind: e.kind, reason: e.reason, resetAt: e.resetAt });
+        lastStatus = "error";
+        break;
+      }
+      neurons += r.neurons ?? 0;
+      usd += r.usd ?? 0;
+      last = r;
+      answer = parseAnswer(r.text);
+      if (answer) { used = p; break; }
+      lastStatus = r.incomplete ? "incomplete" : "unparseable";
+      log({ ev: "unparseable", repository, pr, provider: p.id, attempt, incomplete: r.incomplete });
+      if ((!r.incomplete && !r.text.includes("{")) || !(await p.affordable(chars, cfg.maxOutput)).ok) break;
+      if (r.incomplete) low = true;
       note = "\nYour previous answer could not be used. Answer again, shorter, and leave out every \"suggestion\" key.";
     }
+    if (answer) break;
+    if (lastStatus === "incomplete") outcomes.push({ id: p.id, kind: "failed", reason: "the model ran out of output room before it answered; try again, or review a smaller change" });
+    else if (lastStatus === "unparseable") outcomes.push({ id: p.id, kind: "failed", reason: "the model did not return a usable answer; try again later" });
   }
+
   if (!answer) {
-    const reason = lastStatus === "incomplete"
-      ? "the model ran out of output room before it answered; try again, or review a smaller change"
-      : "the model did not return a usable answer; try again later";
-    return res(502, { status: "failed", reason });
+    // Any provider out of quota, or busy until a known time: wait for the
+    // first of those to come back (the review is queued, not dropped), even
+    // if another provider failed outright. Otherwise the most hopeful
+    // failure: busy beats broken.
+    const waiting = outcomes.filter((o) => o.kind === "deferred" || (o.kind === "unavailable" && o.resetAt));
+    if (waiting.length) {
+      const first = waiting.reduce((a, o) => ((o.resetAt ?? Infinity) < (a.resetAt ?? Infinity) ? o : a));
+      const at = first.resetAt ?? nextUtcMidnight(now());
+      const failedIds = outcomes.filter((o) => o.kind === "failed").map((o) => o.id);
+      return res(429, { status: "deferred", reason: first.reason, resets_at: new Date(at).toISOString(), chars, failed: failedIds });
+    }
+    const busy = outcomes.find((o) => o.kind === "unavailable");
+    if (busy) return res(503, { status: "unavailable", reason: busy.reason });
+    const failed = [...outcomes].reverse().find((o) => o.kind === "failed");
+    const none = skipped.size ? "every model provider failed on this review" : "no model provider is configured";
+    return res(502, { status: "failed", reason: failed?.reason ?? none });
   }
+
+  const cost = used.kind === "workers-ai"
+    ? `- Cost: ${neurons.toFixed(0)} neurons; ${Math.max(0, cfg.cap - (last.spent ?? 0)).toFixed(0)} of today's ${cfg.cap} left for reviews.`
+    : used.kind === "anthropic"
+      ? `- Cost: $${usd.toFixed(4)} of the plan's API credit; $${Math.max(0, (last.capUsd ?? 0) - (last.spentUsd ?? 0)).toFixed(2)} of today's $${(last.capUsd ?? 0).toFixed(2)} left.`
+      : "- Cost: nothing (free tier).";
   const classified = classifyFindings(answer, prepared.commentable, prepared.lineText);
-  const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap, again, headSha } });
+  const review = renderReview({ answer, classified, prepared, meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha } });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
     ev: "reviewed",
     repository,
     pr,
+    provider: used.id,
     files: prepared.included.length,
     omitted: prepared.omitted.length,
     inline: classified.inline.length,
     general: classified.general.length,
     neurons: Math.round(neurons),
-    spent: Math.round(spent),
+    usd: Number(usd.toFixed(5)),
+    passed_over: outcomes.length,
     ms: now() - started,
   });
-  return res(200, {
-    status: "reviewed",
-    review,
-    usage: { model: cfg.model, neurons, spent_today: spent, cap: cfg.cap },
-  });
+  const usage = used.kind === "workers-ai"
+    ? { provider: used.kind, model: used.model, neurons, spent_today: last.spent, cap: cfg.cap }
+    : { provider: used.kind, model: used.model, usd };
+  return res(200, { status: "reviewed", review, usage });
 }
 
 
@@ -401,7 +390,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
   const slug = (await appConfig(env))?.slug ?? DEFAULT_SLUG;
   const again = `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`;
   const input = { title: body.title, body: body.body, files: body.files, force };
-  const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep, again });
+  const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep, again, fetchImpl: deps.fetch, skip: Array.isArray(job.skip) ? job.skip : [] });
   const finish = () => askPr(env, key, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
 
   if (out.status === 200 && out.body.status === "reviewed") {
@@ -427,6 +416,15 @@ export async function handleRunnerReview(request, env, deps = {}) {
     return json(200, { status: "reviewed", inline: posted.inline, usage: out.body.usage });
   }
   if (out.status === 409 || (out.status === 200 && out.body.status === "skipped")) await finish();
+  if (out.status === 429 || out.status === 503 || out.status === 502) {
+    // Queued, not dropped: the PR's object releases the job and dispatches it
+    // again once a provider resets (429), shortly (503), or a little later
+    // (502: a few tries only, so a review that always fails cannot loop).
+    const at = Date.parse(out.body.resets_at);
+    const retryAt = out.status === 429 ? (Number.isFinite(at) ? at : now() + 3600_000) : now() + (out.status === 503 ? 5 : 15) * 60_000;
+    const why = out.status === 429 ? "quota" : out.status === 503 ? "busy" : "failed";
+    await askPr(env, key, { op: "defer", jobId: job.id, runId: String(claims.run_id), retryAt, why, chars: out.body.chars, reason: out.body.reason, failed: out.body.failed });
+  }
   return json(out.status, out.body);
 }
 
@@ -435,8 +433,16 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/healthz" && request.method === "GET") {
       const cfg = config(env);
+      const now = () => Date.now();
       const spent = await createLedger(env.LEDGER).spent();
-      return json(200, { ok: true, model: cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) } });
+      // Which providers are set up and which are out of quota; never a key.
+      const providers = [];
+      for (const p of createProviders(env, cfg, draftChain(env, cfg), { now, sleep: async () => {}, fetch: () => Promise.reject(new Error("no calls")), log })) {
+        const until = p.configured ? await p.exhausted() : null;
+        providers.push({ id: p.id, configured: p.configured, exhausted_until: until ? new Date(until).toISOString() : null });
+      }
+      const lead = draftChain(env, cfg).find((x) => providers.find((p) => p.id === `${x.kind}:${x.model}`)?.configured);
+      return json(200, { ok: true, model: lead?.model ?? cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) }, providers });
     }
     if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
     if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
