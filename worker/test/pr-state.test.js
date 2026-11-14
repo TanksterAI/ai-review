@@ -960,3 +960,14 @@ test("capacity check before dispatch: a drafter is not enough, a verifier must b
   const off = new PrState({ storage: memoryStorage() }, { ...env, VERIFY: "off" }, { now: () => NOW, effects: fakeEffects() });
   assert.equal((await off.capacityNow(10_000)).ok, true);
 });
+
+test("a runner's complete message cannot claim full coverage", async () => {
+  const { obj, storage } = make();
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await obj.claim({ jobId: out.jobId, runId: "9" });
+  const res = await obj.fetch(new Request("https://pr-state/", { method: "POST", body: JSON.stringify({ op: "complete", jobId: out.jobId, runId: "9", reviewedSha: "e".repeat(40), fullCoverage: true }) }));
+  assert.deepEqual(await res.json(), { ok: true });
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, "e".repeat(40));
+  assert.equal(st.lastCompleteReviewed, undefined);
+});

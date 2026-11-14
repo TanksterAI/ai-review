@@ -20,10 +20,24 @@
 import { SKIP, annotatePatch, priority } from "./review.js";
 
 export const BATCH_CHARS = 60_000;
+// A line longer than this many batches is minified or generated data: not
+// reviewable, and too big to store or send.
+export const LONG_LINE_BATCHES = 4;
 export const MAX_PR_CHARS = 5_000_000;
 // Room kept for a block's header line.
 const HEADER_ROOM = 160;
 const LINE_NO = /^\s*(\d+) [+ ] /;
+
+function longestLine(text) {
+  let max = 0;
+  for (let at = 0; at < text.length;) {
+    const end = text.indexOf("\n", at);
+    const stop = end < 0 ? text.length : end;
+    if (stop - at > max) max = stop - at;
+    at = stop + 1;
+  }
+  return max;
+}
 
 /** Why a file is not reviewable at all, or null when it is. */
 export function skipReason(f) {
@@ -108,6 +122,10 @@ export function splitFile(f, maxChars = BATCH_CHARS) {
  * uncovered: [{path, reason}], files: [{path, parts}], chars}. Code comes
  * first, then tests, then docs; a file's parts stay together and in order.
  */
+export function prLimitReason(maxPrChars) {
+  return `the pull request is over the reviewer's limit of ${maxPrChars.toLocaleString("en-GB")} characters of diff`;
+}
+
 export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_PR_CHARS } = {}) {
   const ordered = [...files]
     .filter((f) => f && typeof f.filename === "string")
@@ -117,7 +135,7 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
   const skipped = [];
   const uncovered = [];
   const planned = [];
-  const limit = `the pull request is over the reviewer's limit of ${maxPrChars.toLocaleString("en-GB")} characters of diff`;
+  const limit = prLimitReason(maxPrChars);
   let chars = 0;
   for (const f of ordered) {
     const path = f.filename;
@@ -126,6 +144,13 @@ export function planReview(files, { batchChars = BATCH_CHARS, maxPrChars = MAX_P
     if (typeof f.unfetched === "string") { uncovered.push({ path, reason: f.unfetched }); continue; }
     if (f.patch_omitted === true) { uncovered.push({ path, reason: "its diff was not sent" }); continue; }
     if (typeof f.patch !== "string" || f.patch.length === 0) { skipped.push({ path, reason: "binary or no textual diff" }); continue; }
+    if (longestLine(f.patch) > LONG_LINE_BATCHES * batchChars) {
+      skipped.push({ path, reason: `a line over ${(LONG_LINE_BATCHES * batchChars).toLocaleString("en-GB")} characters: minified or generated` });
+      continue;
+    }
+    // The limit is checked on the raw patch first, so a file far past it is
+    // never annotated (annotation adds about 8 characters a line).
+    if (chars + f.patch.length > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }
     const parts = splitFile(f, batchChars);
     const size = parts.reduce((n, p) => n + p.chars, 0);
     if (chars + size > maxPrChars) { uncovered.push({ path, reason: limit }); continue; }

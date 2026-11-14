@@ -146,3 +146,29 @@ test("a PR closed while a step waits on a model: the step does not bring the rev
   assert.deepEqual([...(await m.storage.list({ prefix: "run" })).keys()], [], "no run: or runmeta: keys are left");
   assert.ok(!m.fx.statuses.some((s) => s.state === "error"), "no error status on a closed PR");
 });
+
+// --- from the independent review ----------------------------------------------
+
+test("after a single-prompt review (the runner), the first Worker review covers the whole PR, not just the commits since", async () => {
+  const m = make();
+  m.state.compare = (base) => (base === sha("a") ? { status: "ahead", files: [{ filename: "src/new.js", status: "added", additions: 2, deletions: 0, patch: added(2, "new_") }] } : null);
+  // The runner reviewed head a (in one prompt, skipping what did not fit).
+  await m.storage.put("state", { lastReviewed: sha("a"), lastClaimedAt: NOW - 1, paused: false, closed: false });
+  m.state.head = sha("e");
+  await m.obj.onEvent({ delivery: "d1", ev: ev({ action: "synchronize" }) });
+  await settle(m, NOW + 7200_000);
+  assert.ok(m.fx.calls.some((c) => c[0] === "listFiles"), "the whole PR was listed");
+  assert.ok(!m.fx.calls.some((c) => c[0] === "compare" && c[1] === sha("a")), "no review started from the runner's commit");
+  assert.match(m.fx.posted[0].body, /Coverage: 12 of 12 reviewable files \(100%\)/);
+  assert.equal((await m.storage.get("state")).lastCompleteReviewed, sha("e"));
+});
+
+test("a run step that throws does not hold up the outbox: commands are still answered", async () => {
+  const m = make();
+  m.obj.stepActiveRun = async () => { throw new Error("boom"); };
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review pause" } });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.ok(m.fx.calls.some((c) => c[0] === "comment" && /paused/.test(c[1])));
+  assert.ok(m.storage.alarm > m.now(), "the run is looked at again later");
+});

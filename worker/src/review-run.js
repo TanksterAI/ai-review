@@ -27,14 +27,14 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
-import { batchPrepared, coverageOf, planReview, skipReason } from "./coverage.js";
+import { batchPrepared, coverageOf, planReview, prLimitReason, skipReason } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
 import { createProviders, draftChain } from "./providers.js";
 import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
-import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, renderReview, titleLine } from "./review.js";
+import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
 // under runmeta:<id>, so finding the run in progress never loads its data.
@@ -75,21 +75,40 @@ const fileKey = (id, i) => `${RUN}${id}:file:${String(i).padStart(5, "0")}`;
 const pieceKey = (id, i, k) => `${fileKey(id, i)}:p${k}`;
 const batchKey = (id, i) => `${RUN}${id}:batch:${String(i).padStart(4, "0")}`;
 const planKey = (id) => `${RUN}${id}:plan`;
+// A commit reviewed at full coverage. Not the single-prompt paths' done: key.
+export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}`;
+
+// A file's record holds its patch's length, never the patch: the patch is in
+// pieces of its own, so the plan can choose what fits the pull request's
+// limit before it loads any text.
+const META_FIELDS = ["filename", "status", "additions", "deletions", "sha", "previous_filename", "patch_omitted", "synthetic", "unfetched", "binary", "checked", "contentTries"];
 
 async function putFile(storage, id, i, f) {
-  const { patch, ...rest } = f;
-  const pieces = typeof patch === "string" && patch.length > PIECE ? Math.ceil(patch.length / PIECE) : 0;
-  for (let k = 0; k < pieces; k++) await storage.put(pieceKey(id, i, k), patch.slice(k * PIECE, (k + 1) * PIECE));
-  await storage.put(fileKey(id, i), pieces ? { ...rest, pieces } : { ...rest, ...(patch === undefined ? {} : { patch }) });
+  const rec = {};
+  for (const k of META_FIELDS) if (f[k] !== undefined) rec[k] = f[k];
+  const patch = typeof f.patch === "string" ? f.patch : null;
+  rec.patchLen = patch === null ? -1 : patch.length;
+  if (patch !== null) { let n = 1; for (let k = patch.indexOf("\n"); k >= 0; k = patch.indexOf("\n", k + 1)) n++; rec.patchLines = n; }
+  rec.pieces = patch === null ? 0 : Math.max(1, Math.ceil(patch.length / PIECE));
+  for (let k = 0; k < rec.pieces; k++) await storage.put(pieceKey(id, i, k), patch.slice(k * PIECE, (k + 1) * PIECE));
+  await storage.put(fileKey(id, i), rec);
 }
 
+const getMeta = (storage, id, i) => storage.get(fileKey(id, i));
+
+// What a patch costs of the pull request's limit once annotated: every line
+// gains its number (about 8 characters), and each part a header.
+export const ANNOTATION_PER_LINE = 8;
+const costOf = (len, lines) => len + ANNOTATION_PER_LINE * lines + 200;
+
 async function getFile(storage, id, i) {
-  const f = await storage.get(fileKey(id, i));
-  if (!f?.pieces) return f;
+  const rec = await getMeta(storage, id, i);
+  if (!rec) return rec;
+  const { pieces, patchLen, patchLines: _n, ...f } = rec;
+  if (patchLen < 0) return f;
   const parts = [];
-  for (let k = 0; k < f.pieces; k++) parts.push(await storage.get(pieceKey(id, i, k)));
-  const { pieces: _p, ...rest } = f;
-  return { ...rest, patch: parts.join("") };
+  for (let k = 0; k < pieces; k++) parts.push(await storage.get(pieceKey(id, i, k)));
+  return { ...f, patch: parts.join("") };
 }
 
 /** Deletes everything a run stored. */
@@ -141,8 +160,14 @@ export async function stepRun(ctx, id) {
     if (!(await storage.get(metaKey(id)))) throw new Gone();
     await storage.put(metaKey(id), r);
   };
-  // Failures are counted in a row: a step that succeeds starts the count again.
+  // Failures are counted in a row, and an attempt is counted before it runs:
+  // a step killed outright (out of memory, out of CPU) throws nothing, but it
+  // still counts. A step that succeeds starts the count again.
   const failedBefore = run.tries ?? 0;
+  if (failedBefore >= MAX_TRIES * 2) {
+    return finish(ctx, run, (r) => storage.put(metaKey(id), r), { state: "error", description: `The review stopped: its ${run.stage} step kept failing.`, gaveUp: true });
+  }
+  await storage.put(metaKey(id), { ...run, tries: failedBefore + 1 });
   run.tries = 0;
   try {
     if (run.stage === "pr") return await stagePr(counted, run, save);
@@ -218,10 +243,12 @@ async function stagePr(ctx, run, save) {
   run.title = String(pr.title ?? "").slice(0, 300);
   run.body = String(pr.body ?? "").slice(0, 3000);
   run.changedFiles = Number(pr.changed_files) || 0;
-  const doneKey = `done:${run.repo.full}#${run.pr}@${run.headSha}`;
-  if (!run.force && (await ctx.env.LEDGER?.get(doneKey))) {
+  // Only a full-coverage review's own mark counts: the single-prompt paths
+  // (v1, REVIEW_MODE=runner) mark commits done: too, but read at most 90,000
+  // characters of them.
+  if (!run.force && (await ctx.env.LEDGER?.get(doneKeyOf(run)))) {
     ctx.deps.log?.({ ev: "run_duplicate", repository: run.repo.full, pr: run.pr });
-    return finish(ctx, run, save, { reviewedSha: run.headSha });
+    return finish(ctx, run, save, { state: "success", description: "This commit was already reviewed at 100% coverage.", reviewedSha: run.headSha });
   }
   await status(ctx, run, "pending", "Reviewing every changed file…");
   // Incremental when the last reviewed commit is still behind the head (no
@@ -267,6 +294,15 @@ const NUL = (bytes) => bytes.subarray(0, 8000).includes(0);
 
 // Files GitHub sent without a patch: their diff, worked out from both sides.
 async function stageContent(ctx, run, save) {
+  // The diff characters already in hand (GitHub's own patches), so files
+  // without a patch are fetched only while they can still fit the limit.
+  if (run.patchChars === undefined) {
+    run.patchChars = 0;
+    for (let i = 0; i < run.files; i++) {
+      const m = await getMeta(ctx.storage, run.id, i);
+      if (m && m.patchLen > 0 && !skipReason(m)) run.patchChars += costOf(m.patchLen, m.patchLines ?? 0);
+    }
+  }
   if (!run.mergeBase) {
     const cmp = await ctx.fx.compare(run.repo.full, run.baseSha, run.headSha);
     run.mergeBase = cmp?.merge_base_commit?.sha ?? run.baseSha;
@@ -278,6 +314,17 @@ async function stageContent(ctx, run, save) {
     const needs = f && typeof f.patch !== "string" && !skipReason(f) && !BINARY_EXT.test(f.filename) && f.status !== "removed" && !f.checked;
     if (!needs) continue;
     if (done >= CONTENTS_PER_STEP) { await save(run); return ctx.deps.now(); }
+    // A file GitHub sends without a patch is big: once less than a batch of
+    // the limit is left, none is fetched.
+    const left = ctx.cfg.maxPrChars - run.patchChars;
+    // Its changed lines alone, annotated, would not fit: not fetched.
+    const least = ANNOTATION_PER_LINE * ((Number(f.additions) || 0) + (Number(f.deletions) || 0));
+    if (left < ctx.cfg.batchChars || least > left) {
+      f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+      f.checked = true;
+      await putFile(ctx.storage, run.id, i, f);
+      continue;
+    }
     done++;
     try {
       const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
@@ -289,8 +336,15 @@ async function stageContent(ctx, run, save) {
       else if (NUL(head.bytes) || (base && NUL(base.bytes))) f.binary = true;
       else {
         const dec = new TextDecoder();
-        const patch = unifiedDiff(base ? dec.decode(base.bytes) : "", dec.decode(head.bytes));
-        if (patch) { f.patch = patch; f.synthetic = true; }
+        let patch = "";
+        try {
+          patch = unifiedDiff(base ? dec.decode(base.bytes) : "", dec.decode(head.bytes));
+        } catch {
+          f.unfetched = "its diff could not be worked out";
+        }
+        const lines = patch ? patch.split("\n").length : 0;
+        if (patch && costOf(patch.length, lines) > left) f.unfetched = prLimitReason(ctx.cfg.maxPrChars);
+        else if (patch) { f.patch = patch; f.synthetic = true; run.patchChars += costOf(patch.length, lines); }
       }
       f.checked = true;
     } catch (e) {
@@ -307,8 +361,24 @@ async function stageContent(ctx, run, save) {
 }
 
 async function stagePlan(ctx, run, save) {
+  // What fits the limit is chosen from the records, in the plan's order
+  // (code, tests, docs), and only those patches are loaded.
+  const metas = [];
+  for (let i = 0; i < run.files; i++) metas.push({ i, m: await getMeta(ctx.storage, run.id, i) });
+  metas.sort((x, y) => priority(x.m.filename) - priority(y.m.filename) || x.i - y.i);
   const files = [];
-  for (let i = 0; i < run.files; i++) files.push(await getFile(ctx.storage, run.id, i));
+  let budget = ctx.cfg.maxPrChars;
+  for (const { i, m } of metas) {
+    const { pieces: _p, patchLen: _l, patchLines: _n, ...rec } = m;
+    if (m.patchLen > 0 && !skipReason(m) && m.unfetched === undefined) {
+      const cost = costOf(m.patchLen, m.patchLines ?? 0);
+      if (cost > budget) { files.push({ ...rec, unfetched: prLimitReason(ctx.cfg.maxPrChars) }); continue; }
+      budget -= cost;
+      files.push(await getFile(ctx.storage, run.id, i));
+    } else {
+      files.push(rec);
+    }
+  }
   const plan = planReview(files, { batchChars: ctx.cfg.batchChars, maxPrChars: ctx.cfg.maxPrChars });
   // GitHub lists 3,000 files at most: any beyond that are not covered.
   if (!run.since && run.changedFiles > run.files) {
@@ -316,16 +386,17 @@ async function stagePlan(ctx, run, save) {
   }
   const { batches, ...rest } = plan;
   await ctx.storage.put(planKey(run.id), { ...rest, batchCount: batches.length });
-  for (const [i, parts] of batches.entries()) await ctx.storage.put(batchKey(run.id, i), { parts, status: "pending", tries: 0, waitUntil: 0 });
+  for (const [i, parts] of batches.entries()) await ctx.storage.put(batchKey(run.id, i), { parts, status: "pending", draftTries: 0, verifyTries: 0, waitUntil: 0 });
   run.batches = batches.length;
+  if (!batches.length && !plan.uncovered.length) {
+    // Nothing reviewable at all: a pass.
+    return finish(ctx, run, save, { state: "success", description: "No reviewable changes (deleted, binary or generated files only).", reviewedSha: run.headSha });
+  }
   if (!batches.length) {
-    // Nothing reviewable: a pass, unless something reviewable could not be had.
-    const complete = !plan.uncovered.length;
-    return finish(ctx, run, save, {
-      state: complete ? "success" : "failure",
-      description: complete ? "No reviewable changes (deleted, binary or generated files only)." : `Incomplete: ${plan.uncovered.length} file(s) could not be reviewed.`,
-      reviewedSha: complete ? run.headSha : null,
-    });
+    // Reviewable files, none of which could be taken: the review says so.
+    run.stage = "post";
+    await save(run);
+    return ctx.deps.now();
   }
   const files_ = plan.files.length + plan.uncovered.length;
   await status(ctx, run, "pending", `Reviewing ${plural(files_, "file")} in ${passes(batches.length)}…`);
@@ -407,7 +478,7 @@ async function stageDraft(ctx, run, save) {
     } else {
       const wait = earliestWait(d.outcomes, ctx.deps.now());
       if (wait) b.waitUntil = wait;
-      else if (++b.tries >= MAX_TRIES) { b.status = "failed"; b.reason = d.outcomes.at(-1)?.reason ?? "no model could review it"; }
+      else if ((b.draftTries = (b.draftTries ?? 0) + 1) >= MAX_TRIES) { b.status = "failed"; b.reason = d.outcomes.at(-1)?.reason ?? "no model could review it"; }
     }
     await ctx.storage.put(batchKey(run.id, i), b);
   }));
@@ -463,7 +534,7 @@ async function stageVerify(ctx, run, save) {
       };
     } else if (o.kind === "deferred") {
       b.waitUntil = o.resetAt;
-    } else if (++b.tries >= MAX_TRIES) {
+    } else if ((b.verifyTries = (b.verifyTries ?? 0) + 1) >= MAX_TRIES) {
       b.status = "failed";
       b.reason = o.reason;
     } else {
@@ -532,7 +603,9 @@ async function stagePost(ctx, run, save) {
   const coveredPaths = plan.files.filter((f) => f.batches.every((b) => done.has(b))).map((f) => f.path);
   const merged = mergeResults(batches.filter((b) => b.status === "verified").map((b) => b.result));
   const ids = Object.entries(run.drafters);
-  const modelLine = ids.length === 1
+  const modelLine = !ids.length
+    ? "- Model: none: no file of this pull request could be sent to a model."
+    : ids.length === 1
     ? `- Model: ${batches.find((b) => b.drafter?.id === ids[0][0])?.drafter.label ?? `\`${modelOf(ids[0][0])}\``}`
     : `- Models: ${ids.map(([id, n]) => `\`${modelOf(id)}\` (${passes(n)})`).join(", ")}; free tiers first, the plan's API credit last, never billed.`;
   const costParts = [];
@@ -555,12 +628,19 @@ async function stagePost(ctx, run, save) {
     if (off.length) text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
     text += `\n\n_Incremental review: commits after \`${run.since.slice(0, 7)}\`._`;
   }
-  const posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments });
+  // Posted once: a step retried after the post (a failed write below) does
+  // not post the review again.
+  let posted = run.posted ?? null;
+  if (!posted) {
+    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments });
+    run.posted = { inline: posted?.inline ?? 0 };
+    await save(run);
+  }
   const complete = cov.complete;
   // Only a complete review marks the commit done and moves the PR's last
   // reviewed commit on: after an incomplete one, the next review starts from
   // the last complete one, so nothing it missed is passed over.
-  if (complete) await ctx.env.LEDGER?.put(`done:${run.repo.full}#${run.pr}@${run.headSha}`, utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
+  if (complete) await ctx.env.LEDGER?.put(doneKeyOf(run), utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
   const shownCount = merged.shown.inline.length + merged.shown.general.length;
   ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: posted?.inline ?? 0, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
   return finish(ctx, run, save, {

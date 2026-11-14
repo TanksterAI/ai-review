@@ -127,7 +127,8 @@ export class PrState {
     let out;
     if (msg.op === "event") out = await this.onEvent(msg);
     else if (msg.op === "claim") out = await this.claim(msg);
-    else if (msg.op === "complete") out = await this.complete(msg);
+    // Only the Worker's own runs (stepActiveRun) may say a review covered every file.
+    else if (msg.op === "complete") out = await this.complete({ jobId: msg.jobId, runId: msg.runId, reviewedSha: msg.reviewedSha });
     else if (msg.op === "defer") out = await this.defer(msg);
     else out = { error: "unknown op" };
     return Response.json(out);
@@ -362,8 +363,16 @@ export class PrState {
   async alarm() {
     // A quiet period that is over becomes a job (and a dispatch in the outbox).
     await this.fireDebounce();
-    // One step of the review in progress, if any (review-run.js).
-    const runNext = await this.stepActiveRun();
+    // One step of the review in progress, if any (review-run.js). A step that
+    // throws must not hold up the outbox: commands are still answered, and the
+    // run is looked at again shortly.
+    let runNext;
+    try {
+      runNext = await this.stepActiveRun();
+    } catch (e) {
+      console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", error: String(e?.message ?? e).slice(0, 200) }));
+      runNext = this.now() + RECHECK_MS;
+    }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     const isDue = (x) => !(x.notBefore > this.now());
     const item = box.find(isDue);
@@ -519,7 +528,9 @@ export class PrState {
   async startWorkerRun(job, st) {
     const active = await activeRun(this.ctx.storage);
     if (active && active.id !== job.id) return { holdUntil: this.now() + RECHECK_MS };
-    const since = job.full ? null : st.lastReviewed;
+    // Only a full-coverage review's commit is a starting point: the runner and
+    // v1 move lastReviewed too, but read at most 90,000 characters.
+    const since = job.full ? null : (st.lastCompleteReviewed ?? null);
     if (!active) await startRun(this.ctx.storage, { ...job, since }, this.now());
     const now = this.now();
     await this.ctx.storage.put(`job:${job.id}`, { ...job, since, claimedBy: "worker", claimedAt: now, dispatchedAt: now, firstRunAt: job.firstRunAt ?? now });
@@ -547,7 +558,7 @@ export class PrState {
   // A run is over: its job completes (moving lastReviewed on) or is dropped,
   // and its stored state goes. One given up says so on the PR.
   async runDone(run, { reviewedSha, gaveUp, description }) {
-    if (reviewedSha) await this.complete({ jobId: run.id, runId: "worker", reviewedSha });
+    if (reviewedSha) await this.complete({ jobId: run.id, runId: "worker", reviewedSha, fullCoverage: true });
     else await this.ctx.storage.delete(`job:${run.id}`);
     await dropRun(this.ctx.storage, run.id);
     if (gaveUp) {
@@ -626,7 +637,9 @@ export class PrState {
     return { job };
   }
 
-  async complete({ jobId, runId, reviewedSha }) {
+  // fullCoverage: the Worker's own review covered every file (review-run.js);
+  // only such a review moves lastCompleteReviewed, its incremental start.
+  async complete({ jobId, runId, reviewedSha, fullCoverage = false }) {
     const job = await this.ctx.storage.get(`job:${jobId}`);
     if (!job || job.claimedBy !== String(runId)) return { error: "not your job" };
     const st = await this.state();
@@ -638,6 +651,10 @@ export class PrState {
     if (/^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
       st.lastReviewed = reviewedSha;
       st.lastClaimedAt = at;
+    }
+    if (fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
+      st.lastCompleteReviewed = reviewedSha;
+      st.lastCompleteClaimedAt = at;
     }
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);

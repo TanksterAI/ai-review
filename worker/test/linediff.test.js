@@ -103,3 +103,35 @@ test("random edits round-trip", () => {
     assert.equal(apply(a, unifiedDiff(a, b)), b, `case ${k}`);
   }
 });
+
+// From the independent review: big files with scattered edits, the files
+// GitHub sends without a patch.
+test("70,000 lines with 600 scattered edits: no stack overflow, an exact and small diff", () => {
+  const old = numbered(70_000, "row");
+  const next = [...old];
+  for (let i = 0; i < 600; i++) next[i * 113 + 7] = `edited ${i}`;
+  const a = old.join("\n");
+  const b = next.join("\n");
+  const patch = unifiedDiff(a, b);
+  assert.equal(apply(a, patch), b);
+  // Each one-line edit is a hunk: its header, the old and new line, and 3
+  // lines of context either side.
+  assert.ok(patch.split("\n").length <= 600 * 9, `the diff has ${patch.split("\n").length} lines`);
+});
+
+test("a file rewritten in two halves, past the exact-diff edit limit, still gets a small exact diff around the unchanged lines", () => {
+  const old = numbered(40_000, "row");
+  const next = [...old];
+  for (let i = 0; i < 1500; i++) next[i * 25] = `edited ${i}`;
+  const a = old.join("\n");
+  const b = next.join("\n");
+  const patch = unifiedDiff(a, b, { maxEdits: 200 });
+  assert.equal(apply(a, patch), b);
+  assert.ok(patch.length < 400_000, `the diff has ${patch.length} characters`);
+});
+
+test("a hunk of hundreds of thousands of lines is built without spreading arguments", () => {
+  const b = numbered(300_000, "n").join("\n");
+  const patch = unifiedDiff("", b);
+  assert.equal(apply("", patch), b);
+});

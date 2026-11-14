@@ -141,7 +141,9 @@ test("PR #9's shape: every one of its 18 files is reviewed, in batches, and one 
   assert.equal(s.github.statuses[0].state, "pending");
   assert.deepEqual(s.github.statuses.at(-1), { sha: HEAD, state: "success", description: "Reviewed all 18 files (100%): 1 confirmed finding." });
   assert.equal(s.done.at(-1).reviewedSha, HEAD);
-  assert.ok(s.env.LEDGER.map.has(`done:TanksterAI/ai-review#9@${HEAD}`));
+  // Its own mark: the single-prompt paths' done: key means less (finding 1 of the independent review).
+  assert.ok(s.env.LEDGER.map.has(`donefull:TanksterAI/ai-review#9@${HEAD}`));
+  assert.ok(!s.env.LEDGER.map.has(`done:TanksterAI/ai-review#9@${HEAD}`));
   assert.equal(await activeRun(s.storage), null);
 });
 
@@ -265,12 +267,12 @@ test("a closed pull request is not reviewed, and gets no status", async () => {
 
 test("a commit already reviewed is not reviewed again, unless someone asked", async () => {
   const s = setup();
-  await s.env.LEDGER.put(`done:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
+  await s.env.LEDGER.put(`donefull:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
   await runAll(s);
   assert.equal(s.github.posted.length, 0);
   assert.equal(s.done.at(-1).reviewedSha, HEAD);
   const asked = setup({ job: { requestedBy: "rishitank" } });
-  await asked.env.LEDGER.put(`done:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
+  await asked.env.LEDGER.put(`donefull:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
   await runAll(asked);
   assert.equal(asked.github.posted.length, 1);
 });
@@ -367,7 +369,7 @@ test("an incomplete review marks nothing done, so the next one starts from the l
   await runAll(s);
   assert.equal(s.github.statuses.at(-1).state, "failure");
   assert.equal(s.done.at(-1).reviewedSha, null);
-  assert.ok(!s.env.LEDGER.map.has(`done:TanksterAI/ai-review#9@${HEAD}`));
+  assert.ok(!s.env.LEDGER.map.has(`donefull:TanksterAI/ai-review#9@${HEAD}`));
   assert.match(s.github.posted[0].body, /Not covered \(\d+\): [^\n]*\(the pull request is over the reviewer's limit of 100,000 characters of diff\)/);
 });
 
@@ -399,4 +401,105 @@ test("a step that fails is tried again after a pause; failures are counted in a 
   await runAll(t);
   assert.equal(always.posted.length, 0);
   assert.equal(t.done.at(-1).gaveUp, true);
+});
+
+// --- from the independent review ----------------------------------------------
+
+test("a commit marked done by a single-prompt review (v1 or the runner) is still reviewed in full", async () => {
+  const s = setup();
+  await s.env.LEDGER.put(`done:TanksterAI/ai-review#9@${HEAD}`, "2026-11-14");
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.match(s.github.posted[0].body, /Coverage: 18 of 18 reviewable files \(100%\)/);
+});
+
+test("a commit already reviewed at 100% is not reviewed again, and its status is set again", async () => {
+  const s = setup();
+  await runAll(s);
+  const again = setup();
+  again.env.LEDGER.map = s.env.LEDGER.map;
+  again.ctx.env.LEDGER = s.env.LEDGER;
+  await runAll(again);
+  assert.equal(again.github.posted.length, 0);
+  assert.deepEqual(again.github.statuses.map((x) => x.state), ["success"]);
+  assert.match(again.github.statuses[0].description, /already reviewed at 100%/);
+});
+
+test("files GitHub sent without a patch are fetched only while they fit the pull request's limit", async () => {
+  const big = (i) => Array.from({ length: 2000 }, (_, k) => `const big${i}_${k} = ${k};`).join("\n");
+  const files = Array.from({ length: 6 }, (_, i) => file(`data/big${i}.js`, undefined, { sha: String(i + 1).repeat(40) }));
+  const blobs = new Map(files.map((f, i) => [f.sha, big(i)]));
+  const github = fakeGithub({ files, blobs });
+  const s = setup({ github, env: { MAX_PR_CHARS: "100000" } });
+  await runAll(s);
+  // About 50,000 characters each: once less than a batch of the limit is
+  // left, the rest are named as not covered and never fetched.
+  const fetched = github.calls.filter((c) => c.startsWith("blob:")).length;
+  assert.ok(fetched <= 3, `${fetched} blobs were fetched`);
+  const { body } = github.posted[0];
+  assert.match(body, /Not covered \(\d+\): `data\/big[1-5]\.js` \(the pull request is over the reviewer's limit of 100,000 characters of diff\)/);
+  assert.equal(github.statuses.at(-1).state, "failure");
+});
+
+test("a step that dies without throwing (out of memory, CPU) is still counted, and six in a row give up", async () => {
+  const github = fakeGithub();
+  github.pullRequest = () => new Promise(() => {}); // the step never ends: the isolate is killed
+  const s = setup({ github });
+  await startRun(s.storage, s.job, s.getNow());
+  for (let i = 0; i < 6; i++) {
+    void stepRun(s.ctx, s.job.id);
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal((await s.storage.get("runmeta:job1")).tries, i + 1);
+  }
+  // The next alarm finds six dead attempts and gives up, rather than die again.
+  assert.equal(await stepRun(s.ctx, s.job.id), null);
+  assert.equal(s.done.at(-1).gaveUp, true);
+});
+
+test("drafting and verifying count their failures apart: a verifier blip does not throw away a draft", async () => {
+  let drafts = 0;
+  let verifies = 0;
+  const models = fakeModels({
+    flag: "src/a.js",
+    gemini: { "gemini-3.5-flash-lite": () => (++drafts <= 2 ? reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: "nope" }] } }] }) : null) },
+    anthropic: (body, asked) => (++verifies === 1 ? reply(500, {}) : reply(200, { content: [{ type: "text", text: JSON.stringify({ verdicts: asked.map((f) => ({ id: f.id, verdict: "confirmed", severity: f.severity, suggestion_ok: false, prompt_ok: false, reason: "r" })) }) }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } })),
+  });
+  const s = setup({ github: fakeGithub({ files: [file("src/a.js", added(5, "a_"))] }), models, env: { DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite", VERIFY_FALLBACK: "" } });
+  await runAll(s);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+  assert.equal(s.github.posted[0].comments.length, 1);
+});
+
+test("posting is done once: a failure after the review is posted does not post it again", async () => {
+  const s = setup();
+  const put = s.env.LEDGER.put.bind(s.env.LEDGER);
+  let failed = false;
+  s.env.LEDGER.put = async (k, v, o) => { if (!failed && k.startsWith("donefull:")) { failed = true; throw new Error("KV 500"); } return put(k, v, o); };
+  s.ctx.env.LEDGER = s.env.LEDGER;
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+});
+
+test("a single line far longer than a batch (minified or generated data) is not reviewable; a long one that fits is reviewed", async () => {
+  const huge = `@@ -0,0 +1,1 @@\n+${JSON.stringify({ data: "q".repeat(600_000) })}`;
+  const long = `@@ -0,0 +1,1 @@\n+const blob = "${"z".repeat(100_000)}";`;
+  const github = fakeGithub({ files: [file("fixtures/data.json", huge), file("src/blob.js", long), file("src/a.js", added(5, "a_"))] });
+  const s = setup({ github });
+  await runAll(s);
+  const { body } = github.posted[0];
+  assert.match(body, /Coverage: 2 of 2 reviewable files \(100%\)/);
+  assert.match(body, /Not reviewable \(1\): `fixtures\/data\.json` \(a line over 240,000 characters: minified or generated\)/);
+  assert.ok(!s.models.calls.some((c) => c.files?.includes("fixtures/data.json")));
+});
+
+test("when no reviewable file can be taken at all, a review still says so, and the status fails", async () => {
+  const github = fakeGithub({ files: [file("src/a.js", added(400, "a_")), file("src/b.js", added(400, "b_"))] });
+  const s = setup({ github, env: { MAX_PR_CHARS: "1000" } });
+  await runAll(s);
+  const { body } = github.posted[0];
+  assert.match(body, /\*\*Incomplete review: 0 of 2 reviewable files were covered\.\*\*/);
+  assert.match(body, /\n- Model: none: no file of this pull request could be sent to a model\.\n/);
+  assert.equal(github.statuses.at(-1).state, "failure");
+  assert.equal(s.models.calls.length, 0);
 });
