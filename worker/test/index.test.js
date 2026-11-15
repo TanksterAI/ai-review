@@ -294,3 +294,110 @@ test("placeComments keeps what fits, shrinks a range to its line, and moves the 
   assert.deepEqual(off.map((c) => c.body), ["no single-line body", "gone", "other file"]);
   assert.deepEqual(placeComments(comments.slice(1, 2), undefined, lines).off.length, 1);
 });
+
+// --- the provider chain -----------------------------------------------------
+
+function geminiFetch(steps) {
+  const calls = [];
+  const f = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    const s = steps[Math.min(calls.length - 1, steps.length - 1)];
+    return { ok: s.status === 200, status: s.status, headers: { get: () => null }, async json() { return s.body; } };
+  };
+  f.calls = calls;
+  return f;
+}
+const geminiOk = (text) => ({ status: 200, body: { candidates: [{ finishReason: "STOP", content: { parts: [{ text }] } }] } });
+const geminiDay = { status: 429, body: { error: { details: [{ violations: [{ quotaId: "GenerateRequestsPerDayPerProjectPerModel-FreeTier" }] }] } } };
+
+test("the chain: Gemini reviews first, for free, and Workers AI is never called", async () => {
+  const ai = aiReturning(answer);
+  const e = env(ai, { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const f = geminiFetch([geminiOk(answer)]);
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: f });
+  const out = await res.json();
+  assert.equal(res.status, 200);
+  assert.deepEqual(out.usage, { provider: "gemini", model: "gemini-3.5-flash-lite", usd: 0 });
+  assert.equal(ai.calls.length, 0);
+  assert.match(out.review.body, /Model: `gemini-3\.5-flash-lite` on the Gemini API free tier/);
+  assert.match(out.review.body, /Cost: nothing \(free tier\)\./);
+});
+
+test("the chain: a provider out of quota hands over to the next, and stays skipped until it resets", async () => {
+  const ai = aiReturning(answer);
+  const e = env(ai, { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const f = geminiFetch([geminiDay]);
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: f });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).usage.model, "@cf/zai-org/glm-4.7-flash");
+  assert.equal(ai.calls[0].model, "@cf/zai-org/glm-4.7-flash");
+  // The next review does not ask Gemini again until midnight Pacific.
+  const res2 = await handleReview(await req({ ...goodBody, head_sha: "b".repeat(40) }), e, { ...deps, fetch: f });
+  assert.equal(res2.status, 200);
+  assert.equal(f.calls.length, 1);
+});
+
+test("the chain: every provider out of quota defers to the earliest reset; busy beats broken", async () => {
+  const e = env(aiScript([new Error("AiError: 3036: daily free allocation")]), { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: geminiFetch([geminiDay]) });
+  const out = await res.json();
+  assert.equal(res.status, 429);
+  // Workers AI resets at 00:00 UTC; Gemini at midnight Pacific, later.
+  const d = new Date(NOW_MS);
+  assert.equal(out.resets_at, new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1)).toISOString());
+  const busy = env(aiScript([new Error("weird")]), { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:g,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const r2 = await handleReview(await req(goodBody), busy, { ...deps, fetch: geminiFetch([{ status: 503, body: {} }]) });
+  assert.equal(r2.status, 503);
+  // An unparseable answer on one provider is retried there once, then the next is tried.
+  const ai = aiReturning(answer);
+  const e3 = env(ai, { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:g,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const f3 = geminiFetch([geminiOk('{"summary": "s", "findings": [')]);
+  const r3 = await handleReview(await req(goodBody), e3, { ...deps, fetch: f3 });
+  assert.equal(r3.status, 200);
+  assert.equal(f3.calls.length, 2);
+  assert.match(f3.calls[1].body.systemInstruction.parts[0].text, /leave out every "suggestion" key/);
+  assert.equal(ai.calls.length, 1);
+});
+
+test("the chain: Claude as a last-resort drafter shows its cost against the day's cap", async () => {
+  const f = async () => ({ ok: true, status: 200, headers: { get: () => null }, async json() { return { content: [{ type: "text", text: answer }], stop_reason: "end_turn", usage: { input_tokens: 20_000, output_tokens: 1_000 } }; } });
+  const e = env(aiReturning(answer), { ANTHROPIC_API_KEY: "sk", DRAFT_CHAIN: "anthropic:claude-haiku-5-5", ANTHROPIC_DAILY_USD_CAP: "5" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: f });
+  const out = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(out.usage.provider, "anthropic");
+  assert.match(out.review.body, /Cost: \$0\.0025 of the plan's API credit; \$5\.00 of today's \$5\.00 left\./);
+});
+
+test("healthz lists the providers and what is out of quota, never a key", async () => {
+  const e = env(aiReturning(answer), { GEMINI_API_KEY: "secret-key", DRAFT_CHAIN: "gemini:g,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  await e.LEDGER.put("ex:gemini:g", String(Date.now() + 3600_000));
+  const res = await worker.fetch(new Request("https://x/healthz"), e);
+  const text = await res.text();
+  assert.ok(!text.includes("secret-key"));
+  const body = JSON.parse(text);
+  assert.equal(body.providers.length, 2);
+  assert.equal(body.providers[0].configured, true);
+  assert.ok(body.providers[0].exhausted_until);
+  assert.equal(body.providers[1].exhausted_until, null);
+});
+
+test("the chain: busy until a known time counts as a wait (429, queued), not a failure", async () => {
+  const minute = { status: 429, body: { error: { details: [{ violations: [{ quotaId: "GenerateRequestsPerMinute-FreeTier" }] }, { retryDelay: "40s" }] } } };
+  const e = env(aiScript([new Error("AiError: 3036: daily free allocation")]), { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:g,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: geminiFetch([minute]) });
+  const out = await res.json();
+  assert.equal(res.status, 429);
+  // The earliest: Gemini's minute limit (40 s, held for KV's 60-second minimum).
+  assert.equal(out.resets_at, new Date(NOW_MS + 60_000).toISOString());
+  assert.match(out.reason, /rate limit/);
+  assert.ok(out.chars > 1000, "the review's size, for sizing the next capacity check");
+});
+
+test("the chain: one provider failing and another only out of quota waits (429), it is not a failure", async () => {
+  const cut = { status: 200, body: { candidates: [{ finishReason: "MAX_TOKENS", content: { parts: [{ text: '{"summary":' }] } }] } };
+  const e = env(aiScript([new Error("AiError: 3036: daily free allocation")]), { GEMINI_API_KEY: "k", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,workers-ai:@cf/zai-org/glm-4.7-flash" });
+  const res = await handleReview(await req(goodBody), e, { ...deps, fetch: geminiFetch([cut]) });
+  assert.equal(res.status, 429);
+  assert.match((await res.json()).reason, /Workers AI allocation/);
+});

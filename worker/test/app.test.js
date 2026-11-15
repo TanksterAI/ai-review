@@ -275,3 +275,46 @@ test("a re-run of the runner reviews again after a failed post; other events can
   const push = await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }, { event_name: "push" }), e, deps(e));
   assert.equal(push.status, 403);
 });
+
+test("runner review deferred: the job goes back to the PR's object and is dispatched again after the reset", async () => {
+  const e = env({ AI: { async run() { throw new Error("AiError: 3036: daily free allocation used"); } } });
+  const jobId = await openPr(e);
+  await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, deps(e));
+  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), title: "t", body: "b", files }), e, deps(e));
+  assert.equal(r.status, 429);
+  assert.equal(e.fx.calls.filter((c) => c[0] === "postReview").length, 0);
+  const obj = e.PR_STATE.objects.get("TanksterAI/browser-relay#39");
+  const box = await obj.ctx.storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].type, "dispatch");
+  assert.equal(box[0].jobId, jobId);
+  assert.ok(box[0].notBefore > NOW_MS);
+  // Released: a later run of the dispatch can claim it.
+  assert.equal((await obj.ctx.storage.get(`job:${jobId}`)).claimedBy, null);
+  const s2 = await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }, { run_id: "9000" }), e, deps(e));
+  assert.equal(s2.status, 200);
+});
+
+test("runner review: a provider that failed is skipped when the deferred review runs again", async () => {
+  let calls = 0;
+  const e = env({
+    GEMINI_API_KEY: "k",
+    DRAFT_CHAIN: "workers-ai:@cf/zai-org/glm-4.7-flash,gemini:gemini-3.5-flash-lite",
+    AI: { async run() { calls++; return { choices: [{ message: { content: "not json" }, finish_reason: "stop" }] }; } },
+  });
+  const day = { ok: false, status: 429, headers: { get: () => null }, async json() { return { error: { details: [{ violations: [{ quotaId: "PerDay" }] }] } }; } };
+  const d = { ...deps(e), fetch: async () => day };
+  const jobId = await openPr(e);
+  await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, d);
+  const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
+  const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), files }), e, d);
+  assert.equal(r.status, 429);
+  assert.equal(calls, 1);
+  const obj = e.PR_STATE.objects.get("TanksterAI/browser-relay#39");
+  assert.deepEqual((await obj.ctx.storage.get(`job:${jobId}`)).skip, ["workers-ai:@cf/zai-org/glm-4.7-flash"]);
+  e.LEDGER.map.delete("ex:gemini:gemini-3.5-flash-lite");
+  await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }, { run_id: "9100" }), e, d);
+  await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), files }, { run_id: "9100" }), e, d);
+  assert.equal(calls, 1, "the failing provider is not asked again");
+});

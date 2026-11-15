@@ -124,7 +124,10 @@ test("the token is revoked even when the run fails", async () => {
 test("closed PRs, deferrals and failures are reported, not hidden", async () => {
   assert.match((await run({ pr: { state: "closed" } })).notices[0], /closed; nothing to review/);
   assert.match((await run({ review: { status: 429, json: { reason: "spent", resets_at: "t" } } })).warnings[0], /deferred/);
-  assert.match((await run({ review: { status: 502, json: { reason: "bad answer" } } })).failed, /bad answer/);
+  // 502 and 503 are queued by the Worker and tried again: a warning, not a failure.
+  assert.match((await run({ review: { status: 502, json: { reason: "bad answer" } } })).warnings[0], /bad answer\. It is queued/);
+  assert.match((await run({ review: { status: 503, json: { reason: "busy" } } })).warnings[0], /busy\. It is queued/);
+  assert.match((await run({ review: { status: 500, json: { reason: "boom" } } })).failed, /boom/);
 });
 
 test("big patches are cut and the total is bounded", async () => {

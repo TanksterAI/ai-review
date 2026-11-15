@@ -8,7 +8,10 @@
 //   RSA signing is the costly part of 10 ms of CPU.
 // - Installation tokens are always minted for named repositories and a named
 //   subset of permissions, never for the whole installation, and cached until
-//   five minutes before they expire.
+//   five minutes before they expire. A token handed to someone else who will
+//   revoke it (the runner deletes its token when its run ends) is minted fresh
+//   and never cached: a shared one would be revoked under every other run for
+//   the same repository.
 
 const API = "https://api.github.com";
 const UA = "tankster-ai-review";
@@ -114,19 +117,20 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
   }
 
   // repos: bare repository names in the org. permissions: e.g. {contents: "read"}.
-  async function installationToken(repos, permissions) {
+  // fresh: mint a new token and keep it out of the cache (see the top).
+  async function installationToken(repos, permissions, { fresh = false } = {}) {
     const names = [...new Set(repos)].sort();
     if (!names.length || names.some((r) => !/^[A-Za-z0-9._-]+$/.test(r))) {
       throw new GithubAppError("installation tokens are only minted for named repositories");
     }
     const k = `${names.join(",")}|${JSON.stringify(Object.entries(permissions).sort())}`;
-    const hit = tokens.get(k);
+    const hit = fresh ? null : tokens.get(k);
     if (hit && hit.expires - 5 * 60_000 > now()) return hit.token;
     const out = await call("POST", `/app/installations/${await installation()}/access_tokens`, {
       token: await appJwt(),
       body: { repositories: names, permissions },
     });
-    tokens.set(k, { token: out.token, expires: Date.parse(out.expires_at) });
+    if (!fresh) tokens.set(k, { token: out.token, expires: Date.parse(out.expires_at) });
     return out.token;
   }
 

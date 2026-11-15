@@ -713,3 +713,233 @@ test("a push after a long wait on a job starts a fresh burst with its own quiet 
   assert.equal(dispatched(fx).length, 2, "one review for both late pushes");
   assert.ok(t >= NOW + 23 * MIN + 30_000, "after the second push's quiet period");
 });
+
+// --- capacity: hold rather than start a runner that can only defer ----------
+
+test("no provider has capacity: the dispatch is held, its job kept fresh, then sent once one resets", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  let cap = { ok: false, retryAt: NOW + 5 * 3600_000 };
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await fire(obj);
+  assert.deepEqual(fx.calls, []);
+  let box = await storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].attempts, 0, "a hold is not a failed attempt");
+  // Looked at again within the hour, never left to age out.
+  assert.equal(box[0].notBefore, NOW + 3600_000);
+  assert.equal(storage.alarm, NOW + 3600_000);
+  for (let i = 1; i <= 4; i++) {
+    await advance(obj, (v) => { t = v; }, NOW + i * 3600_000);
+    assert.equal((await storage.get(`job:${out.jobId}`)).createdAt, t, "kept fresh while held");
+  }
+  assert.deepEqual(fx.calls, []);
+  cap = { ok: true };
+  await advance(obj, (v) => { t = v; }, NOW + 5 * 3600_000);
+  assert.deepEqual(fx.calls, [["dispatch", out.jobId]]);
+  assert.deepEqual(await storage.get("outbox"), []);
+  // The runner can still claim it: the job did not expire while held.
+  assert.ok((await obj.claim({ jobId: out.jobId, runId: "77" })).job);
+  box = await storage.get("outbox");
+  assert.deepEqual(box, []);
+});
+
+test("a held dispatch does not block other side effects behind it", async () => {
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState({ storage }, {}, { now: () => NOW, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
+  await obj.onEvent({ delivery: "d1", ev: review() });
+  await fire(obj);
+  await obj.onEvent({ delivery: "d2", ev: command("@tankster-ai-review help") });
+  await fire(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "comment").length, 1);
+  assert.equal((await storage.get("outbox")).length, 1);
+});
+
+test("a deferred review is given back: released, queued for the reset, claimable by a new run", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: true }) });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  assert.ok((await obj.claim({ jobId: out.jobId, runId: "1" })).job);
+  assert.deepEqual(await obj.defer({ jobId: out.jobId, runId: "2", retryAt: NOW + 7200_000 }), { error: "not your job" });
+  const d = await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW + 7200_000 });
+  // At most an hour away, so the job is looked at (and kept fresh) in time.
+  assert.equal(d.retryAt, NOW + 3600_000);
+  const job = await storage.get(`job:${out.jobId}`);
+  assert.equal(job.claimedBy, null);
+  assert.equal(job.claimedAt, undefined);
+  assert.equal(storage.alarm, NOW + 3600_000);
+  // A second deferral for the same job queues no second dispatch.
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW });
+  assert.equal((await storage.get("outbox")).length, 1);
+  await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+  assert.deepEqual(fx.calls.filter((c) => c[0] === "dispatch").length, 2);
+  assert.ok((await obj.claim({ jobId: out.jobId, runId: "3" })).job);
+});
+
+test("a deferral on a closed pull request just ends its job", async () => {
+  const { obj, storage } = make();
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  await obj.onEvent({ delivery: "d2", ev: { ...review(), kind: "closed" } });
+  // Closing deleted the job already; a late deferral finds nothing to give back.
+  assert.deepEqual(await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW }), { error: "not your job" });
+  assert.deepEqual(await storage.get("outbox"), []);
+});
+
+test("a push while a dispatch is held waits for it, without waking every 30 seconds", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
+  await obj.onEvent({ delivery: "d1", ev: review() });
+  await fire(obj);
+  await obj.onEvent({ delivery: "d2", ev: review({ action: "synchronize" }) });
+  await advance(obj, (v) => { t = v; }, NOW + 180_000);
+  const d = await storage.get("debounce");
+  assert.equal(d.due, NOW + 3600_000);
+  assert.equal(storage.alarm, NOW + 3600_000);
+  assert.equal((await storage.list({ prefix: "job:" })).size, 1, "no second job");
+});
+
+test("a held review request beside a waiting push never spins the alarm (both kinds of covering item)", async () => {
+  for (const kind of ["command", "author_check"]) {
+    let t = NOW;
+    const storage = memoryStorage();
+    const fx = fakeEffects({ writers: ["rishitank", "bob"] });
+    const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 5 * 3600_000 }) });
+    if (kind === "command") {
+      await obj.onEvent({ delivery: "d0", ev: review({ action: "synchronize" }) });
+      await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review review") });
+      await fire(obj);
+      await obj.onEvent({ delivery: "d2", ev: review({ action: "synchronize" }) });
+    } else {
+      const bob = { login: "bob", association: "CONTRIBUTOR", bot: false };
+      await obj.onEvent({ delivery: "d1", ev: review({ author: bob }) });
+      await fire(obj);
+      await obj.onEvent({ delivery: "d2", ev: review({ action: "synchronize", author: bob }) });
+      await fire(obj);
+    }
+    t = NOW + 181_000;
+    let n = 0;
+    while (storage.alarm !== null && storage.alarm <= t && n < 100) { await fire(obj); n++; }
+    assert.ok(n <= 2, `${kind}: ${n} alarms at one instant`);
+    assert.ok(storage.alarm > t, `${kind}: the next alarm is in the future`);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  }
+});
+
+test("a deferral remembers when and how big: no runner is started before then, and it is sized as the review", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const asked = [];
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async (chars) => { asked.push(chars); return { ok: true }; } });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW + 3 * 3600_000, chars: 96_000 });
+  // Hourly looks keep the job fresh but start nothing until the time given.
+  for (let h = 1; h <= 2; h++) await advance(obj, (v) => { t = v; }, NOW + h * 3600_000);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
+  await advance(obj, (v) => { t = v; }, NOW + 3 * 3600_000);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 2);
+  assert.equal(asked.at(-1), 96_000, "capacity asked for the review's own size");
+});
+
+test("busy or failing reviews are retried a few times, then dropped; quota waits never count", async () => {
+  const { obj, storage } = make();
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  for (let i = 0; i < 5; i++) {
+    await obj.claim({ jobId: out.jobId, runId: "1" });
+    assert.equal((await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW, why: "quota" })).dropped, undefined);
+  }
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  assert.equal((await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW, why: "busy" })).dropped, undefined);
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  assert.equal((await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW, why: "failed" })).dropped, undefined);
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  assert.equal((await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW, why: "failed" })).dropped, true);
+  assert.equal(await storage.get(`job:${out.jobId}`), undefined);
+});
+
+test("a held automatic review is dropped if the PR is paused or made a draft meanwhile; one asked for still runs", async () => {
+  for (const change of ["pause", "draft"]) {
+    let t = NOW;
+    const storage = memoryStorage();
+    const fx = fakeEffects({ writers: ["rishitank"] });
+    let cap = { ok: false, retryAt: NOW + 3600_000 };
+    const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+    await obj.onEvent({ delivery: "d1", ev: review() });
+    await fire(obj);
+    if (change === "pause") { await obj.onEvent({ delivery: "d2", ev: command("@tankster-ai-review pause") }); await fire(obj); }
+    else await obj.onEvent({ delivery: "d2", ev: review({ action: "converted_to_draft", draft: true }) });
+    cap = { ok: true };
+    await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+    await drain(obj);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0, change);
+    assert.equal((await storage.list({ prefix: "job:" })).size, 0, change);
+  }
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  let cap = { ok: false, retryAt: NOW + 3600_000 };
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+  await obj.onEvent({ delivery: "d0", ev: review({ action: "synchronize" }) });
+  await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  await obj.onEvent({ delivery: "d2", ev: command("@tankster-ai-review review") });
+  await fire(obj);
+  cap = { ok: true };
+  await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "asked for: still runs while paused");
+});
+
+test("a review given up after its tries says so on the pull request, once an hour at most", async () => {
+  const { obj, fx } = make();
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  for (let i = 0; i < 3; i++) {
+    await obj.claim({ jobId: out.jobId, runId: "1" });
+    await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW, why: "failed", reason: "the model did not return a `usable`\nanswer" });
+  }
+  await drain(obj);
+  const notes = fx.calls.filter((c) => c[0] === "comment");
+  assert.equal(notes.length, 1);
+  assert.match(notes[0][3], /has stopped trying after 3 failed tries \(the model did not return a  usable  answer\)\. Comment `@tankster-ai-review review` to try again\./);
+});
+
+test("providers that failed a job are skipped on its later tries and by the capacity check; a job lives three days at most", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const asked = [];
+  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async (chars, skip) => { asked.push(skip); return { ok: true }; } });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: out.jobId, runId: "1" });
+  await obj.defer({ jobId: out.jobId, runId: "1", retryAt: NOW + 120_000, failed: ["gemini:g", 7, "workers-ai:w"] });
+  let job = await storage.get(`job:${out.jobId}`);
+  assert.deepEqual(job.skip, ["gemini:g", "workers-ai:w"]);
+  await advance(obj, (v) => { t = v; }, NOW + 120_000);
+  assert.deepEqual(asked.at(-1), ["gemini:g", "workers-ai:w"]);
+  // However many quota waits, three days after it was made it is given up, with a note.
+  t = NOW + 3 * 24 * 3600_000 + 1;
+  // (Hourly holds keep a waiting job fresh; here the clock simply jumps.)
+  await storage.put(`job:${out.jobId}`, { ...(await storage.get(`job:${out.jobId}`)), createdAt: t });
+  await obj.claim({ jobId: out.jobId, runId: "2" });
+  assert.equal((await obj.defer({ jobId: out.jobId, runId: "2", retryAt: t + 3600_000 })).dropped, true);
+  await drain(obj);
+  const note = fx.calls.filter((c) => c[0] === "comment").at(-1)[3];
+  assert.match(note, /waited three days for a model provider \(.*\), so it has stopped trying/);
+  job = await storage.get(`job:${out.jobId}`);
+  assert.equal(job, undefined);
+});

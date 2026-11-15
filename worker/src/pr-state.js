@@ -10,6 +10,8 @@
 import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
 import { appConfig } from "./setup.js";
 import { createEffects } from "./effects.js";
+import { config } from "./config.js";
+import { capacity, draftChain } from "./providers.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -76,6 +78,16 @@ const WRITER_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const MAX_ATTEMPTS = 5;
 const REPLY_WINDOW_MS = 3600_000;
 const DELETE_CHUNK = 128; // a Durable Object deletes at most 128 keys per call
+// A dispatch held while no model provider has capacity is looked at again at
+// least this often, and its job kept fresh, so it never ages out (JOB_TTL_MS).
+const HOLD_RECHECK_MS = 3600_000;
+// A job the runner gave back (every provider deferred) waits at least this long.
+const MIN_DEFER_MS = 60_000;
+// A job given back because its review failed or the service was busy (not
+// for quota) is tried this many times in all, then dropped.
+const MAX_RETRIES = 3;
+// However it waits, a job is given up this long after it was first made.
+const MAX_JOB_LIFE_MS = 3 * 24 * 3600_000;
 
 export function needsApproval(slug = DEFAULT_SLUG) {
   return `This pull request comes from a fork or from an author without write access, so it is not reviewed automatically. Someone with write access can comment \`@${slug} review\` to start one.`;
@@ -94,6 +106,8 @@ export class PrState {
     this.now = deps.now ?? (() => Date.now());
     // {dispatch(jobId), comment(repoFull, pr, body), canWrite(repoFull, login)}
     this.effects = deps.effects ?? null;
+    // () => {ok} | {ok: false, retryAt}: can any model provider take a review now?
+    this.capacity = deps.capacity ?? null;
     this.debounceMs = seconds(env?.REVIEW_DEBOUNCE_S, DEBOUNCE_S) * 1000;
     this.debounceMaxMs = Math.max(this.debounceMs, seconds(env?.REVIEW_DEBOUNCE_MAX_S, DEBOUNCE_MAX_S) * 1000);
   }
@@ -108,6 +122,7 @@ export class PrState {
     if (msg.op === "event") out = await this.onEvent(msg);
     else if (msg.op === "claim") out = await this.claim(msg);
     else if (msg.op === "complete") out = await this.complete(msg);
+    else if (msg.op === "defer") out = await this.defer(msg);
     else out = { error: "unknown op" };
     return Response.json(out);
   }
@@ -178,7 +193,14 @@ export class PrState {
     // A review asked for, or an opening one, still waiting in the outbox
     // covers this push, and drops it when it runs.
     const box = (await this.ctx.storage.get("outbox")) ?? [];
-    if (box.some((x) => (x.type === "command" && (x.cmd === "review" || x.cmd === "full review")) || (x.type === "author_check" && x.opening))) return;
+    const covering = box.filter((x) => (x.type === "command" && (x.cmd === "review" || x.cmd === "full review")) || (x.type === "author_check" && x.opening));
+    if (covering.length) {
+      // It may be held for capacity: look again once it can go, never in a
+      // loop meanwhile.
+      d.due = Math.max(this.now() + RECHECK_MS, Math.min(...covering.map((x) => x.notBefore ?? 0)));
+      await this.ctx.storage.put("debounce", d);
+      return;
+    }
     const st = await this.state();
     const key = await this.ctx.storage.get("key");
     if (st.paused || st.closed || st.draft || !key) {
@@ -202,7 +224,7 @@ export class PrState {
     const now = this.now();
     const recheck = now + Math.max(this.debounceMs, RECHECK_MS);
     const jobs = await this.ctx.storage.list({ prefix: "job:" });
-    const queued = new Set(box.map((x) => x.jobId).filter(Boolean));
+    const queued = new Map(box.filter((x) => x.jobId).map((x) => [x.jobId, x.notBefore ?? 0]));
     let next = Infinity;
     for (const j of jobs.values()) {
       if (now - j.createdAt > JOB_TTL_MS) continue;
@@ -211,7 +233,8 @@ export class PrState {
           next = Math.min(next, recheck, j.claimedAt + this.debounceMaxMs);
         }
       } else if (queued.has(j.id)) {
-        next = Math.min(next, recheck);
+        // A dispatch held for capacity: nothing to look at until it goes out.
+        next = Math.min(next, Math.max(recheck, queued.get(j.id)));
       } else if (j.dispatchedAt !== undefined && now - j.dispatchedAt < this.debounceMaxMs) {
         next = Math.min(next, recheck, j.dispatchedAt + this.debounceMaxMs);
       }
@@ -240,6 +263,7 @@ export class PrState {
       since: full ? null : st.lastReviewed,
       requestedBy,
       createdAt: this.now(),
+      firstAt: this.now(),
       claimedBy: null,
     };
     await this.ctx.storage.put(`job:${id}`, job);
@@ -331,26 +355,35 @@ export class PrState {
     // A quiet period that is over becomes a job (and a dispatch in the outbox).
     await this.fireDebounce();
     const box = (await this.ctx.storage.get("outbox")) ?? [];
-    if (box.length) {
-      const [item, ...rest] = box;
+    const isDue = (x) => !(x.notBefore > this.now());
+    const item = box.find(isDue);
+    if (item) {
       if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
-        await this.ctx.storage.put("outbox", rest);
+        await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
         // Its job would never get a runner: it must not stand in for later pushes.
         if (item.jobId) await this.ctx.storage.delete(`job:${item.jobId}`);
       } else {
         item.attempts += 1;
-        await this.ctx.storage.put("outbox", [item, ...rest]);
-        await this.perform(item);
+        await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
+        const out = await this.perform(item);
         const now = (await this.ctx.storage.get("outbox")) ?? [];
-        await this.ctx.storage.put("outbox", now.filter((x) => x.id !== item.id));
+        if (out?.holdUntil) {
+          // Held, not failed: the attempt does not count.
+          await this.ctx.storage.put("outbox", now.map((x) => (x.id === item.id ? { ...x, attempts: x.attempts - 1, notBefore: out.holdUntil } : x)));
+        } else {
+          await this.ctx.storage.put("outbox", now.filter((x) => x.id !== item.id));
+        }
       }
     }
-    if (((await this.ctx.storage.get("outbox")) ?? []).length) {
+    const rest = (await this.ctx.storage.get("outbox")) ?? [];
+    if (rest.some(isDue)) {
       await this.ctx.storage.setAlarm(this.now());
     } else {
       const d = await this.ctx.storage.get("debounce");
-      if (d) await this.ctx.storage.setAlarm(d.due);
+      const next = Math.min(d ? d.due : Infinity, ...rest.map((x) => x.notBefore));
+      // Never in the past: an alarm with nothing due must not fire at once.
+      if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next > this.now() ? next : this.now() + RECHECK_MS);
     }
   }
 
@@ -367,10 +400,28 @@ export class PrState {
   // jobs), and records when, so a push can tell a job on its way from one
   // whose runner never came.
   async dispatchJob(fx, jobId) {
-    if (!(await this.ctx.storage.get(`job:${jobId}`))) return undefined;
+    const held = await this.ctx.storage.get(`job:${jobId}`);
+    if (!held) return undefined;
+    // A dispatch can wait for hours now: an automatic one (not asked for)
+    // whose PR was paused or made a draft meanwhile is dropped.
+    const st = await this.state();
+    if (!held.requestedBy && (st.paused || st.draft)) {
+      await this.ctx.storage.delete(`job:${jobId}`);
+      return undefined;
+    }
+    // No model provider can take a review now (sized as the review itself,
+    // when it was tried before), or the runner said when one will: hold the
+    // dispatch rather than start a runner that can only defer. The job is
+    // kept fresh meanwhile.
+    const cap = held.retryAt > this.now() ? { ok: false, retryAt: held.retryAt } : await this.capacityNow(held.chars, held.skip);
+    if (!cap.ok) {
+      await this.ctx.storage.put(`job:${jobId}`, { ...held, createdAt: this.now() });
+      console.log(JSON.stringify({ svc: "ai-review", ev: "dispatch_held", retry_at: new Date(cap.retryAt).toISOString() }));
+      return { holdUntil: Math.max(this.now() + MIN_DEFER_MS, Math.min(cap.retryAt, this.now() + HOLD_RECHECK_MS)) };
+    }
     await fx.dispatch(jobId);
     const job = await this.ctx.storage.get(`job:${jobId}`);
-    if (job) await this.ctx.storage.put(`job:${jobId}`, { ...job, dispatchedAt: this.now() });
+    if (job) await this.ctx.storage.put(`job:${jobId}`, { ...job, dispatchedAt: this.now(), firstRunAt: job.firstRunAt ?? this.now() });
     return undefined;
   }
 
@@ -386,7 +437,13 @@ export class PrState {
       if (!key) return undefined;
       // Re-checked here: several may have been queued before the first posted.
       if (item.replyTo && !(await this.mayReply(item.replyTo.login, item.replyTo.kind))) return undefined;
-      await fx.comment(key.repo, key.pr, item.template === "needs_approval" ? needsApproval(slug) : item.body);
+      const text = item.template === "needs_approval" ? needsApproval(slug)
+        : item.template === "gave_up"
+          ? (item.waited
+            ? `The AI review of this pull request waited three days for a model provider (${item.reason}), so it has stopped trying. Comment \`@${slug} review\` to try again.`
+            : `The AI review of this pull request has stopped trying after ${item.tries ?? MAX_RETRIES} failed ${(item.tries ?? MAX_RETRIES) === 1 ? "try" : "tries"} (${item.reason}). Comment \`@${slug} review\` to try again.`)
+          : item.body;
+      await fx.comment(key.repo, key.pr, text);
       if (item.replyTo) await this.replied(item.replyTo.login, item.replyTo.kind);
       return undefined;
     }
@@ -436,6 +493,56 @@ export class PrState {
       return this.dispatchJob(fx, item.jobId);
     }
     return undefined;
+  }
+
+  async capacityNow(chars, skip = []) {
+    if (this.capacity) return this.capacity(chars, skip);
+    if (!this.env?.LEDGER) return { ok: true };
+    const cfg = config(this.env);
+    const deps = { now: this.now, sleep: async () => {}, fetch: () => Promise.reject(new Error("no calls")), log: () => {} };
+    const chain = draftChain(this.env, cfg).filter((x) => !skip.includes(`${x.kind}:${x.model}`));
+    return capacity(this.env, cfg, chain, deps, Number(chars) > 0 ? Number(chars) : undefined);
+  }
+
+  // The runner's review was deferred (every provider out of quota): the job
+  // is released and dispatched again once one resets. Queued, never dropped.
+  async defer({ jobId, runId, retryAt, why = "quota", chars, reason, failed }) {
+    const job = await this.ctx.storage.get(`job:${jobId}`);
+    if (!job || job.claimedBy !== String(runId)) return { error: "not your job" };
+    const st = await this.state();
+    const retries = (job.retries ?? 0) + (why === "quota" ? 0 : 1);
+    // Three days from its first run, not from when it was made: a job held
+    // for days before any provider could take it gets its full time.
+    const old = this.now() - (job.firstRunAt ?? job.firstAt ?? job.createdAt) > MAX_JOB_LIFE_MS;
+    if (st.closed || retries >= MAX_RETRIES || old) {
+      await this.ctx.storage.delete(`job:${jobId}`);
+      if (!st.closed) {
+        // Never silently: say so on the PR, at most once an hour.
+        console.log(JSON.stringify({ svc: "ai-review", ev: "review_given_up", retries }));
+        const why = String(reason ?? "the review kept failing").replace(/[`\n]/g, " ").slice(0, 200);
+        await this.outbox({ type: "comment", template: "gave_up", reason: why, tries: retries, waited: old, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
+      }
+      return { ok: true, dropped: true };
+    }
+    const { claimedAt: _c, dispatchedAt: _d, ...rest } = job;
+    const when = Math.max(this.now() + MIN_DEFER_MS, Number(retryAt) || 0);
+    // Providers that failed this review outright are skipped on its next tries
+    // (and by the capacity check), so one that always fails cannot keep a
+    // waiting review running, and spending the others' quota.
+    const skip = [...new Set([...(job.skip ?? []), ...(Array.isArray(failed) ? failed.filter((x) => typeof x === "string").slice(0, 10) : [])])];
+    await this.ctx.storage.put(`job:${jobId}`, {
+      ...rest, claimedBy: null, createdAt: this.now(), retries, retryAt: when, skip,
+      ...(Number(chars) > 0 ? { chars: Number(chars) } : {}),
+    });
+    // Looked at again at least hourly (keeping the job fresh) until retryAt.
+    const at = Math.min(when, this.now() + HOLD_RECHECK_MS);
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    if (!box.some((x) => x.type === "dispatch" && x.jobId === jobId)) {
+      box.push({ id: randomId(), attempts: 0, type: "dispatch", jobId, notBefore: at });
+      await this.ctx.storage.put("outbox", box);
+    }
+    await this.armAt(at);
+    return { ok: true, retryAt: at };
   }
 
   // The runner's first call. A job is claimed once, by one workflow run, and
