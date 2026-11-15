@@ -199,12 +199,51 @@ test("sanitize defuses inside code too: GitHub may not see it as code", () => {
   assert.equal(sanitize("```a`b\nc", 100), "```a`b\nc");
 });
 
+// Wall time on a shared CI runner is noisy: judge the best of several runs.
+function bestMs(fn, runs = 5) {
+  let best = Infinity;
+  for (let i = 0; i < runs; i++) {
+    const t0 = performance.now();
+    fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+
 test("sanitize stays linear on hostile input (10 ms of CPU on Workers Free)", () => {
-  const inputs = ["a".repeat(800), "a.".repeat(400), "\n".repeat(400) + "[x]:", `${"a+".repeat(400)}://`, "`".repeat(800)];
-  const t0 = performance.now();
-  for (let i = 0; i < 12; i++) for (const x of inputs) sanitize(x, 800);
-  assert.ok(performance.now() - t0 < 50, "60 hostile bodies in well under the budget");
+  // Defusing runs on the whole text before it is cut to length, so a hostile
+  // answer costs what its full length costs: every shape must be linear.
+  const shapes = {
+    letters: (n) => "a".repeat(n),
+    dots: (n) => "a.".repeat(n / 2),
+    newlines: (n) => "\n".repeat(n / 2) + "[x]:",
+    schemes: (n) => `${"a+".repeat(n / 2)}://`,
+    backticks: (n) => "`".repeat(n),
+    tildes: (n) => "~".repeat(n),
+    fences: (n) => "``` ".repeat(n / 4),
+  };
+  for (const [name, shape] of Object.entries(shapes)) {
+    const run = (n) => () => { const x = shape(n); for (let i = 0; i < 12; i++) sanitize(x, x.length); };
+    const one = bestMs(run(1_600));
+    const four = bestMs(run(6_400));
+    // Linear work grows about 4x with 4x the input; quadratic grows 16x.
+    assert.ok(four < one * 8 + 2, `${name}: 4x the input took ${(four / Math.max(one, 0.01)).toFixed(1)}x as long (${one.toFixed(2)} ms, then ${four.toFixed(2)} ms)`);
+  }
+  // And the absolute bound: 60 hostile 800-character bodies, at best.
+  const bodies = ["a".repeat(800), "a.".repeat(400), "\n".repeat(400) + "[x]:", `${"a+".repeat(400)}://`, "`".repeat(800)];
+  const ms = bestMs(() => { for (let i = 0; i < 12; i++) for (const x of bodies) sanitize(x, 800); });
+  assert.ok(ms < 50, `60 hostile bodies took ${ms.toFixed(1)} ms at best`);
   assert.equal(sanitize("see https://x and ftp://y", 100), `see https:${ZWSP}//x and ftp:${ZWSP}//y`);
+});
+
+test("info strings are rewritten from the start of a fence run, however long", () => {
+  // The lookbehinds must not lose a match: a run preceded by the other fence
+  // character, a long run, and a run inside a line are all still caught.
+  assert.match(sanitize("````````suggestion\nx", 100), /^````````text-suggestion/);
+  assert.match(sanitize("~```suggestion", 100), /^~```text-suggestion/);
+  assert.match(sanitize("`~~~mermaid", 100), /^`~~~text-mermaid/);
+  assert.match(sanitize("> ``` \tMath", 100), /``` \ttext-Math/);
+  assert.equal(sanitize("``suggestion", 100), "``suggestion");
 });
 
 test("classifyFindings splits inline from general, normalises, dedupes and caps", () => {
