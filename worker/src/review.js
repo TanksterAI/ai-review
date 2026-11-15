@@ -278,7 +278,10 @@ function defuse(t) {
     .replace(/\bwww\./gi, (m) => `${m.slice(0, 3)}${ZWSP}.`)
     .replace(/#(?=\d)/g, `#${ZWSP}`)
     .replace(/&(?=#|[A-Za-z])/g, `&${ZWSP}`)
-    .replace(/(`{3,}|~{3,})([ \t]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
+    // Each run is matched from its first character only (the lookbehinds):
+    // tried from inside a long run, \`{3,} would back off one character at a
+    // time at every position, which is quadratic in the run's length.
+    .replace(/((?<!`)`{3,}|(?<!~)~{3,})([ \t]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
 }
 
 // The fence still open at the end of the text, if any, so it can be closed
