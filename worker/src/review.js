@@ -266,7 +266,8 @@ export function parseAnswer(text) {
 // the Worker's own, validated block can be committed, or one GitHub draws as
 // an interactive block (mermaid, geojson, topojson, stl, math), so model text
 // stays text. Every pattern is linear in the text's length (Workers Free
-// allows 10 ms of CPU).
+// allows 10 ms of CPU). sanitize's inline replaces are not, but they run only
+// on text already cut to its bound (at most 200 characters for inline text).
 function defuse(t) {
   return t
     .replace(/@(?=[A-Za-z0-9-])/g, `@${ZWSP}`)
@@ -281,7 +282,9 @@ function defuse(t) {
     // Each run is matched from its first character only (the lookbehinds):
     // tried from inside a long run, \`{3,} would back off one character at a
     // time at every position, which is quadratic in the run's length.
-    .replace(/((?<!`)`{3,}|(?<!~)~{3,})([ \t]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
+    // The info string may open with a vertical tab or form feed too: cmark-gfm
+    // strips them as whitespace, so "```\vsuggestion" is a suggestion block.
+    .replace(/((?<!`)`{3,}|(?<!~)~{3,})([ \t\v\f]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
 }
 
 // The fence still open at the end of the text, if any, so it can be closed
@@ -294,7 +297,9 @@ export function openFence(text) {
   let indent = "";
   for (const line of String(text).split("\n")) {
     if (!open) {
-      const m = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+      // [^\n], not ".": a line may hold U+2028 or U+2029, which "." skips, so
+      // the opener would go unseen and the fence would stay open.
+      const m = /^( {0,3})(`{3,}|~{3,})([^\n]*)$/.exec(line);
       if (m && !(m[2][0] === "`" && m[3].includes("`"))) { indent = m[1]; open = m[2]; }
     } else {
       const m = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
