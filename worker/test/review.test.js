@@ -4,7 +4,7 @@ import {
   annotatePatch, prepareFiles, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP, codeSpan,
   findingId, findingsBlock, parseFindingsBlock, MAX_SUGGESTION_LINES, MAX_SUGGESTION_CHARS, MAX_PROMPT_CHARS, MAX_BLOCK_CHARS, MAX_BODY_CHARS,
 } from "../src/review.js";
-import { PATCH, responsesResult } from "./helpers.js";
+import { PATCH, bestOf, growth, responsesResult } from "./helpers.js";
 
 test("annotatePatch numbers new-file lines and marks only added and context lines", () => {
   const { text, lines } = annotatePatch(PATCH);
@@ -200,10 +200,16 @@ test("sanitize defuses inside code too: GitHub may not see it as code", () => {
 });
 
 test("sanitize stays linear on hostile input (10 ms of CPU on Workers Free)", () => {
-  const inputs = ["a".repeat(800), "a.".repeat(400), "\n".repeat(400) + "[x]:", `${"a+".repeat(400)}://`, "`".repeat(800)];
-  const t0 = performance.now();
-  for (let i = 0; i < 12; i++) for (const x of inputs) sanitize(x, 800);
-  assert.ok(performance.now() - t0 < 50, "60 hostile bodies in well under the budget");
+  // Hostile bodies k times the usual 800 characters.
+  const inputs = (k) => ["a".repeat(800 * k), "a.".repeat(400 * k), "\n".repeat(400 * k) + "[x]:", `${"a+".repeat(400 * k)}://`, "`".repeat(800 * k), "~".repeat(800 * k), "```" + " \t".repeat(400 * k)];
+  const run = (k) => { for (let i = 0; i < 9; i++) for (const x of inputs(k)) sanitize(x, 800 * k); };
+  // Linear: four times the input costs about four times the time (quadratic
+  // would be about 16), whatever the machine's speed.
+  const g = growth(run);
+  assert.ok(g < 8, `4x the input took ${g.toFixed(1)}x the time`);
+  // And no catastrophe: backtracking would take seconds, not milliseconds.
+  const ms = bestOf(3, () => run(1));
+  assert.ok(ms < 250, `63 hostile bodies took ${ms.toFixed(1)} ms`);
   assert.equal(sanitize("see https://x and ftp://y", 100), `see https:${ZWSP}//x and ftp:${ZWSP}//y`);
 });
 

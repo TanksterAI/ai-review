@@ -302,7 +302,10 @@ function defuse(t) {
     .replace(/\bwww\./gi, (m) => `${m.slice(0, 3)}${ZWSP}.`)
     .replace(/#(?=\d)/g, `#${ZWSP}`)
     .replace(/&(?=#|[A-Za-z])/g, `&${ZWSP}`)
-    .replace(/(`{3,}|~{3,})([ \t]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
+    // A fence run is matched only from its first character, and whole (the
+    // lookahead and \1 cannot give characters back), so a long run of
+    // backticks or tildes costs linear time, not quadratic.
+    .replace(/(?=((?<!`)`{3,}|(?<!~)~{3,}))\1([ \t]*)(suggestion|mermaid|geojson|topojson|stl|math)/gi, "$1$2text-$3");
 }
 
 // The fence still open at the end of the text, if any, so it can be closed

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyFindings, prepareFiles } from "../src/review.js";
 import { REASONS, codeShape, groundFindings, hasContent, named, normaliseLine, publicReason, suggestionBalanced } from "../src/grounding.js";
-import { PATCH, GROUNDED_PATCH } from "./helpers.js";
+import { PATCH, GROUNDED_PATCH, bestOf, growth } from "./helpers.js";
 
 // A 20-line new file: line n reads "const vN = compute(N);".
 const LONG = `@@ -0,0 +1,20 @@\n${Array.from({ length: 20 }, (_, i) => `+const v${i + 1} = compute(${i + 1});`).join("\n")}`;
@@ -247,24 +247,31 @@ test("an unbalanced suggestion is stripped and its finding kept", () => {
 });
 
 test("the gate stays linear on hostile input (10 ms of CPU on Workers Free)", () => {
-  // A 90,000-character diff and twelve findings built to be slow.
-  const rows = Array.from({ length: 2400 }, (_, i) => `+${"a.".repeat(15)}b${i} = (${"[".repeat(3)}`);
-  const big = prepareFiles([{ filename: "src/big.js", patch: `@@ -0,0 +1,${rows.length} @@\n${rows.join("\n")}` }], { maxChars: 90_000, maxFileChars: 90_000 });
-  const findings = Array.from({ length: 12 }, (_, i) => ({
-    path: "src/big.js", line: 5 + i, severity: "minor", category: "bug", title: `t${i} ${"`a.a`".repeat(15)}`,
-    // Real evidence and names, so every check runs to the end.
-    claim: "`a`".repeat(90), body: `${"`a.a.b0`".repeat(80)}`, evidence: [`${"a.".repeat(15)}b${4 + i} = (${"[".repeat(3)}`],
-    symbols: Array.from({ length: 12 }, () => "a.".repeat(39) + "a"),
-    suggestion: "(".repeat(1500) + "'\"`".repeat(400),
-  }));
-  const c = classifyFindings({ findings }, big.commentable, big.lineText);
-  const t0 = performance.now();
-  for (let i = 0; i < 5; i++) groundFindings(c, big, { title: "x".repeat(300), body: "y ".repeat(1500) });
-  const ms = (performance.now() - t0) / 5;
+  // A diff of k times 90,000 characters, and twelve findings built to be slow.
+  const setup = (k) => {
+    const rows = Array.from({ length: 2400 * k }, (_, i) => `+${"a.".repeat(15)}b${i} = (${"[".repeat(3)}`);
+    const big = prepareFiles([{ filename: "src/big.js", patch: `@@ -0,0 +1,${rows.length} @@\n${rows.join("\n")}` }], { maxChars: 90_000 * k, maxFileChars: 90_000 * k });
+    const findings = Array.from({ length: 12 }, (_, i) => ({
+      path: "src/big.js", line: 5 + i, severity: "minor", category: "bug", title: `t${i} ${"`a.a`".repeat(15)}`,
+      // Real evidence and names, so every check runs to the end.
+      claim: "`a`".repeat(90), body: `${"`a.a.b0`".repeat(80)}`, evidence: [`${"a.".repeat(15)}b${4 + i} = (${"[".repeat(3)}`],
+      symbols: Array.from({ length: 12 }, () => "a.".repeat(39) + "a"),
+      suggestion: "(".repeat(1500) + "'\"`".repeat(400),
+    }));
+    return { big, c: classifyFindings({ findings }, big.commentable, big.lineText) };
+  };
+  const sized = { 1: setup(1), 4: setup(4) };
+  const run = (k) => groundFindings(sized[k].c, sized[k].big, { title: "x".repeat(300), body: "y ".repeat(1500) });
+  // The fastest of five warm passes is the gate's own cost, not the machine's noise.
+  const ms = bestOf(5, () => run(1));
   assert.ok(ms < 25, `one pass took ${ms.toFixed(1)} ms`);
-  const g = groundFindings(c, big, {});
-  assert.equal(g.dropped.length, 0, JSON.stringify(g.dropped.map((d) => d.reason)));
-  assert.equal(g.stripped.length, 12, "every check ran, the last one included");
+  // Four times the diff costs about four times the time, not sixteen.
+  const g = growth(run);
+  assert.ok(g < 8, `4x the diff took ${g.toFixed(1)}x the time`);
+  const { big, c } = sized[1];
+  const g1 = groundFindings(c, big, {});
+  assert.equal(g1.dropped.length, 0, JSON.stringify(g1.dropped.map((d) => d.reason)));
+  assert.equal(g1.stripped.length, 12, "every check ran, the last one included");
 });
 
 test("keyword-only evidence does not ground a finding; '} catch (error) {' does when it is unique", () => {

@@ -140,3 +140,23 @@ export function askedFindings(user) {
 export function testSleep(ms) {
   return ms >= 60_000 ? new Promise(() => {}) : Promise.resolve();
 }
+
+// Timing on a shared CI machine is noisy: other jobs, garbage collection and
+// a cold JIT all add time that is not the code's own. bestOf runs fn once to
+// warm up, then returns the fastest of n timed runs in ms.
+export function bestOf(n, fn) {
+  fn();
+  let best = Infinity;
+  for (let i = 0; i < n; i++) {
+    const t0 = performance.now();
+    fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+
+// How much longer run(4) takes than run(1). Linear work gives about 4 and
+// quadratic work about 16, on a fast machine or a slow one alike.
+export function growth(run, n = 5) {
+  return bestOf(n, () => run(4)) / Math.max(bestOf(n, () => run(1)), 0.01);
+}
