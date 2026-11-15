@@ -237,13 +237,24 @@ test("sanitize stays linear on hostile input (10 ms of CPU on Workers Free)", ()
 });
 
 test("info strings are rewritten from the start of a fence run, however long", () => {
-  // The lookbehinds must not lose a match: a run preceded by the other fence
-  // character, a long run, and a run inside a line are all still caught.
+  // An equivalence guard for the lookbehinds (they must lose no match: a run
+  // preceded by the other fence character, a long run, a run inside a line),
+  // and the whitespace cmark-gfm strips before an info string.
+  assert.match(sanitize("```\vsuggestion\nfoo()\n```", 100), /^```\vtext-suggestion/);
+  assert.match(sanitize("```\fsuggestion", 100), /^```\ftext-suggestion/);
+  assert.match(sanitize("~~~\vmermaid", 100), /^~~~\vtext-mermaid/);
   assert.match(sanitize("````````suggestion\nx", 100), /^````````text-suggestion/);
   assert.match(sanitize("~```suggestion", 100), /^~```text-suggestion/);
   assert.match(sanitize("`~~~mermaid", 100), /^`~~~text-mermaid/);
   assert.match(sanitize("> ``` \tMath", 100), /``` \ttext-Math/);
   assert.equal(sanitize("``suggestion", 100), "``suggestion");
+});
+
+test("a fence whose info string holds a line separator is still closed", async () => {
+  // U+2028 and U+2029 are not line breaks in markdown, but "." skips them.
+  const { openFence } = await import("../src/review.js");
+  assert.equal(openFence("```js\u2028x\ncode"), "```");
+  assert.equal(openFence("~~~\u2029\ncode"), "~~~");
 });
 
 test("classifyFindings splits inline from general, normalises, dedupes and caps", () => {
