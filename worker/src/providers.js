@@ -68,6 +68,29 @@ export function parseChain(text) {
   }).filter((x) => x && kinds.has(x.kind) && x.model);
 }
 
+// The verifiers' chains (TAN-299; see verify.js). They live here so the
+// capacity check can see them without importing the verifier.
+export const DEFAULT_VERIFY_CHAIN = "anthropic:claude-haiku-5-5";
+export const DEFAULT_ESCALATE_CHAIN = "anthropic:claude-sonnet-5-5";
+export const DEFAULT_VERIFY_FALLBACK = "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash";
+// Verdicts are short, but reasoning counts as output.
+export const VERIFY_MAX_OUTPUT = 6000;
+
+export function verifyOff(env) {
+  return String(env.VERIFY ?? "").trim().toLowerCase() === "off";
+}
+
+// Every provider that may verify: VERIFY_CHAIN, then VERIFY_FALLBACK, once each.
+export function verifierChain(env) {
+  const seen = new Set();
+  return [...parseChain(env.VERIFY_CHAIN ?? DEFAULT_VERIFY_CHAIN), ...parseChain(env.VERIFY_FALLBACK ?? DEFAULT_VERIFY_FALLBACK)].filter((x) => {
+    const id = `${x.kind}:${x.model}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
 // The drafting chain: DRAFT_CHAIN when set, else the one Workers AI model
 // (MODEL), with Gemini first and Claude last when their keys exist.
 export function draftChain(env, cfg) {
@@ -91,7 +114,8 @@ function retryAfterMs(value, fallback) {
 
 function workersAi(env, cfg, model, deps) {
   const now = deps.now;
-  const ledger = createLedger(env.LEDGER, now);
+  // deps.serial: the review's queue for ledger writes (budget.js).
+  const ledger = createLedger(env.LEDGER, now, deps.serial);
   const scope = "workers-ai";
   const gptOss = /gpt-oss/.test(model);
   return {
@@ -208,7 +232,7 @@ function gemini(env, model, deps) {
 function anthropic(env, cfg, model, deps) {
   const now = deps.now;
   const scope = "anthropic";
-  const usd = createUsdLedger(env.LEDGER, now);
+  const usd = createUsdLedger(env.LEDGER, now, deps.serial);
   const cap = Number.isFinite(Number(env.ANTHROPIC_DAILY_USD_CAP)) && Number(env.ANTHROPIC_DAILY_USD_CAP) >= 0
     ? Number(env.ANTHROPIC_DAILY_USD_CAP) : 5;
   const price = ANTHROPIC_PRICES[model] ?? ANTHROPIC_FALLBACK;
@@ -284,7 +308,16 @@ function anthropic(env, cfg, model, deps) {
   };
 }
 
-/** One provider object per chain entry; deps: {now, sleep, fetch, log}. */
+// The deadline race: the promise's value, or LATE once `deadline` (epoch ms)
+// passes. The timer is deps.sleep, so tests control it. Used for every model
+// call a review makes, drafting and verifying.
+export const LATE = Symbol("late");
+export function beforeDeadline(promise, deadline, { now, sleep }) {
+  const left = deadline - now();
+  return left <= 0 ? Promise.resolve(LATE) : Promise.race([promise, sleep(left).then(() => LATE)]);
+}
+
+/** One provider object per chain entry; deps: {now, sleep, fetch, log, serial?}. */
 export function createProviders(env, cfg, chain, deps) {
   return chain.map(({ kind, model }) => {
     if (kind === "workers-ai") return workersAi(env, cfg, model, deps);
@@ -293,25 +326,53 @@ export function createProviders(env, cfg, chain, deps) {
   });
 }
 
-/**
- * Whether any provider in the chain could take a review now. {ok: true}, or
- * {ok: false, retryAt}: the earliest time one of them resets. Used before a
- * runner is dispatched, so none is spent on a review that can only defer.
- */
-export async function capacity(env, cfg, chain, deps, chars = 60_000, maxOutput = cfg.maxOutput) {
-  let retryAt = Infinity;
+// Every provider in a chain that could take the work now (ids, in order),
+// and for the rest the time each resets. any: whether any is set up at all.
+async function available(env, cfg, chain, deps, chars, maxOutput) {
+  const ids = [];
+  const resets = new Map();
   let any = false;
   for (const p of createProviders(env, cfg, chain, deps)) {
     if (!p.configured) continue;
     any = true;
     const until = await p.exhausted();
-    if (until) { retryAt = Math.min(retryAt, until); continue; }
+    if (until) { resets.set(p.id, until); continue; }
     const a = await p.affordable(chars, maxOutput);
-    if (a.ok) return { ok: true, provider: p.id };
-    if (a.resetAt) retryAt = Math.min(retryAt, a.resetAt);
+    if (a.ok) ids.push(p.id);
+    else if (a.resetAt) resets.set(p.id, a.resetAt);
   }
+  return { ids, resets, any };
+}
+
+/**
+ * Whether a review could run now: a drafter in the chain and, unless
+ * VERIFY=off, a verifier that is not that same provider (no model checks its
+ * own findings), since findings are never posted unverified. {ok: true,
+ * provider}, or {ok: false, retryAt}: both are needed, so the later of the
+ * two earliest resets. Used before a runner is dispatched, so none is spent
+ * on a review that can only defer.
+ */
+export async function capacity(env, cfg, chain, deps, chars = 60_000, maxOutput = cfg.maxOutput) {
+  const earliest = (resets, skip = new Set()) => {
+    const times = [...resets].filter(([id]) => !skip.has(id)).map(([, t]) => t);
+    return times.length ? Math.min(...times) : nextUtcMidnight(deps.now());
+  };
+  const draft = await available(env, cfg, chain, deps, chars, maxOutput);
   // Nothing set up at all is a configuration fault, not a quota: let the
   // review run and fail where it shows, rather than wait for ever.
-  if (!any) return { ok: true, provider: null };
-  return { ok: false, retryAt: Number.isFinite(retryAt) ? retryAt : nextUtcMidnight(deps.now()) };
+  const draftOk = draft.ids.length > 0 || !draft.any;
+  if (verifyOff(env)) return draftOk ? { ok: true, provider: draft.ids[0] ?? null } : { ok: false, retryAt: earliest(draft.resets) };
+  const verify = await available(env, cfg, verifierChain(env), deps, chars, Math.min(maxOutput, VERIFY_MAX_OUTPUT));
+  if (!verify.any) return draftOk ? { ok: true, provider: draft.ids[0] ?? null } : { ok: false, retryAt: earliest(draft.resets) };
+  // A drafter, and a verifier with another id: two distinct providers.
+  const pairs = draft.any ? draft.ids.filter((d) => verify.ids.some((v) => v !== d)) : [null];
+  if (pairs.length) return { ok: true, provider: pairs[0] };
+  if (!draftOk) {
+    const v = verify.ids.length ? -Infinity : earliest(verify.resets);
+    return { ok: false, retryAt: Math.max(earliest(draft.resets), v) };
+  }
+  if (!verify.ids.length) return { ok: false, retryAt: earliest(verify.resets) };
+  // The one provider free could draft or verify, not both: wait for any other.
+  const only = new Set([...draft.ids, ...verify.ids]);
+  return { ok: false, retryAt: earliest(new Map([...draft.resets, ...verify.resets]), only) };
 }

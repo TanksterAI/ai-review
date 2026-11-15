@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  annotatePatch, prepareFiles, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP,
+  annotatePatch, prepareFiles, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP, codeSpan,
   findingId, findingsBlock, parseFindingsBlock, MAX_SUGGESTION_LINES, MAX_SUGGESTION_CHARS, MAX_PROMPT_CHARS, MAX_BLOCK_CHARS, MAX_BODY_CHARS,
 } from "../src/review.js";
 import { PATCH, responsesResult } from "./helpers.js";
@@ -420,7 +420,8 @@ test("comments carry a committable suggestion, a multi-line range, a prompt for 
       suggestion: "import { a } from \"./a.js\"; // ```", agent_prompt: "Use ``` carefully" },
   ] };
   const classified = classifyFindings(answer, p.commentable, p.lineText);
-  const r = renderReview({ answer, classified, prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10, headSha: "c".repeat(40) } });
+  // Assertive: the nitpick goes inline too (chill would collapse it in the body).
+  const r = renderReview({ answer, classified, prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10, headSha: "c".repeat(40), profile: "assertive" } });
   const [multi, single] = r.comments;
   assert.equal(multi.start_line, 2);
   assert.equal(multi.start_side, "RIGHT");
@@ -656,4 +657,260 @@ test("GitHub's interactive fences stay text, and an inline title cannot escape i
   const p = shown();
   const c = classifyFindings({ findings: [{ path: "src/a.js", line: 3, title: "ends in \\", body: "b" }] }, p.commentable, p.lineText);
   assert.ok(c.inline[0].title.endsWith("in "));
+});
+
+// --- verified findings: placement, hidden findings, the Worker's summary ----
+
+const conf = (f) => ({ status: "confirmed", verifiedBy: ["anthropic:claude-haiku-5-5"], reason: "confirmed by claude-haiku-5-5", prompt: "", suggestion: null, body: "b", category: "bug", ...f });
+function placed() {
+  const inline = [
+    conf({ id: "aaaaaaa1", path: "src/a.js", line: 3, severity: "major", type: "issue", title: "Real bug", verifiedBy: ["anthropic:claude-haiku-5-5", "anthropic:claude-sonnet-5-5"], reason: "confirmed by claude-haiku-5-5 and claude-sonnet-5-5" }),
+    conf({ id: "aaaaaaa2", path: "src/a.js", line: 1, severity: "minor", type: "nitpick", title: "Polish", prompt: "Rename it." }),
+    conf({ id: "aaaaaaa3", path: "src/a.js", line: 2, severity: "trivial", type: "issue", title: "Tiny", suggestion: { start: 2, end: 2, original: "const x = 2;", code: "const x = 3;" } }),
+    conf({ id: "aaaaaaa4", path: "src/a.js", line: 4, severity: "info", type: "refactor", title: "Note" }),
+  ];
+  const general = [
+    conf({ id: "aaaaaaa5", path: "src/a.js", line: 9, severity: "minor", type: "issue", title: "Elsewhere" }),
+    conf({ id: "aaaaaaa6", path: "src/a.js", line: 7, severity: "minor", type: "nitpick", title: "Elsewhere nit" }),
+  ];
+  return { inline, general };
+}
+const hiddenSet = [
+  { id: "bbbbbbb1", path: "src/a.js", line: 3, severity: "minor", type: "issue", category: "bug", title: "Refuted thing", body: "RefutedBody", claim: "RefutedClaim", prompt: "RefutedPrompt", status: "refuted", reason: "refuted by claude-haiku-5-5" },
+  { id: "bbbbbbb2", path: "src/a.js", line: 2, severity: "major", type: "issue", category: "bug", title: "Unsure thing", body: "UnsureBody", claim: "UnsureClaim", prompt: "", status: "unconfirmed", reason: "claude-haiku-5-5 could not confirm it" },
+  { id: "bbbbbbb3", path: "", line: null, severity: "minor", type: "issue", category: "bug", title: "Dropped thing", body: "DroppedBody", claim: "DroppedClaim", prompt: "", status: "dropped", reason: "not about a file in the change" },
+  { id: "bbbbbbb4", path: "src/InventedPath.js", line: 1, severity: "minor", type: "issue", category: "bug", title: "Unnamed thing", body: "UnnamedBody", claim: "UnnamedClaim", prompt: "", status: "dropped", reason: "names something not in the change" },
+  { id: "bbbbbbb5", path: "src/a.js", line: 1, severity: "minor", type: "issue", category: "bug", title: "Thin thing", body: "ThinBody", claim: "ThinClaim", prompt: "", status: "dropped", reason: "evidence too thin" },
+];
+const render = (profile, extra = {}, verification = { off: false, weak: false, fallback: false }) => renderReview({
+  answer: { summary: "DrafterSummaryText says all is well." }, classified: placed(), prepared: shown(), hidden: hiddenSet,
+  verification, meta: { model: "m", neurons: 1, spent: 1, cap: 10, headSha: "h", profile, ...extra },
+});
+
+test("chill: nitpicks, trivial and info findings go in a collapsed section; the rest inline", () => {
+  const r = render("chill");
+  assert.deepEqual(r.comments.map((c) => c.line), [3]);
+  assert.match(r.body, /6 findings: 1 inline, 5 below\./);
+  assert.match(r.body, /\n<details>\n<summary>🧹 Nitpick comments \(3\)<\/summary>\n\n- \*\*Minor \(bug\): Polish\*\* \(`src\/a\.js:1`, finding `aaaaaaa2`\)  \n/);
+  // Its prompt in a fenced text block, indented into the list item; no suggestion block.
+  assert.match(r.body, /\n  Prompt for AI agents:\n  ```text\n  In src\/a\.js around line 1: Rename it\.\n  ```\n\n  b\n/);
+  const nits = r.body.split("🧹 Nitpick comments")[1].split("</details>")[0];
+  assert.doesNotMatch(nits, /suggestion/);
+  assert.match(nits, /\*\*Trivial \(bug\): Tiny\*\* \(`src\/a\.js:2`, finding `aaaaaaa3`\)/);
+  assert.match(nits, /\*\*Info \(bug\): Note\*\*/);
+  assert.match(r.body, /\n<details>\n<summary>Outside diff range comments \(2\)<\/summary>\n\n- \*\*Minor \(bug\): Elsewhere\*\* \(`src\/a\.js:9`, finding `aaaaaaa5`\)  \n  b\n/);
+  // The block records where each finding went.
+  const v = parseFindingsBlock(r.body);
+  assert.deepEqual(v.findings.filter((f) => f.inline).map((f) => f.id), ["aaaaaaa1"]);
+});
+
+test("assertive puts nitpicks inline; quiet leaves them out but keeps them in the block", () => {
+  const a = render("assertive");
+  assert.deepEqual(a.comments.map((c) => c.line), [3, 1, 2, 4]);
+  assert.doesNotMatch(a.body, /Nitpick comments/);
+  assert.match(a.body, /6 findings: 4 inline, 2 below\./);
+  assert.match(a.comments[2].body, /```suggestion\nconst x = 3;\n```/);
+  const q = render("quiet");
+  assert.deepEqual(q.comments.map((c) => c.line), [3]);
+  // Out of view: only the block (line 2) still has them.
+  assert.doesNotMatch(q.body.split("\n").slice(2).join("\n"), /Nitpick comments|Polish|Tiny|Elsewhere nit/);
+  assert.match(q.body, /2 findings: 1 inline, 1 below\. 4 nitpicks left out \(quiet profile\)\./);
+  const v = parseFindingsBlock(q.body);
+  assert.deepEqual(v.findings.filter((f) => f.status === "confirmed").map((f) => f.id), ["aaaaaaa1", "aaaaaaa2", "aaaaaaa3", "aaaaaaa4", "aaaaaaa5", "aaaaaaa6"]);
+  assert.equal(v.findings.find((f) => f.id === "aaaaaaa2").inline, false);
+  // Nothing at all to show.
+  const only = renderReview({ answer: { summary: "s" }, classified: { inline: [placed().inline[1]], general: [] }, prepared: shown(), meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "quiet" } });
+  assert.match(only.body, /No findings to show; 1 nitpick left out \(quiet profile\)\./);
+  // An unknown profile is chill.
+  assert.deepEqual(render("loud").comments.map((c) => c.line), [3]);
+});
+
+test("hidden findings are in the block only, with no text, and a path only when it is a file in the change", () => {
+  const r = render("chill");
+  for (const t of ["Refuted thing", "Unsure thing", "Dropped thing", "Unnamed thing", "Thin thing", "RefutedBody", "RefutedClaim", "RefutedPrompt", "UnsureBody", "UnsureClaim", "DroppedBody", "UnnamedClaim", "ThinClaim", "InventedPath"]) {
+    assert.ok(!r.body.includes(t) && !r.comments.some((c) => c.body.includes(t)), t);
+  }
+  const v = parseFindingsBlock(r.body);
+  const hid = v.findings.filter((f) => f.status !== "confirmed");
+  assert.deepEqual(hid.map((f) => [f.id, f.path, f.status, f.reason]), [
+    ["bbbbbbb1", "src/a.js", "refuted", "refuted by claude-haiku-5-5"],
+    ["bbbbbbb2", "src/a.js", "unconfirmed", "claude-haiku-5-5 could not confirm it"],
+    ["bbbbbbb3", null, "dropped", "not about a file in the change"],
+    ["bbbbbbb4", null, "dropped", "names something not in the change"],
+    ["bbbbbbb5", "src/a.js", "dropped", "evidence too thin"],
+  ]);
+  for (const f of hid) assert.deepEqual(Object.keys(f), ["id", "path", "line", "severity", "type", "category", "status", "reason"]);
+  // Confirmed ones carry who verified them, and the Worker's own account of it.
+  const real = v.findings.find((f) => f.id === "aaaaaaa1");
+  assert.deepEqual(real.verified_by, ["anthropic:claude-haiku-5-5", "anthropic:claude-sonnet-5-5"]);
+  assert.equal(real.status, "confirmed");
+  assert.equal(real.reason, "confirmed by claude-haiku-5-5 and claude-sonnet-5-5");
+  // There is no other mode: unconfirmed findings are never listed.
+  const c = render("chill", { unconfirmed: "collapsed" });
+  assert.doesNotMatch(c.body, /Unsure thing|Unconfirmed \(/);
+});
+
+test("the summary is the Worker's own, from the confirmed findings; the drafter's is never shown", () => {
+  const r = render("chill");
+  assert.doesNotMatch(r.body, /DrafterSummaryText/);
+  assert.match(r.body, /### AI review \(advisory\)\n\nReviewed 1 file\. 2 findings confirmed: 1 major, 1 minor \(plus 4 nitpicks\)\.\n/);
+  const none = renderReview({ answer: { summary: "Everything is broken." }, classified: { inline: [], general: [] }, prepared: shown(), hidden: hiddenSet, verification: { off: false }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(none.body, /\n\nNo problems confirmed in the 1 file reviewed\.\n/);
+  assert.doesNotMatch(none.body, /Everything is broken/);
+  const nits = renderReview({ answer: {}, classified: { inline: [placed().inline[1]], general: [] }, prepared: shown(), verification: { off: false }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(nits.body, /\n\nReviewed 1 file\. 1 nitpick confirmed\.\n/);
+  const off = renderReview({ answer: {}, classified: placed(), prepared: shown(), verification: { off: true }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(off.body, /\n\nReviewed 1 file\. 2 findings found \(not verified\): 1 major, 1 minor \(plus 4 nitpicks\)\.\n/);
+  // The drafter is still asked for a short summary (the answer's shape stays), not for its view of the risk.
+  const { instructions } = buildPrompt({ repository: "r", title: "t", body: "b", prepared: shown(), tag: "T" });
+  assert.match(instructions, /"summary": "one sentence: what the change does"/);
+  assert.doesNotMatch(instructions, /overall risk/);
+});
+
+test("the footer says what was verified, by whom, and what was not shown", () => {
+  assert.match(render("chill").body, /\n- Verified: 6 findings confirmed by `claude-haiku-5-5` \(1 also by `claude-sonnet-5-5`\); 5 not shown \(1 refuted, 1 unconfirmed, 1 failed the evidence check, 1 not about a file in the change, 1 named something not in the change\)\.\n/);
+  const off = renderReview({ answer: { summary: "s" }, classified: placed(), prepared: shown(), verification: { off: true }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(off.body, /\n- Not verified \(verification is switched off\)\.\n/);
+  const weak = renderReview({ answer: { summary: "s" }, classified: placed(), prepared: shown(), verification: { off: false, weak: true, fallback: true, fallbackBy: ["workers-ai:@cf/openai/gpt-oss-120b"] }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(weak.body, /nothing hidden\. Some findings were checked by a fallback model \(`@cf\/openai\/gpt-oss-120b`\), because the usual verifier could not run\. Some were checked by a model of the same kind as the one that wrote them, which is a weaker check\./);
+  // The usual verifier wrote the findings: the footer says so, not that it could not run.
+  const self = renderReview({ answer: {}, classified: placed(), prepared: shown(), verification: { off: false, fallback: true, fallbackBy: ["gemini:gemini-3.5-flash-lite"], selfExcluded: ["anthropic:claude-haiku-5-5"] }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(self.body, /Verified by `gemini-3\.5-flash-lite`, since `claude-haiku-5-5` wrote the findings\./);
+  assert.doesNotMatch(self.body, /could not run/);
+  const none = renderReview({ answer: { summary: "s" }, classified: { inline: [], general: [] }, prepared: shown(), hidden: hiddenSet.slice(0, 1), verification: { off: false }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.match(none.body, /- Verified: no finding was confirmed; 1 not shown \(1 refuted\)\./);
+  assert.match(none.body, /No confirmed problems in the reviewed files\./);
+  // The block of a confirmed finding checked by a weak verifier says so.
+  const w = renderReview({ answer: { summary: "s" }, classified: { inline: [conf({ id: "c1", path: "src/a.js", line: 3, severity: "major", type: "issue", title: "t", weak: true })], general: [] }, prepared: shown(), verification: { off: false, weak: true }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.equal(parseFindingsBlock(w.body).findings[0].weak, true);
+});
+
+// A small seeded PRNG (mulberry32), so a failure can be replayed.
+function prng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test("INVARIANT: no unverified text reaches the body, the block, a comment, a single-line variant or the 'Also noted' fallback", async () => {
+  const { placeComments, titleLine } = await import("../src/index.js");
+  const { applyVerdicts } = await import("../src/verify.js");
+  const rand = prng(0x7a299);
+  const pick = (xs) => xs[Math.floor(rand() * xs.length)];
+  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const marker = () => Array.from({ length: 14 }, () => letters[Math.floor(rand() * 26)]).join("");
+  const p = prepareFiles([{ filename: "src/a.js", patch: PATCH }, { filename: "src/b.js", patch: "@@ -1,2 +1,2 @@\n-let t = 0;\n+let t = 1;\n x" }]);
+  let checked = 0;
+  const channels = { hidden: 0, summary: 0, path: 0, prompt: 0, suggestion: 0 };
+  for (let trial = 0; trial < 150; trial++) {
+    const n = 1 + Math.floor(rand() * 12);
+    const classified = { inline: [], general: [] };
+    const dropped = [];
+    const verdicts = new Map();
+    const secrets = [];
+    for (let i = 0; i < n; i++) {
+      const inChange = rand() < 0.7;
+      const f = {
+        id: `${trial.toString(16).padStart(4, "0")}${i.toString(16).padStart(4, "0")}`,
+        // A path not in the change is model text too: a marker.
+        path: inChange ? pick(["src/a.js", "src/b.js"]) : `src/${marker()}.js`,
+        line: 1 + Math.floor(rand() * 5),
+        severity: pick(["critical", "major", "minor", "trivial", "info"]),
+        type: pick(["issue", "nitpick", "refactor"]),
+        category: pick(["bug", "security", "tests"]),
+        title: marker(), body: `${marker()}\n${marker()}`, claim: marker(), evidence: [marker(), marker()], prompt: pick(["", marker()]),
+        suggestion: null,
+      };
+      if (rand() < 0.5) {
+        const start = rand() < 0.5 ? f.line : Math.max(1, f.line - 1);
+        f.suggestion = { start, end: f.line, original: "const x = 2;", code: `${marker()}\n${marker()}` };
+      }
+      const status = inChange ? pick(["confirmed", "confirmed", "unconfirmed", "refuted", "dropped"]) : pick(["unconfirmed", "refuted", "dropped"]);
+      const texts = [f.title, f.body, f.claim, ...f.evidence, f.prompt, f.suggestion?.code ?? ""];
+      if (status === "dropped") {
+        dropped.push({ finding: f, reason: pick(["evidence not in the code", "evidence too thin", "not about a file in the change", `names something not in the change: ${f.title}`]) });
+      } else {
+        (rand() < 0.6 && inChange ? classified.inline : classified.general).push(f);
+        const suggestionOk = rand() < 0.5;
+        const promptOk = rand() < 0.5;
+        verdicts.set(f.id, { status, by: ["anthropic:claude-haiku-5-5"], why: `${status} by claude-haiku-5-5`, severity: pick(["critical", "minor", null]), suggestionOk, promptOk });
+        // A confirmed finding's prompt or suggestion the verifiers did not pass is unverified text.
+        if (status === "confirmed") {
+          if (!promptOk && f.prompt) { secrets.push(f.prompt); channels.prompt++; }
+          if (!suggestionOk && f.suggestion) { secrets.push(f.suggestion.code); channels.suggestion++; }
+          continue;
+        }
+      }
+      secrets.push(...texts);
+      channels.hidden++;
+      if (!inChange) { secrets.push(f.path.slice(4, -3)); channels.path++; }
+    }
+    // The drafter's summary is never verified: it may say anything, including a hidden finding's title.
+    const summary = `${marker()} ${pick([...secrets, "x"])}`;
+    secrets.push(summary.split(" ")[0]);
+    channels.summary++;
+    const { shown, hidden } = applyVerdicts(classified, dropped, verdicts);
+    const r = renderReview({
+      answer: { summary }, classified: shown, hidden, prepared: p,
+      verification: { off: false, weak: rand() < 0.3, fallback: rand() < 0.3 },
+      meta: { model: "m", neurons: 1, spent: 1, cap: 10, headSha: "h", profile: pick(["chill", "assertive", "quiet"]) },
+    });
+    // The incremental fallbacks: a random part of the diff is left.
+    const lines = new Map([["src/a.js", new Set([1, 2, 3, 4, 5].filter(() => rand() < 0.5))], ["src/b.js", new Set([1, 2].filter(() => rand() < 0.5))]]);
+    const { kept, off } = placeComments(r.comments, r.singleLine, lines);
+    const also = off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n");
+    const everything = [r.body, ...r.comments.map((c) => c.body), ...r.singleLine.filter(Boolean), ...kept.map((c) => c.body), also].join("\n\u0000\n").toLowerCase();
+    for (const s of secrets.filter(Boolean)) {
+      for (const part of s.split("\n")) {
+        for (let k = 0; k + 8 <= part.length; k++) {
+          const window = part.slice(k, k + 8);
+          assert.ok(!everything.includes(window.toLowerCase()), `trial ${trial}: unverified text ${JSON.stringify(window)} leaked`);
+        }
+      }
+      checked++;
+    }
+    // And the block still parses, with every finding in it.
+    assert.equal(parseFindingsBlock(r.body).findings.length, n, `trial ${trial}`);
+  }
+  assert.ok(checked > 800, `${checked} texts checked`);
+  for (const [k, v] of Object.entries(channels)) assert.ok(v > 50, `channel ${k} exercised ${v} times`);
+});
+
+test("the prompt asks for evidence, a claim and symbols, and says findings without evidence are discarded", () => {
+  const { instructions } = buildPrompt({ repository: "TanksterAI/x", title: "t", body: "b", prepared: shown(), tag: "T" });
+  assert.match(instructions, /"evidence"/);
+  assert.match(instructions, /"claim"/);
+  assert.match(instructions, /"symbols"/);
+  assert.match(instructions, /Findings without verbatim evidence are discarded/);
+  assert.match(instructions, /Quote a line distinctive enough to find in the file/);
+  assert.match(instructions, /add a neighbouring line that is not/);
+  assert.match(instructions, /"evidence": "const y = x \/ 0;", "claim": "[^"]+", "symbols": \["x", "y"\]/);
+  assert.doesNotMatch(instructions, /bug-free|no bugs|is correct/i);
+});
+
+test("classifyFindings keeps the grounding fields, bounded: claim inline, evidence raw, symbols short", () => {
+  const p = shown();
+  const c = classifyFindings({ findings: [{
+    path: "src/a.js", line: 3, title: "t", body: "b",
+    claim: `@bob <b>wrong\n${"x".repeat(400)}`,
+    evidence: ["  const y = x / 0;  ", "", "a\nb\nc\nd\ne\nf"],
+    symbols: ["x", 7, " y ", "z".repeat(200), ...Array.from({ length: 20 }, (_, i) => `s${i}`)],
+  }] }, p.commentable, p.lineText);
+  const f = c.inline[0];
+  assert.ok(f.claim.length <= 300);
+  assert.doesNotMatch(f.claim, /\n|@bob|<b>/);
+  // Raw, for comparing with the diff: never rendered.
+  assert.deepEqual(f.evidence, ["  const y = x / 0;  ", "a", "b", "c", "d"]);
+  assert.equal(f.symbols.length, 12);
+  assert.deepEqual(f.symbols.slice(0, 3), ["x", "y", "z".repeat(80)]);
+  const none = classifyFindings({ findings: [{ path: "src/a.js", line: 3, title: "t", body: "b", evidence: { a: 1 }, symbols: "solo" }] }, p.commentable, p.lineText).inline[0];
+  assert.deepEqual([none.evidence, none.symbols, none.claim], [[], ["solo"], ""]);
+  // Not shown anywhere: a comment carries neither the claim nor the evidence.
+  const r = renderReview({ answer: { summary: "s" }, classified: c, prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
+  assert.doesNotMatch(r.comments[0].body, /const y = x \/ 0;/);
 });

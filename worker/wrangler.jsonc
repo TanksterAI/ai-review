@@ -31,9 +31,17 @@
     // or push to main (write access to ai-review) is trusted: see README.md.
     "WORKFLOW_REFS": "TanksterAI/ai-review/.github/workflows/review.yml@refs/tags/v1,TanksterAI/ai-review/.github/workflows/review.yml@refs/heads/main",
     // Providers in order; an entry whose key is not set is skipped. See
-    // README.md, "Model providers". Cheaper Workers AI models join the chain
-    // with the finding verifier (TAN-299), not before.
-    "DRAFT_CHAIN": "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5",
+    // README.md, "Model providers". The cheaper drafters are here because every
+    // finding is now verified (README.md, "Verified findings").
+    "DRAFT_CHAIN": "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it,workers-ai:@cf/zai-org/glm-4.7-flash,workers-ai:@cf/google/gemma-4-26b-a4b-it,workers-ai:@cf/openai/gpt-oss-120b,anthropic:claude-haiku-5-5",
+    // Checks every finding; never the drafter's own model.
+    "VERIFY_CHAIN": "anthropic:claude-haiku-5-5",
+    // A second check that critical and major findings need.
+    "ESCALATE_CHAIN": "anthropic:claude-sonnet-5-5",
+    // Verifiers when no VERIFY_CHAIN one can run; another kind than the drafter's first.
+    "VERIFY_FALLBACK": "gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash",
+    // Nitpicks: chill (collapsed in the body), assertive (inline) or quiet (left out).
+    "REVIEW_PROFILE": "chill",
     // Dollars a day of the plan's Anthropic API credit (it stops at zero; never bills).
     "ANTHROPIC_DAILY_USD_CAP": "5",
     "MODEL": "@cf/openai/gpt-oss-120b",

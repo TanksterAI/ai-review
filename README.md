@@ -18,9 +18,12 @@ pull request opened ─▶ caller workflow (each repo)
                               - verifies the OIDC token: GitHub's signature, our organisation
                                 (numeric id 259206056), job_workflow_ref = this repo's review.yml at
                                 v1 or main, and a token id never seen before
-                              - checks the daily budget, then runs @cf/openai/gpt-oss-120b on Workers AI
-                              4. returns the review: findings it can place on a diff line go inline,
-                                 the rest go in the review body
+                              - checks the budget, then drafts with the first provider in DRAFT_CHAIN
+                                that can take the review
+                              - checks every finding against the code, then has an independent model
+                                try to refute it (see "Verified findings")
+                              4. returns the review: only confirmed findings are shown, inline or in
+                                 the review body
 ```
 
 - **Free.** Workers AI gives the Cloudflare account 10,000 neurons a day at no charge. On the Workers Free plan it refuses work past that and never bills. Reviews take at most `DAILY_NEURON_CAP` (6,000) of it, so other Workers that use Workers AI keep room. A typical review costs 300-1,200 neurons, so expect roughly 5-15 reviews a day. Past the cap, or when the account's whole allocation is used, a review is deferred to the next UTC day: the job warns and stays green. If Workers AI is out of capacity the Worker tries once more after 3 seconds, then the job warns. With a Gemini or Anthropic key set, reviews also use those providers (see "Model providers" below), so one provider's quota no longer stops reviews.
@@ -37,7 +40,7 @@ pull request opened ─▶ caller workflow (each repo)
 
     In an incremental review whose range has partly left the PR's diff, the comment stays on its line without the suggestion. A suggestion over several lines is a multi-line comment on that range.
   - **A "Prompt for AI agents" block.** It tells a coding agent exactly what to change and where.
-  - **A machine-readable copy.** The review body's second line is an HTML comment, `<!-- tankster-ai-review:findings {...} -->`, holding every finding as JSON: id, place, labels, prompt, and each suggestion with the original lines it replaces. Agents and later commands (apply, resolve, track) read it from there, and the original lines let an apply refuse code that has moved on. The JSON escapes `<` and `>`, so nothing in it can close the comment.
+  - **A machine-readable copy.** The review body's second line is an HTML comment, `<!-- tankster-ai-review:findings {...} -->`, holding every finding as JSON: id, place, labels, prompt, each suggestion with the original lines it replaces, and its verification (`status`, `verified_by`, and a `reason` the Worker writes). Findings that were not shown are there too, with their labels, status and reason only, and their path only when it names a file in the change. Agents and later commands (apply, resolve, track) read it from there, and the original lines let an apply refuse code that has moved on. The JSON escapes `<` and `>`, so nothing in it can close the comment.
 
   Check a suggestion before committing it, as with any change. The next review covers whatever it changed.
 - **Safe with untrusted input.** The diff, title, description and the names of skipped files are fenced as data in the prompt. Model output is sanitised and can only become comments on this pull request. Its text has no @mentions, no issue references, no HTML tags or comments, no images, no links (inline, reference definitions in any container, or bare URLs) and no `suggestion` fences of its own, and its length is bounded.
@@ -146,7 +149,7 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
 | Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `DRAFT_CHAIN`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `DRAFT_CHAIN`, `VERIFY_CHAIN`, `ESCALATE_CHAIN`, `VERIFY_FALLBACK`, `REVIEW_PROFILE`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) `VERIFY_BUDGET_MS` (verification's time limit, 150,000 ms by default) and `REVIEW_DEADLINE_MS` (the whole review's, 270,000 ms) |
 | Secrets | None needed. Optional: `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` add those providers (see below); `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
 `GET /healthz` shows today's neuron spend and each provider: whether it is set up and, if it is out of quota, until when. It never shows a key.
@@ -182,18 +185,93 @@ Deploy only what is on `main`.
 
 - **With wrangler:** `npx wrangler deploy -c worker/wrangler.jsonc`.
 - **Through the Cloudflare API** (what Claude sessions use, via the Cloudflare connector):
-  - Upload all eleven modules in `worker/src`: `index.js`, `config.js`, `providers.js`, `oidc.js`, `review.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js`, `effects.js` and `setup.js`.
+  - Upload all thirteen modules in `worker/src`: `index.js`, `config.js`, `providers.js`, `oidc.js`, `review.js`, `grounding.js`, `verify.js`, `budget.js`, `github-app.js`, `webhook.js`, `pr-state.js`, `effects.js` and `setup.js`.
   - Set `main_module: "index.js"` and include the bindings and settings from `wrangler.jsonc`.
   - Add the Durable Object bindings `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}` and `{type: "durable_object_namespace", name: "APP_SECRETS", class_name: "AppSecrets"}`.
   - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
   - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState", "AppSecrets"]}`.
 
+## Verified findings
+
+No model text reaches a review unless it has passed a deterministic grounding check and an independent model's attempt to refute it (TAN-299). That covers the comments, their suggestions and agent prompts, the body, and the findings record. Each finding passes four layers, in order:
+
+1. **It carries evidence.** For every finding the drafter gives:
+   - `evidence`: the exact line or lines (at most 5) of the new file it is about, copied from the diff;
+   - `claim`: one sentence saying what is wrong;
+   - `symbols`: the identifiers it depends on.
+
+   The prompt says findings without verbatim evidence are discarded, and it never frames the change as bug-free. It asks for a line distinctive enough to find in the file and, when the cited line is generic (a lone brace, `return null;`), for a neighbouring line that is not.
+2. **The grounding gate** (`worker/src/grounding.js`: no model, so free). It drops a finding when:
+   - it is not about a file in the change: it has no file, or names one the model was not shown ("not about a file in the change");
+   - it has no evidence ("no evidence");
+   - its evidence is not where it says, or does not pick a line out. Whitespace aside:
+     - **Lines with no content are ignored.** A line made only of punctuation, keywords (including word closers such as `end`, `endif`, `fi` and `done`, and Rust, Java, Kotlin and Ruby keywords), bare tags such as `</div>` or `<br/>`, and `null`, `nil`, `None`, `undefined`, `true`, `false`, such as `}`, `} else {` or `return null;`, neither counts nor needs to match. Any name or number, however short, is content: `if err != nil {` and `dx := x1 - x0` have some.
+     - **Every line with content must be a line the model was shown** ("evidence not in the code"): for an inline finding, within 3 lines of the line it cites; for a finding outside the diff, anywhere in its file.
+     - **At least one of them must be distinctive** ("evidence too thin"). For an inline finding, a line is distinctive if it occurs at most twice among the file's shown lines, or at most five times if it has a name of 3 or more characters that is not a keyword or a well-known name (`error` and `err` are well-known). So `const y = x / 0;` or `for (let i = 0; i <= n; i++) {` grounds a finding when it is unique in its file, and `} catch (error) {` does not when it repeats. A finding outside the diff matches anywhere in its file, so its line must occur there only once.
+
+     Occurrences are counted once per file, as its shown lines are collected, so the check stays linear.
+   - a name in its `symbols`, or in backticks in its title or claim, is not a whole word of the diff, the PR's title or its description, nor a language keyword or well-known global ("names something not in the change"). For a dotted path such as `a.b`, the last segment is checked. The body and the suggestion are not checked for names: a fix may add new ones.
+
+   Evidence must come from the new file, so a finding about lines the change removed cannot be grounded and is dropped. A suggestion whose brackets, or open strings, differ from those of the lines it replaces is stripped, and its finding stays. In a JSON file, a suggestion for lines that balance must balance too. Every check is linear in what it reads.
+3. **The verifier** (`worker/src/verify.js`). An independent model is asked to refute the findings, not to agree with them.
+   - **What it sees.** Each finding's id, line, severity, title, claim, evidence, body, agent prompt and suggestion (the original lines and their replacement), with the PR's title and description and the diff of the finding's file, all fenced as data.
+   - **What it answers,** for each finding:
+     - `verdict`: `confirmed`, `refuted` or `uncertain`. A missing or unreadable verdict counts as uncertain;
+     - `severity`: its own view. The finding is shown at the higher of the drafter's and the verifiers' severities;
+     - `suggestion_ok` and `prompt_ok`: whether the suggestion and the agent prompt are right. A confirmed finding keeps its suggestion, and its prompt, only when these are `true`. Otherwise they are removed and the finding is shown without them.
+   - **Few calls, at once.** The findings go in at most 4 calls (`VERIFY_MAX_CALLS`), run at the same time: one per file, with small files sharing a call when there are more than 4. Each call carries only its files' diffs.
+   - **Budgets hold.** Before the calls start, each verifier's budget is checked against all of them together. If it can't cover them all, its calls go one at a time, each checked against what the ones before it spent. Each provider is one object per review, and each review has its own queue for ledger writes, which its drafting and verifying providers share: additions go in turn, so calls at the same moment cannot lose one another's spend. No review waits on another's queue.
+   - **Every finding:** `VERIFY_CHAIN` (Claude Haiku 5.5) checks it.
+   - **Critical and major findings,** by the drafter's severity or the verifier's, also need `ESCALATE_CHAIN` (Claude Sonnet 5.5) to confirm them. All of them go in one more call, with their files' diffs. Both verifiers must also pass the suggestion and the prompt. If the second check can't run, or the two disagree, the finding is unconfirmed; the review is not held for it.
+   - **Time limits.** Both count from when the review started: verification ends by `VERIFY_BUDGET_MS` (150 seconds), and never later than `REVIEW_DEADLINE_MS` (270 seconds), the whole review's limit. Drafting starts no new provider and no retry in the last minute before that deadline, and each drafting call is given up if it has not answered by the deadline itself; either way the review is queued and tried again in 5 minutes (503).
+     - A finding with no verdict by the deadline is unconfirmed.
+     - If every call is late, or more than half the findings have no verdict, nothing is posted: the review is tried again in 5 minutes (503).
+     - Calls still running at the deadline are not in the footer's cost, which then says "at least". Their ledgers still record what they spent.
+   - **No model checks its own findings.** When no `VERIFY_CHAIN` provider can run (no key, out of quota, past the day's cap, or it wrote the findings itself), `VERIFY_FALLBACK` is used. That is never the drafter's own model, and one of a different kind comes first. The footer says which model verified instead, and why. A verifier of the drafter's own kind is a weaker check: the footer says so, and the finding's record has `weak: true`.
+   - **When no verifier can run at all,** the review waits in the queue (429), as when every drafter is out. Findings are never posted unverified. The capacity check before a runner is dispatched plans the drafter (the first free one in `DRAFT_CHAIN`) and needs a verifier with a different id free too, so a review is not usually drafted only to wait. When the first free drafter is the only free verifier and another drafter is free, that other one is planned, and the review drafts with it first, by the same rule.
+   - **Nothing a verifier writes in its own words is kept.** Every reason in the review is the Worker's, such as "refuted by claude-haiku-5-5".
+4. **Placement**, following CodeRabbit's `chill` profile.
+
+| Finding | Where it goes |
+|---|---|
+| Confirmed issue or refactor, minor or above, on a diff line | An inline comment, with its suggestion and agent prompt where the verifiers passed them |
+| Confirmed nitpick, or trivial or info severity | `chill`: a collapsed "🧹 Nitpick comments" section of the review body, with its agent prompt only if the prompt passed verification, and never a suggestion. `assertive`: inline. `quiet`: not shown, but kept in the findings record |
+| Confirmed, outside the diff | A collapsed "Outside diff range comments" section (`quiet` leaves out its nitpicks) |
+| Unconfirmed, refuted, or dropped by the grounding gate | The findings record only: never shown, never inline, and never counted as a finding |
+
+- **What a hidden finding leaves behind.** The findings record keeps its id, labels, status and the Worker's reason, and its path only when that names a file in the change. None of its own text is kept: no title, body, claim, evidence, prompt or suggestion, anywhere in the review.
+- **The summary is the Worker's own.** The drafter is still asked for a one-line summary, so its answer keeps the same shape, but that summary is never shown: nothing has verified it. The Worker writes the summary from the confirmed findings, for example "Reviewed 7 files. 3 findings confirmed: 1 major, 2 minor (plus 2 nitpicks)." or "No problems confirmed in the 7 files reviewed."
+- **What the footer says.** A count line covers the findings shown. One verification line says how many were confirmed and by which models, and how many were not shown and why (counts only). For example: "Verified: 4 findings confirmed by `claude-haiku-5-5` (2 also by `claude-sonnet-5-5`); 3 not shown (1 refuted, 1 unconfirmed, 1 failed the evidence check)." The cost line adds what verification spent.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `VERIFY_CHAIN` | `anthropic:claude-haiku-5-5` | Verifies every finding |
+| `ESCALATE_CHAIN` | `anthropic:claude-sonnet-5-5` | The second verifier critical and major findings need |
+| `VERIFY_FALLBACK` | `gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash` | Used only when no `VERIFY_CHAIN` provider can run |
+| `REVIEW_PROFILE` | `chill` | `chill`, `assertive` or `quiet` (above) |
+| `VERIFY_BUDGET_MS` | `150000` | Verification's time limit, in milliseconds from the review's start |
+| `REVIEW_DEADLINE_MS` | `270000` | The whole review's time limit, in milliseconds; drafting stops a minute before it |
+| `VERIFY` | unset | `off` confirms every finding unchecked. For tests and emergencies only: `wrangler.jsonc` never sets it, and the footer says when it is off |
+
+These are Worker settings for now; a per-repository key (`reviews.profile` in `.ai-review.yml`) comes with TAN-286.
+
+**Costs.**
+- **Drafting:** nothing, on the free drafters at the front of `DRAFT_CHAIN`. The cheaper Workers AI models are in it now that every finding is verified.
+- **Verifying:** a file's findings take about 6,000–8,000 input tokens and a few hundred output on Haiku, about $0.001. The one escalation call to Sonnet costs about $0.02.
+- **A typical review:** 6–8 findings, 2 of them escalated, comes to about $0.03–0.05, paid from the plan's monthly API credit, in at most 5 verifier calls.
+- **Limits:** `ANTHROPIC_DAILY_USD_CAP` ($5) bounds any one day. Past it, the free fallback verifiers take over. Workers AI verification counts against `DAILY_NEURON_CAP` like drafting.
+
 ## Limits worth knowing
 
 - **What it reads.** It sees the diff, not the whole repository, so it can miss problems that need wider context. It reads up to 90,000 characters of diff, 20,000 per file. Code comes before tests and docs, and lockfiles and generated files are skipped. The review lists what it did not read.
 - **Light runner.** It cannot start a Node binary downloaded by `actions/setup-node` (its image has no `libatomic.so.1`), so this repository's CI runs the tests on the Node 24 that the runner ships for JavaScript actions. The review job is a JavaScript action and is unaffected.
-- **CPU.** Workers Free allows 10 ms of CPU per request. The workflow therefore sends at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it.
-- **Budget accuracy.** The ledger is in KV, which is eventually consistent and not atomic. Reviews that run at the same moment can each miss the others' spend, so a burst can overshoot the cap by several reviews. The check reserves each review's whole output allowance, which absorbs some of that. Past the cap, Cloudflare's own 10,000-neuron limit stops everything, never bills, and becomes a deferral. Replay protection is also only as strong as KV: a simultaneous replay is not stopped, but the cap bounds what it can cost.
+- **CPU.** Workers Free allows 10 ms of CPU per request. The workflow therefore sends at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it. The grounding gate collects the diff's words once and reads only a few lines per finding.
+- **Verification narrows errors; it cannot end them.**
+  - Two models can agree on a wrong finding.
+  - The verifier sees the diff, not the whole file, so it can miss context that lies elsewhere (full files come with the Worker-side review, PR C).
+  - A verifier's verdict on a suggestion or a prompt is a judgement, not a test run: nothing executes the code.
+- **A review can still wait for a verifier after it has drafted.** The check before a runner is dispatched needs a drafter and a different verifier, both able to run. But a verifier can run out while the review runs, and with no verifier set up at all the check lets the review run so the fault shows. Then the review drafts, waits in the queue until a verifier resets, and drafts again when it runs.
+- **Budget accuracy.** The ledger is in KV, which is eventually consistent and not atomic. Within one review, additions go in turn on the review's own queue and the verifier's calls are checked together (see "Verified findings"). Reviews that run at the same moment can each miss the others' spend, so a burst can overshoot the cap by several reviews. The check reserves each review's whole output allowance, which absorbs some of that. Past the cap, Cloudflare's own 10,000-neuron limit stops everything, never bills, and becomes a deferral. Replay protection is also only as strong as KV: a simultaneous replay is not stopped, but the cap bounds what it can cost.
 - **Model output.** Reasoning counts as output. If the budget allows, the Worker tries once more, asking for no suggestions, when:
   - an answer is cut short (with low reasoning effort);
   - or an answer tried to be JSON but doesn't parse.
@@ -210,6 +288,7 @@ This runs the following, against stand-ins:
 
 - the Worker's OIDC verification, with a real RSA key pair;
 - the budget, and the prompt and review building;
+- the grounding gate and the verifier, with stand-in Gemini, Workers AI and Anthropic services, including a seeded random check that no unverified text (a hidden finding, the drafter's summary, an unpassed prompt or suggestion, an invented path) reaches a posted review;
 - the HTTP handlers;
 - v2's App authentication, again with a real PKCS#1 key;
 - the one-time manifest setup, including its guards;
