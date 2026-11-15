@@ -9,6 +9,6 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test \"worker/test/*.test.js\""
+    "test": "node --test --test-concurrency=1 \"worker/test/*.test.js\""
   }
 }

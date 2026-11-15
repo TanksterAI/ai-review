@@ -199,6 +199,10 @@ export function suggestionBalanced(suggestion, path) {
 export function groundFindings(classified, prepared, { title = "", body = "" } = {}) {
   const lineText = prepared.lineText ?? new Map();
   const commentable = prepared.commentable ?? new Map();
+  // Every line the model was shown: the commentable ones, and (coverage.js)
+  // those of a diff the Worker worked out itself, which GitHub may not accept
+  // comments on, so their findings stay in the body.
+  const shownLines = prepared.shown ?? commentable;
   const included = new Set(prepared.included ?? []);
   // The lines the model was shown in a file, normalised, with how often
   // each occurs: counted once, on first use, so the work stays linear.
@@ -207,7 +211,7 @@ export function groundFindings(classified, prepared, { title = "", body = "" } =
     if (!perFile.has(path)) {
       const counts = new Map();
       const text = lineText.get(path);
-      for (const n of commentable.get(path) ?? []) {
+      for (const n of shownLines.get(path) ?? []) {
         if (!text?.has(n)) continue;
         const l = normaliseLine(text.get(n));
         counts.set(l, (counts.get(l) ?? 0) + 1);

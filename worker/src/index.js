@@ -25,9 +25,10 @@
 // with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
-import { buildPrompt, classifyFindings, codeSpan, parseAnswer, prepareFiles, renderReview } from "./review.js";
+import { buildPrompt, classifyFindings, codeSpan, placeComments, prepareFiles, renderReview, titleLine } from "./review.js";
+import { draftWithChain } from "./draft.js";
 import { createLedger, createSerial, nextUtcMidnight, utcDay } from "./budget.js";
-import { LATE, ProviderError, beforeDeadline, capacity, createProviders, draftChain, verifyOff } from "./providers.js";
+import { capacity, createProviders, draftChain, verifyOff } from "./providers.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { config } from "./config.js";
@@ -37,6 +38,8 @@ import { createEffects } from "./effects.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
 
 export { PrState } from "./pr-state.js";
+export { placeComments, titleLine } from "./review.js";
+export { draftWithChain, STEP_RESERVE } from "./draft.js";
 export { AppSecrets } from "./setup.js";
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -131,37 +134,6 @@ export async function handleReview(request, env, deps = {}) {
   return json(out.status, out.body);
 }
 
-// A comment's first line (its labels and title), for lists where the whole
-// comment would not read well: suggestion and prompt blocks do not flatten.
-export function titleLine(body) {
-  return String(body).split("\n")[0].slice(0, 300);
-}
-
-/**
- * For an incremental review: which comments still fit the PR's own diff
- * (lines: path -> Set of RIGHT-side lines). A suggestion's range must be there
- * whole; when only its first lines left the diff, the comment stays on its
- * own line with the body renderReview made without the suggestion (never
- * edited here: a multi-line replacement must not reach a one-line comment).
- * Anything else goes in the body.
- */
-export function placeComments(comments, singleLine, lines) {
-  const inDiff = (c, n) => lines.get(c.path)?.has(n) === true;
-  const kept = [];
-  const off = [];
-  for (const [i, c] of comments.entries()) {
-    if (!inDiff(c, c.line)) { off.push(c); continue; }
-    let whole = true;
-    for (let n = c.start_line ?? c.line; n <= c.line; n++) if (!inDiff(c, n)) whole = false;
-    if (whole) { kept.push(c); continue; }
-    const single = singleLine?.[i];
-    if (typeof single !== "string") { off.push(c); continue; }
-    const { start_line: _s, start_side: _side, ...rest } = c;
-    kept.push({ ...rest, body: `${single}\n\n_The suggestion was left out: some of the lines it replaces are no longer in this pull request's diff._` });
-  }
-  return { kept, off };
-}
-
 // The review itself, shared by the v1 endpoint (/v1/review) and the App's
 // runner endpoint. Returns {status, body}; callers turn it into a Response.
 // again: the review's "Review again" line, set by the Worker (never taken from
@@ -204,75 +176,9 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   }
   const providers = createProviders(env, cfg, chain, deps);
 
-  // Each provider in turn, until one answers: one that is out of quota,
-  // busy, or failing hands over to the next. On one provider, up to two calls:
-  //   - an answer cut short (reasoning used the room): once more, with low
-  //     reasoning effort, if the budget allows;
-  //   - an answer that tried to be JSON but does not parse (escaping code in
-  //     a suggestion is where models slip): once more, if the budget allows.
-  //   Either retry asks for no suggestions, which makes the answer shorter
-  //   and its JSON simpler.
-  // Every call races the review's deadline: one that has not answered by
-  // then is given up, and the review is queued (503) to try again.
-  const deadline = started + cfg.reviewDeadlineMs;
-  // Drafting stops a minute before the review's deadline, so verification
-  // still has time: no new provider and no retry after that.
-  const outOfTime = () => now() - started > cfg.reviewDeadlineMs - 60_000;
-  let timedOut = false;
-  const outcomes = [];
-  let answer = null;
-  let used = null;
-  let neurons = 0;
-  let usd = 0;
-  let last = {};
-  for (const p of providers) {
-    if (!p.configured) continue;
-    if (outOfTime()) { timedOut = true; break; }
-    const until = await p.exhausted();
-    if (until) { outcomes.push({ id: p.id, kind: "deferred", reason: `${p.id} is out of quota`, resetAt: until }); continue; }
-    const first = await p.affordable(chars, cfg.maxOutput);
-    if (!first.ok) {
-      log({ ev: "deferred", repository, pr, provider: p.id, spent: first.spent, estimate: first.estimate });
-      // No reset time means it can never take this review (too long for it).
-      outcomes.push(first.resetAt === null
-        ? { id: p.id, kind: "failed", reason: first.reason }
-        : { id: p.id, kind: "deferred", reason: first.reason, resetAt: first.resetAt ?? nextUtcMidnight(now()) });
-      continue;
-    }
-    let note = "";
-    let low = false;
-    let lastStatus = null;
-    for (let attempt = 1; attempt <= 2 && !answer; attempt++) {
-      if (attempt > 1 && outOfTime()) { timedOut = true; break; }
-      let r;
-      try {
-        r = await beforeDeadline(p.complete({ system: instructions + note, user: modelInput, maxOutput: cfg.maxOutput, low }), deadline, deps);
-      } catch (e) {
-        if (!(e instanceof ProviderError)) throw e;
-        outcomes.push({ id: p.id, kind: e.kind, reason: e.reason, resetAt: e.resetAt });
-        lastStatus = "error";
-        break;
-      }
-      if (r === LATE) {
-        // The call may still finish and record its spend; this review stops.
-        log({ ev: "draft_out_of_time", repository, pr, provider: p.id, attempt });
-        return res(503, { status: "unavailable", reason: "the review ran out of time before a model answered" });
-      }
-      neurons += r.neurons ?? 0;
-      usd += r.usd ?? 0;
-      last = r;
-      answer = parseAnswer(r.text);
-      if (answer) { used = p; break; }
-      lastStatus = r.incomplete ? "incomplete" : "unparseable";
-      log({ ev: "unparseable", repository, pr, provider: p.id, attempt, incomplete: r.incomplete });
-      if ((!r.incomplete && !r.text.includes("{")) || !(await p.affordable(chars, cfg.maxOutput)).ok) break;
-      if (r.incomplete) low = true;
-      note = "\nYour previous answer could not be used. Answer again, shorter, and leave out every \"suggestion\" key.";
-    }
-    if (answer) break;
-    if (lastStatus === "incomplete") outcomes.push({ id: p.id, kind: "failed", reason: "the model ran out of output room before it answered; try again, or review a smaller change" });
-    else if (lastStatus === "unparseable") outcomes.push({ id: p.id, kind: "failed", reason: "the model did not return a usable answer; try again later" });
-  }
+  const drafted = await draftWithChain({ providers, instructions, modelInput, chars, cfg, deps, started, repository, pr });
+  if (drafted.late) return res(503, { status: "unavailable", reason: "the review ran out of time before a model answered" });
+  const { answer, used, neurons, usd, last, outcomes, timedOut } = drafted;
 
   if (!answer && timedOut) {
     // Queued and tried again shortly, like a busy provider.

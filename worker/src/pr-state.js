@@ -12,6 +12,7 @@ import { appConfig } from "./setup.js";
 import { createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
+import { MAX_RUN_LIFE_MS, RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -108,6 +109,11 @@ export class PrState {
     this.effects = deps.effects ?? null;
     // () => {ok} | {ok: false, retryAt}: can any model provider take a review now?
     this.capacity = deps.capacity ?? null;
+    // The Worker's own review (review-run.js) needs a fetch and a timer; tests
+    // pass their own.
+    // (Not this.fetch: that is the object's own request handler.)
+    this.fetchImpl = deps.fetch ?? ((...a) => fetch(...a));
+    this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.debounceMs = seconds(env?.REVIEW_DEBOUNCE_S, DEBOUNCE_S) * 1000;
     this.debounceMaxMs = Math.max(this.debounceMs, seconds(env?.REVIEW_DEBOUNCE_MAX_S, DEBOUNCE_MAX_S) * 1000);
   }
@@ -121,7 +127,8 @@ export class PrState {
     let out;
     if (msg.op === "event") out = await this.onEvent(msg);
     else if (msg.op === "claim") out = await this.claim(msg);
-    else if (msg.op === "complete") out = await this.complete(msg);
+    // Only the Worker's own runs (stepActiveRun) may say a review covered every file.
+    else if (msg.op === "complete") out = await this.complete({ jobId: msg.jobId, runId: msg.runId, reviewedSha: msg.reviewedSha });
     else if (msg.op === "defer") out = await this.defer(msg);
     else out = { error: "unknown op" };
     return Response.json(out);
@@ -252,7 +259,9 @@ export class PrState {
   async newJob(ev, st, { full = false, requestedBy = null, queue = true } = {}) {
     // Drop jobs that can no longer be claimed, so they never pile up.
     const old = await this.ctx.storage.list({ prefix: "job:" });
-    await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS).map(([k]) => k));
+    // Never the job of the review in progress: it may wait hours for a provider.
+    const running = (await activeRun(this.ctx.storage))?.id;
+    await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running).map(([k]) => k));
     const id = jobIdFor(`${ev.repo.full}#${ev.pr}`);
     const job = {
       id,
@@ -281,6 +290,8 @@ export class PrState {
       await this.ctx.storage.put("state", st);
       await this.ctx.storage.delete("debounce");
       await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
+      // A review in progress stops: nothing is posted on a closed PR.
+      for (const prefix of [RUN_META, RUN]) await this.deleteAll([...(await this.ctx.storage.list({ prefix })).keys()]);
       // Their dispatches would only start runners the Worker then refuses.
       const box = (await this.ctx.storage.get("outbox")) ?? [];
       await this.ctx.storage.put("outbox", box.filter((x) => x.type !== "dispatch"));
@@ -354,6 +365,32 @@ export class PrState {
   async alarm() {
     // A quiet period that is over becomes a job (and a dispatch in the outbox).
     await this.fireDebounce();
+    // One step of the review in progress, if any (review-run.js). A step that
+    // throws must not hold up the outbox: commands are still answered, and the
+    // run is looked at again shortly.
+    // Failures here (before the run's own step, which counts its own) back
+    // off, and six in a row give the run up: it must never wake for ever.
+    let runNext;
+    try {
+      runNext = await this.stepActiveRun();
+      await this.ctx.storage.delete("runFailures");
+    } catch (e) {
+      const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
+      console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
+      // Backing off to an hour, for as long as a run may live; then the run is
+      // given up, and the PR is told (its status may still say pending).
+      const run = await activeRun(this.ctx.storage);
+      if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
+        await dropRun(this.ctx.storage, run.id);
+        await this.ctx.storage.delete(`job:${run.id}`);
+        await this.ctx.storage.delete("runFailures");
+        await this.outbox({ type: "comment", template: "gave_up", reason: "the review could not run (the App may not be set up)", tries: n, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
+        runNext = null;
+      } else {
+        await this.ctx.storage.put("runFailures", n);
+        runNext = run ? this.now() + Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10)) : null;
+      }
+    }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     const isDue = (x) => !(x.notBefore > this.now());
     const item = box.find(isDue);
@@ -377,11 +414,12 @@ export class PrState {
       }
     }
     const rest = (await this.ctx.storage.get("outbox")) ?? [];
-    if (rest.some(isDue)) {
+    const run = runNext ?? Infinity;
+    if (rest.some(isDue) || run <= this.now()) {
       await this.ctx.storage.setAlarm(this.now());
     } else {
       const d = await this.ctx.storage.get("debounce");
-      const next = Math.min(d ? d.due : Infinity, ...rest.map((x) => x.notBefore));
+      const next = Math.min(d ? d.due : Infinity, run, ...rest.map((x) => x.notBefore));
       // Never in the past: an alarm with nothing due must not fire at once.
       if (Number.isFinite(next)) await this.ctx.storage.setAlarm(next > this.now() ? next : this.now() + RECHECK_MS);
     }
@@ -409,6 +447,7 @@ export class PrState {
       await this.ctx.storage.delete(`job:${jobId}`);
       return undefined;
     }
+    if (this.mode() === "worker") return this.startWorkerRun(held, st);
     // No model provider can take a review now (sized as the review itself,
     // when it was tried before), or the runner said when one will: hold the
     // dispatch rather than start a runner that can only defer. The job is
@@ -495,6 +534,63 @@ export class PrState {
     return undefined;
   }
 
+  // "worker" (the default): the review runs here, in this object's alarm, in
+  // steps, and covers every file (review-run.js). "runner": the earlier path,
+  // a runner on the light lane that sends the diff to /v1/runner/review.
+  mode() {
+    return String(this.env?.REVIEW_MODE ?? "").trim().toLowerCase() === "runner" ? "runner" : "worker";
+  }
+
+  // One review at a time per pull request: a job that comes while one runs
+  // waits for it (it then reviews from where that one stopped).
+  async startWorkerRun(job, st) {
+    const active = await activeRun(this.ctx.storage);
+    // Held until the running review can next move (no sooner than RECHECK_MS):
+    // a review waiting hours for a provider must not wake this every 30 s.
+    if (active && active.id !== job.id) return { holdUntil: Math.max(this.now() + RECHECK_MS, active.waitUntil || 0) };
+    // Only a full-coverage review's commit is a starting point: the runner and
+    // v1 move lastReviewed too, but read at most 90,000 characters.
+    const since = job.full ? null : (st.lastCompleteReviewed ?? null);
+    if (!active) await startRun(this.ctx.storage, { ...job, since }, this.now());
+    const now = this.now();
+    await this.ctx.storage.put(`job:${job.id}`, { ...job, since, claimedBy: "worker", claimedAt: now, dispatchedAt: now, firstRunAt: job.firstRunAt ?? now });
+    console.log(JSON.stringify({ svc: "ai-review", ev: "run_started", pr: job.pr }));
+    await this.armAt(now);
+    return undefined;
+  }
+
+  // Runs one step of the review in progress; returns when the next is due.
+  async stepActiveRun() {
+    const run = await activeRun(this.ctx.storage);
+    if (!run) return null;
+    // A run may wait hours for a provider: its job is kept fresh meanwhile, or
+    // newJob would prune it (JOB_TTL_MS) and the finish could not be recorded.
+    const job = await this.ctx.storage.get(`job:${run.id}`);
+    if (job) await this.ctx.storage.put(`job:${run.id}`, { ...job, createdAt: this.now() });
+    const app = this.effects ? null : await appConfig(this.env);
+    const fx = this.effects ?? createEffects(this.env, { config: app });
+    const slug = app?.slug ?? DEFAULT_SLUG;
+    const ctx = {
+      storage: this.ctx.storage, env: this.env, cfg: config(this.env), fx,
+      deps: { now: this.now, sleep: this.sleep, fetch: this.fetchImpl, log: (e) => console.log(JSON.stringify({ svc: "ai-review", ...e })) },
+      again: `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`,
+      onDone: (r, out) => this.runDone(r, out),
+    };
+    return stepRun(ctx, run.id);
+  }
+
+  // A run is over: its job completes (moving lastReviewed on) or is dropped,
+  // and its stored state goes. One given up says so on the PR.
+  async runDone(run, { reviewedSha, gaveUp, description }) {
+    if (reviewedSha) await this.complete({ jobId: run.id, runId: "worker", reviewedSha, fullCoverage: true });
+    else await this.ctx.storage.delete(`job:${run.id}`);
+    await dropRun(this.ctx.storage, run.id);
+    if (gaveUp) {
+      const why = String(description ?? "the review kept failing").replace(/[`\n]/g, " ").slice(0, 200);
+      await this.outbox({ type: "comment", template: "gave_up", reason: why, tries: 3, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
+    }
+  }
+
   async capacityNow(chars, skip = []) {
     if (this.capacity) return this.capacity(chars, skip);
     if (!this.env?.LEDGER) return { ok: true };
@@ -565,7 +661,9 @@ export class PrState {
     return { job };
   }
 
-  async complete({ jobId, runId, reviewedSha }) {
+  // fullCoverage: the Worker's own review covered every file (review-run.js);
+  // only such a review moves lastCompleteReviewed, its incremental start.
+  async complete({ jobId, runId, reviewedSha, fullCoverage = false }) {
     const job = await this.ctx.storage.get(`job:${jobId}`);
     if (!job || job.claimedBy !== String(runId)) return { error: "not your job" };
     const st = await this.state();
@@ -577,6 +675,10 @@ export class PrState {
     if (/^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
       st.lastReviewed = reviewedSha;
       st.lastClaimedAt = at;
+    }
+    if (fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
+      st.lastCompleteReviewed = reviewedSha;
+      st.lastCompleteClaimedAt = at;
     }
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);

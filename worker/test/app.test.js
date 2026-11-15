@@ -6,6 +6,10 @@ import worker, { handleWebhook, handleRunnerSession, handleRunnerReview } from "
 import { PrState } from "../src/pr-state.js";
 import { makeSigner, claimsAt, staticJwks, memoryKv, memoryStorage, fakeEffects, responsesResult, testSleep, PATCH, GROUNDED_PATCH, AUDIENCE, OWNER_ID } from "./helpers.js";
 
+// These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
+// and the worker-mode tests below cover the Worker's own review.
+const RUNNER_MODE = { REVIEW_MODE: "runner" };
+
 const NOW_MS = 1_794_500_000_000;
 const SECRET = "whsec";
 const RUNNER = "TanksterAI/ai-review/.github/workflows/runner.yml";
@@ -19,7 +23,7 @@ function namespace(fx, clock) {
     objects,
     idFromName: (n) => n,
     get(name) {
-      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage() }, {}, { now: () => clock.t, effects: fx }));
+      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage() }, RUNNER_MODE, { now: () => clock.t, effects: fx }));
       const obj = objects.get(name);
       return { fetch: (url, init) => obj.fetch(new Request(url, init)) };
     },

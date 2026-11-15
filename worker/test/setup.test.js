@@ -7,6 +7,10 @@ import { normalise } from "../src/webhook.js";
 import { PrState, parseCommand, helpText } from "../src/pr-state.js";
 import { memoryStorage } from "./helpers.js";
 
+// These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
+// and the worker-mode tests below cover the Worker's own review.
+const RUNNER = { REVIEW_MODE: "runner" };
+
 const NOW = 1_794_500_000_000;
 const ORIGIN = "https://tankster-ai-review.rishi-tank.workers.dev";
 const PEM = "-----BEGIN RSA PRIVATE KEY-----\nSECRETKEY\n-----END RSA PRIVATE KEY-----";
@@ -45,7 +49,8 @@ test("the manifest asks for exactly what v2 uses, and points back at this Worker
   assert.equal(m.hook_attributes.url, `${ORIGIN}/v1/github/webhook`);
   assert.equal(m.redirect_url, `${ORIGIN}/v1/setup/github-app/callback`);
   assert.deepEqual(m.default_events, ["pull_request", "issue_comment", "pull_request_review_comment"]);
-  assert.deepEqual(m.default_permissions, { metadata: "read", contents: "read", pull_requests: "write", issues: "read", actions: "write" });
+  // statuses: the "Tankster AI Review" commit status the merge gate reads.
+  assert.deepEqual(m.default_permissions, { metadata: "read", contents: "read", pull_requests: "write", issues: "read", actions: "write", statuses: "write" });
   assert.equal(m.default_permissions.workflows, undefined);
   assert.equal(m.default_permissions.administration, undefined);
 });
@@ -201,7 +206,7 @@ test("another App slug changes the mention, the bot login and the help text", ()
 
 test("before setup, the outbox keeps its work and retries", async () => {
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, { OWNER_ID: "259206056" }, { now: () => NOW });
+  const obj = new PrState({ storage }, { ...RUNNER, OWNER_ID: "259206056" }, { now: () => NOW });
   await obj.onEvent({
     delivery: "1",
     ev: {
@@ -222,7 +227,7 @@ test("replies name the App by its configured slug", async () => {
     async dispatch() {},
   };
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, {}, { now: () => NOW, effects: fx });
+  const obj = new PrState({ storage }, RUNNER, { now: () => NOW, effects: fx });
   const repo = { full: "TanksterAI/x", name: "x" };
   await obj.onEvent({ delivery: "1", ev: { kind: "command", slug: "tankster-ai-reviewer", repo, pr: 3, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-reviewer pause" } });
   await obj.alarm();

@@ -3,13 +3,17 @@ import assert from "node:assert/strict";
 import { PrState, parseCommand, jobIdFor, prKeyOfJob } from "../src/pr-state.js";
 import { memoryStorage, fakeEffects } from "./helpers.js";
 
+// These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
+// and the worker-mode tests below cover the Worker's own review.
+const RUNNER = { REVIEW_MODE: "runner" };
+
 const NOW = 1_794_500_000_000;
 const repo = { full: "TanksterAI/browser-relay", name: "browser-relay", ownerId: "259206056" };
 
 function make({ writers = ["rishitank"], now = () => NOW } = {}) {
   const storage = memoryStorage();
   const fx = fakeEffects({ writers });
-  const obj = new PrState({ storage }, {}, { now, effects: fx });
+  const obj = new PrState({ storage }, RUNNER, { now, effects: fx });
   return { obj, storage, fx };
 }
 
@@ -396,7 +400,7 @@ test("an incremental job starts from the last review finished when it is claimed
 
 test("the quiet period can be set, and the cap is never below it", async () => {
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, { REVIEW_DEBOUNCE_S: "60", REVIEW_DEBOUNCE_MAX_S: "30" }, { now: () => NOW, effects: fakeEffects() });
+  const obj = new PrState({ storage }, { ...RUNNER, REVIEW_DEBOUNCE_S: "60", REVIEW_DEBOUNCE_MAX_S: "30" }, { now: () => NOW, effects: fakeEffects() });
   assert.equal(obj.debounceMs, 60_000);
   assert.equal(obj.debounceMaxMs, 60_000);
   const bad = new PrState({ storage: memoryStorage() }, { REVIEW_DEBOUNCE_S: "soon", REVIEW_DEBOUNCE_MAX_S: "-1" }, { now: () => NOW });
@@ -494,7 +498,7 @@ test("a zero quiet period never spins the alarm while a job is on its way", asyn
   let t = NOW;
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
-  const obj = new PrState({ storage }, { REVIEW_DEBOUNCE_S: "0" }, { now: () => t, effects: fx });
+  const obj = new PrState({ storage }, { ...RUNNER, REVIEW_DEBOUNCE_S: "0" }, { now: () => t, effects: fx });
   await obj.onEvent({ delivery: "1", ev: review() });
   await drain(obj);
   await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize" }) });
@@ -721,7 +725,7 @@ test("no provider has capacity: the dispatch is held, its job kept fresh, then s
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
   let cap = { ok: false, retryAt: NOW + 5 * 3600_000 };
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
   const out = await obj.onEvent({ delivery: "d1", ev: review() });
   await fire(obj);
   assert.deepEqual(fx.calls, []);
@@ -749,7 +753,7 @@ test("no provider has capacity: the dispatch is held, its job kept fresh, then s
 test("a held dispatch does not block other side effects behind it", async () => {
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
-  const obj = new PrState({ storage }, {}, { now: () => NOW, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
+  const obj = new PrState({ storage }, RUNNER, { now: () => NOW, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
   await obj.onEvent({ delivery: "d1", ev: review() });
   await fire(obj);
   await obj.onEvent({ delivery: "d2", ev: command("@tankster-ai-review help") });
@@ -762,7 +766,7 @@ test("a deferred review is given back: released, queued for the reset, claimable
   let t = NOW;
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: true }) });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => ({ ok: true }) });
   const out = await obj.onEvent({ delivery: "d1", ev: review() });
   await drain(obj);
   assert.ok((await obj.claim({ jobId: out.jobId, runId: "1" })).job);
@@ -798,7 +802,7 @@ test("a push while a dispatch is held waits for it, without waking every 30 seco
   let t = NOW;
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 3600_000 }) });
   await obj.onEvent({ delivery: "d1", ev: review() });
   await fire(obj);
   await obj.onEvent({ delivery: "d2", ev: review({ action: "synchronize" }) });
@@ -814,7 +818,7 @@ test("a held review request beside a waiting push never spins the alarm (both ki
     let t = NOW;
     const storage = memoryStorage();
     const fx = fakeEffects({ writers: ["rishitank", "bob"] });
-    const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 5 * 3600_000 }) });
+    const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => ({ ok: false, retryAt: NOW + 5 * 3600_000 }) });
     if (kind === "command") {
       await obj.onEvent({ delivery: "d0", ev: review({ action: "synchronize" }) });
       await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review review") });
@@ -841,7 +845,7 @@ test("a deferral remembers when and how big: no runner is started before then, a
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
   const asked = [];
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async (chars) => { asked.push(chars); return { ok: true }; } });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async (chars) => { asked.push(chars); return { ok: true }; } });
   const out = await obj.onEvent({ delivery: "d1", ev: review() });
   await drain(obj);
   await obj.claim({ jobId: out.jobId, runId: "1" });
@@ -877,7 +881,7 @@ test("a held automatic review is dropped if the PR is paused or made a draft mea
     const storage = memoryStorage();
     const fx = fakeEffects({ writers: ["rishitank"] });
     let cap = { ok: false, retryAt: NOW + 3600_000 };
-    const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+    const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
     await obj.onEvent({ delivery: "d1", ev: review() });
     await fire(obj);
     if (change === "pause") { await obj.onEvent({ delivery: "d2", ev: command("@tankster-ai-review pause") }); await fire(obj); }
@@ -892,7 +896,7 @@ test("a held automatic review is dropped if the PR is paused or made a draft mea
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
   let cap = { ok: false, retryAt: NOW + 3600_000 };
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async () => cap });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
   await obj.onEvent({ delivery: "d0", ev: review({ action: "synchronize" }) });
   await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review pause") });
   await drain(obj);
@@ -922,7 +926,7 @@ test("providers that failed a job are skipped on its later tries and by the capa
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
   const asked = [];
-  const obj = new PrState({ storage }, {}, { now: () => t, effects: fx, capacity: async (chars, skip) => { asked.push(skip); return { ok: true }; } });
+  const obj = new PrState({ storage }, RUNNER, { now: () => t, effects: fx, capacity: async (chars, skip) => { asked.push(skip); return { ok: true }; } });
   const out = await obj.onEvent({ delivery: "d1", ev: review() });
   await drain(obj);
   await obj.claim({ jobId: out.jobId, runId: "1" });
@@ -955,4 +959,15 @@ test("capacity check before dispatch: a drafter is not enough, a verifier must b
   assert.deepEqual(await obj.capacityNow(10_000), { ok: false, retryAt: NOW + 2 * 3600_000 });
   const off = new PrState({ storage: memoryStorage() }, { ...env, VERIFY: "off" }, { now: () => NOW, effects: fakeEffects() });
   assert.equal((await off.capacityNow(10_000)).ok, true);
+});
+
+test("a runner's complete message cannot claim full coverage", async () => {
+  const { obj, storage } = make();
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  await obj.claim({ jobId: out.jobId, runId: "9" });
+  const res = await obj.fetch(new Request("https://pr-state/", { method: "POST", body: JSON.stringify({ op: "complete", jobId: out.jobId, runId: "9", reviewedSha: "e".repeat(40), fullCoverage: true }) }));
+  assert.deepEqual(await res.json(), { ok: true });
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, "e".repeat(40));
+  assert.equal(st.lastCompleteReviewed, undefined);
 });

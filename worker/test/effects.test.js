@@ -109,3 +109,54 @@ test("postReview's fallback keeps a hostile path inside its code span", async ()
   assert.equal((line.match(/`/g) || []).length, 2);
   assert.doesNotMatch(line, /@[a-z]|<[a-z]/);
 });
+
+// --- the Worker's own review (review-run.js) --------------------------------
+
+const err = (status) => Object.assign(new Error(`GitHub ${status}`), { status });
+
+test("the review's reads use a read-only token for the one repository, and nothing else", async () => {
+  const app = fakeApp((m, path) => (path.includes("/contents/") ? { type: "file", sha: "f".repeat(40) } : path.includes("/git/blobs/") ? { content: btoa("hi\n"), size: 3 } : []));
+  const fx = createEffects({}, { app });
+  await fx.pullRequest("TanksterAI/x", 7);
+  await fx.listFiles("TanksterAI/x", 7, 2);
+  await fx.compare("TanksterAI/x", "a".repeat(40), "b".repeat(40));
+  const blob = await fx.blob("TanksterAI/x", "c".repeat(40));
+  assert.equal(new TextDecoder().decode(blob.bytes), "hi\n");
+  assert.equal(await fx.fileSha("TanksterAI/x", "dir/a b.js", "d".repeat(40)), "f".repeat(40));
+  assert.ok(app.log.tokens.every((t) => t.repos.join() === "x" && JSON.stringify(t.permissions) === JSON.stringify({ contents: "read", pull_requests: "read" })));
+  assert.deepEqual(app.log.calls.map((c) => [c.method, c.path]), [
+    ["GET", "/repos/TanksterAI/x/pulls/7"],
+    ["GET", "/repos/TanksterAI/x/pulls/7/files?per_page=100&page=2"],
+    ["GET", `/repos/TanksterAI/x/compare/${"a".repeat(40)}...${"b".repeat(40)}?per_page=100`],
+    ["GET", `/repos/TanksterAI/x/git/blobs/${"c".repeat(40)}`],
+    ["GET", `/repos/TanksterAI/x/contents/dir/a%20b.js?ref=${"d".repeat(40)}`],
+  ]);
+});
+
+test("reads refuse anything but commit ids, and a missing file or blob is null, not an error", async () => {
+  const fx = createEffects({}, { app: fakeApp(() => err(404)) });
+  await assert.rejects(fx.compare("TanksterAI/x", "main", "b".repeat(40)));
+  await assert.rejects(fx.blob("TanksterAI/x", "../x"));
+  await assert.rejects(fx.fileSha("TanksterAI/x", "a.js", "HEAD"));
+  assert.equal(await fx.blob("TanksterAI/x", "c".repeat(40)), null);
+  assert.equal(await fx.fileSha("TanksterAI/x", "a.js", "d".repeat(40)), null);
+  // A directory at that path is not a file.
+  assert.equal(await createEffects({}, { app: fakeApp(() => [{ type: "file" }]) }).fileSha("TanksterAI/x", "src", "d".repeat(40)), null);
+  await assert.rejects(createEffects({}, { app: fakeApp(() => err(500)) }).blob("TanksterAI/x", "c".repeat(40)));
+});
+
+test("the commit status: a statuses:write token, the fixed context, a bounded description; false without the permission", async () => {
+  const app = fakeApp(() => ({}));
+  const fx = createEffects({}, { app });
+  assert.equal(await fx.setStatus("TanksterAI/x", "e".repeat(40), "success", "x".repeat(300)), true);
+  assert.deepEqual(app.log.tokens.at(-1).permissions, { statuses: "write" });
+  const c = app.log.calls.at(-1);
+  assert.equal(c.path, `/repos/TanksterAI/x/statuses/${"e".repeat(40)}`);
+  assert.equal(c.body.context, "Tankster AI Review");
+  assert.equal(c.body.description.length, 140);
+  // The App without statuses:write: GitHub refuses the token.
+  const denied = { ...fakeApp(), async installationToken() { throw err(422); } };
+  assert.equal(await createEffects({}, { app: denied }).setStatus("TanksterAI/x", "e".repeat(40), "pending", "d"), false);
+  assert.equal(await fx.setStatus("TanksterAI/x", "not-a-sha", "pending", "d"), false);
+  await assert.rejects(fx.setStatus("Other/x", "e".repeat(40), "pending", "d"));
+});
