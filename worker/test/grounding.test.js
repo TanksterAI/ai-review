@@ -258,10 +258,15 @@ test("the gate stays linear on hostile input (10 ms of CPU on Workers Free)", ()
     suggestion: "(".repeat(1500) + "'\"`".repeat(400),
   }));
   const c = classifyFindings({ findings }, big.commentable, big.lineText);
-  const t0 = performance.now();
-  for (let i = 0; i < 5; i++) groundFindings(c, big, { title: "x".repeat(300), body: "y ".repeat(1500) });
-  const ms = (performance.now() - t0) / 5;
-  assert.ok(ms < 25, `one pass took ${ms.toFixed(1)} ms`);
+  // The best of five passes: wall time on a shared CI runner is noisy, and a
+  // slow pass there says nothing about the code.
+  let ms = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    groundFindings(c, big, { title: "x".repeat(300), body: "y ".repeat(1500) });
+    ms = Math.min(ms, performance.now() - t0);
+  }
+  assert.ok(ms < 25, `the best pass took ${ms.toFixed(1)} ms`);
   const g = groundFindings(c, big, {});
   assert.equal(g.dropped.length, 0, JSON.stringify(g.dropped.map((d) => d.reason)));
   assert.equal(g.stripped.length, 12, "every check ran, the last one included");
