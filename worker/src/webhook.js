@@ -15,7 +15,9 @@ export function mentionOf(slug = DEFAULT_SLUG) {
 }
 export const MENTION = mentionOf();
 
-const REVIEW_ACTIONS = new Set(["opened", "reopened", "ready_for_review", "synchronize"]);
+// converted_to_draft arrives with draft: true, so it only stops a push from
+// being reviewed.
+const REVIEW_ACTIONS = new Set(["opened", "reopened", "ready_for_review", "synchronize", "converted_to_draft"]);
 const WRITERS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 function hexToBytes(hex) {

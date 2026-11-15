@@ -11,13 +11,15 @@ const SECRET = "whsec";
 const RUNNER = "TanksterAI/ai-review/.github/workflows/runner.yml";
 const signer = await makeSigner();
 
-function namespace(fx) {
+// clock.t: the PR objects' time, moved forward by tests that wait out a
+// push's quiet period.
+function namespace(fx, clock) {
   const objects = new Map();
   return {
     objects,
     idFromName: (n) => n,
     get(name) {
-      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage() }, {}, { now: () => NOW_MS, effects: fx }));
+      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage() }, {}, { now: () => clock.t, effects: fx }));
       const obj = objects.get(name);
       return { fetch: (url, init) => obj.fetch(new Request(url, init)) };
     },
@@ -26,8 +28,10 @@ function namespace(fx) {
 
 function env(over = {}) {
   const fx = fakeEffects({ writers: ["rishitank"] });
+  const clock = { t: NOW_MS };
   return {
     fx,
+    clock,
     AUDIENCE,
     OWNER_ID,
     WORKFLOW_REFS: "TanksterAI/ai-review/.github/workflows/review.yml@refs/heads/main",
@@ -38,7 +42,7 @@ function env(over = {}) {
     GITHUB_APP_ID: "1",
     GITHUB_APP_PRIVATE_KEY: "unused-in-tests",
     LEDGER: memoryKv(),
-    PR_STATE: namespace(fx),
+    PR_STATE: namespace(fx, clock),
     AI: { async run() { return responsesResult(JSON.stringify({ summary: "Adds y.", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." }] })); } },
     ...over,
   };
@@ -133,6 +137,9 @@ test("webhook to runner to review: the whole path", async () => {
   const post = e.fx.calls.find((c) => c[0] === "postReview");
   assert.equal(post[1], "TanksterAI/browser-relay");
   assert.equal(post[3].commitId, "a".repeat(40));
+  // The footer names the App's own commands, not v1's label and workflow.
+  assert.match(post[3].body, /comment `@tankster-ai-review review` for the commits since this review/);
+  assert.doesNotMatch(post[3].body, /ai-review` label/);
   // The repository reviewed is the job's, not the runner's own.
   assert.ok(e.LEDGER.map.has(`done:TanksterAI/browser-relay#39@${"a".repeat(40)}`));
 
@@ -141,6 +148,11 @@ test("webhook to runner to review: the whole path", async () => {
   assert.equal(again.status, 403);
   await handleWebhook(hook(prBody("synchronize")), e);
   const obj = e.PR_STATE.objects.get("TanksterAI/browser-relay#39");
+  // The push is reviewed once its quiet period (3 minutes) is over.
+  await obj.alarm();
+  assert.equal(e.fx.calls.filter((c) => c[0] === "dispatch").length, 1, "not before the quiet period");
+  e.clock.t += 180_000;
+  await obj.alarm();
   await obj.alarm();
   const next = e.fx.calls.filter((c) => c[0] === "dispatch")[1][1];
   const s2 = await (await handleRunnerSession(await runnerReq("/v1/runner/session", { job: next }, { run_id: "7000" }), e, deps(e))).json();
@@ -178,6 +190,8 @@ test("incremental: findings off the PR's own diff move to the body", async () =>
   const files = [{ filename: "src/a.js", status: "modified", patch: PATCH }];
   await handleRunnerReview(await runnerReq("/v1/runner/review", { job: first, head_sha: "a".repeat(40), files }), e, deps(e));
   await handleWebhook(hook(prBody("synchronize")), e);
+  e.clock.t += 180_000;
+  await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
   await e.PR_STATE.objects.get("TanksterAI/browser-relay#39").alarm();
   const next = e.fx.calls.filter((c) => c[0] === "dispatch")[1][1];
   // The PR's own diff no longer has line 3 of src/a.js (a later commit undid it).

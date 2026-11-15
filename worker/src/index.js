@@ -25,7 +25,7 @@
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
 import { buildPrompt, classifyFindings, extractText, parseAnswer, prepareFiles, renderReview } from "./review.js";
 import { createLedger, estimateNeurons, neuronsFor, utcDay } from "./budget.js";
-import { normalise, prKey, verifySignature } from "./webhook.js";
+import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { prKeyOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
@@ -148,7 +148,9 @@ export async function handleReview(request, env, deps = {}) {
 
 // The review itself, shared by the v1 endpoint (/v1/review) and the App's
 // runner endpoint. Returns {status, body}; callers turn it into a Response.
-export async function runReview({ cfg, env, repository, pr, headSha, input, now, sleep }) {
+// again: the review's "Review again" line, set by the Worker (never taken from
+// a request body); without it the v1 line is used.
+export async function runReview({ cfg, env, repository, pr, headSha, input, now, sleep, again }) {
   const res = (status, body) => ({ status, body });
   const ledger = createLedger(env.LEDGER, now);
   const doneKey = `done:${repository}#${pr}@${headSha}`;
@@ -242,7 +244,7 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
     return res(502, { status: "failed", reason });
   }
   const classified = classifyFindings(answer, prepared.commentable);
-  const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap } });
+  const review = renderReview({ answer, classified, prepared, meta: { model: cfg.model, neurons, spent, cap: cfg.cap, again } });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
     ev: "reviewed",
@@ -357,8 +359,10 @@ export async function handleRunnerReview(request, env, deps = {}) {
   const since = job.since && body.since === job.since ? job.since : null;
   // A re-run of the runner (say, after the review failed to post) reviews again.
   const force = Boolean(job.requestedBy) || Number(claims.run_attempt) > 1;
+  const slug = (await appConfig(env))?.slug ?? DEFAULT_SLUG;
+  const again = `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`;
   const input = { title: body.title, body: body.body, files: body.files, force };
-  const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep });
+  const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep, again });
   const finish = () => askPr(env, key, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
 
   if (out.status === 200 && out.body.status === "reviewed") {

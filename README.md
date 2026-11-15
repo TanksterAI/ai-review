@@ -57,6 +57,21 @@ GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Obj
                     model, then posts as tankster-ai-review[bot]
 ```
 
+- **When it reviews** (as CodeRabbit does):
+  - **Opened, reopened, or marked ready for review:** at once. That covers the whole PR the first time, and the commits since the last review after that. Drafts wait until they are marked ready, and converting a PR to a draft drops a push that is still waiting.
+  - **New commits:** incrementally, covering the commits since the last review.
+    - Each push starts a quiet period, and the review begins 3 minutes after the last push. A steady stream of pushes is still reviewed 15 minutes after the first push it covers.
+    - `REVIEW_DEBOUNCE_S` (default 180) and `REVIEW_DEBOUNCE_MAX_S` (default 900) set the two times.
+    - The starting point is the last review that had finished when the runner took the job. A review still running at that moment can therefore overlap with the next one.
+    - When reviews overlap, the one taken later counts as the last review, whichever finishes first.
+    - A push counts as covered once a review finishes whose run took its job after the push, because the runner reads the latest commit when it starts. The push waits instead of making another job while a job is still on its way:
+      - its dispatch is queued;
+      - or its dispatch went out within the last 15 minutes;
+      - or a run took it after the push, within the last 15 minutes, and has not finished.
+
+      If that window ends without such a review, the runner or its run is presumed lost, and the push gets its own review. Waiting pushes are checked again no more often than every 30 seconds. A dispatch that fails five times is dropped together with its job.
+  - **On request:** `@tankster-ai-review review` (the commits since the last review) or `full review` (the whole PR), at once. Either one covers a push that is still waiting.
+  - **Not while** the PR is paused (`pause`) or closed. Closing drops the PR's jobs and their waiting dispatches.
 - **Who decides what.**
   - The PR's Durable Object decides what happens. Each job it mints is single-use and names its own repository, PR and commits.
   - The runner proves who it is with its OIDC token. Only `runner.yml` on `main` is accepted.
@@ -111,7 +126,7 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
 | Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) |
 | Secrets | None needed. Optional: `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
 `GET /healthz` shows the model and today's spend.

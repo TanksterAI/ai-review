@@ -13,6 +13,20 @@ import { createEffects } from "./effects.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
+// New commits are reviewed incrementally once the pushes stop, as CodeRabbit
+// does: the review starts DEBOUNCE_S after the last push, and at most
+// DEBOUNCE_MAX_S after the first push it covers, so a steady stream of pushes
+// is still reviewed. One review per burst also spares the light lane and the
+// daily neuron cap. REVIEW_DEBOUNCE_S and REVIEW_DEBOUNCE_MAX_S override them.
+const DEBOUNCE_S = 180;
+const DEBOUNCE_MAX_S = 900;
+// A push waiting on a job already on its way is looked at again no sooner
+// than this, whatever REVIEW_DEBOUNCE_S says (0 would otherwise spin).
+const RECHECK_MS = 30_000;
+
+function seconds(v, fallback) {
+  return /^\d+(\.\d+)?$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : fallback;
+}
 const COMMANDS = ["full review", "review", "pause", "resume", "help"];
 
 export function helpText(slug = DEFAULT_SLUG) {
@@ -80,6 +94,8 @@ export class PrState {
     this.now = deps.now ?? (() => Date.now());
     // {dispatch(jobId), comment(repoFull, pr, body), canWrite(repoFull, login)}
     this.effects = deps.effects ?? null;
+    this.debounceMs = seconds(env?.REVIEW_DEBOUNCE_S, DEBOUNCE_S) * 1000;
+    this.debounceMaxMs = Math.max(this.debounceMs, seconds(env?.REVIEW_DEBOUNCE_MAX_S, DEBOUNCE_MAX_S) * 1000);
   }
 
   async state() {
@@ -134,6 +150,82 @@ export class PrState {
     await this.ctx.storage.setAlarm(this.now());
   }
 
+  // The DO has one alarm: moved earlier, never later (the alarm re-arms itself
+  // for whatever is still due when it runs).
+  async armAt(t) {
+    const cur = await this.ctx.storage.getAlarm();
+    if (cur === null || cur === undefined || cur > t) await this.ctx.storage.setAlarm(t);
+  }
+
+  // A push: (re)start the quiet period before the incremental review.
+  async debounce() {
+    const now = this.now();
+    const d = (await this.ctx.storage.get("debounce")) ?? { first: now };
+    // A burst already past its cap (it waited on a job) starts afresh, so this
+    // push still gets its quiet period.
+    if (now >= d.first + this.debounceMaxMs) d.first = now;
+    d.last = now;
+    d.due = Math.min(now + this.debounceMs, d.first + this.debounceMaxMs);
+    await this.ctx.storage.put("debounce", d);
+    await this.armAt(d.due);
+    return d.due;
+  }
+
+  // From the alarm: once the quiet period is over, the incremental review.
+  async fireDebounce() {
+    const d = await this.ctx.storage.get("debounce");
+    if (!d || d.due > this.now()) return;
+    // A review asked for, or an opening one, still waiting in the outbox
+    // covers this push, and drops it when it runs.
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    if (box.some((x) => (x.type === "command" && (x.cmd === "review" || x.cmd === "full review")) || (x.type === "author_check" && x.opening))) return;
+    const st = await this.state();
+    const key = await this.ctx.storage.get("key");
+    if (st.paused || st.closed || st.draft || !key) {
+      await this.ctx.storage.delete("debounce");
+      return;
+    }
+    const last = d.last ?? d.first;
+    // A review that finished, from a run that claimed its job after the last
+    // push, read the head after it: the push is covered.
+    if ((st.lastDoneClaimAt ?? -Infinity) > last) {
+      await this.ctx.storage.delete("debounce");
+      return;
+    }
+    // A job that will read the head after the push is on its way when its
+    // dispatch is queued, or went out less than DEBOUNCE_MAX_S ago, or a run
+    // claimed it after the push less than DEBOUNCE_MAX_S ago and has not
+    // finished. The push waits for it rather than minting another job, and is
+    // looked at again (never sooner than RECHECK_MS): covered once that review
+    // finishes, or reviewed on its own once the window is over (the runner,
+    // or its run, presumed lost).
+    const now = this.now();
+    const recheck = now + Math.max(this.debounceMs, RECHECK_MS);
+    const jobs = await this.ctx.storage.list({ prefix: "job:" });
+    const queued = new Set(box.map((x) => x.jobId).filter(Boolean));
+    let next = Infinity;
+    for (const j of jobs.values()) {
+      if (now - j.createdAt > JOB_TTL_MS) continue;
+      if (j.claimedBy) {
+        if (j.claimedAt !== undefined && j.claimedAt > last && now - j.claimedAt < this.debounceMaxMs) {
+          next = Math.min(next, recheck, j.claimedAt + this.debounceMaxMs);
+        }
+      } else if (queued.has(j.id)) {
+        next = Math.min(next, recheck);
+      } else if (j.dispatchedAt !== undefined && now - j.dispatchedAt < this.debounceMaxMs) {
+        next = Math.min(next, recheck, j.dispatchedAt + this.debounceMaxMs);
+      }
+    }
+    if (next !== Infinity) {
+      d.due = next;
+      await this.ctx.storage.put("debounce", d);
+      await this.armAt(next);
+      return;
+    }
+    await this.ctx.storage.delete("debounce");
+    await this.newJob({ repo: { full: key.repo, name: String(key.repo).split("/")[1] }, pr: key.pr }, st);
+  }
+
   async newJob(ev, st, { full = false, requestedBy = null, queue = true } = {}) {
     // Drop jobs that can no longer be claimed, so they never pile up.
     const old = await this.ctx.storage.list({ prefix: "job:" });
@@ -144,6 +236,7 @@ export class PrState {
       repo: { full: ev.repo.full, name: ev.repo.name },
       pr: ev.pr,
       scope: "review",
+      full,
       since: full ? null : st.lastReviewed,
       requestedBy,
       createdAt: this.now(),
@@ -162,13 +255,22 @@ export class PrState {
     if (ev.kind === "closed") {
       st.closed = true;
       await this.ctx.storage.put("state", st);
+      await this.ctx.storage.delete("debounce");
       await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
+      // Their dispatches would only start runners the Worker then refuses.
+      const box = (await this.ctx.storage.get("outbox")) ?? [];
+      await this.ctx.storage.put("outbox", box.filter((x) => x.type !== "dispatch"));
       return { action: "closed" };
     }
 
     if (ev.kind === "review") {
       st.closed = false;
-      if (ev.draft) return this.save(st, { action: "draft" });
+      st.draft = Boolean(ev.draft);
+      if (ev.draft) {
+        // Converted to a draft, or a push to one: nothing waits for it.
+        await this.ctx.storage.delete("debounce");
+        return this.save(st, { action: "draft" });
+      }
       if (st.paused) return this.save(st, { action: "paused" });
       const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
       // Bots wait for a writer, silently. Forks wait for a writer, with a note.
@@ -187,6 +289,13 @@ export class PrState {
         await this.outbox({ type: "author_check", login: ev.author.login, repo: ev.repo, pr: ev.pr, opening });
         return { action: "author_check" };
       }
+      // Opened, reopened or marked ready: reviewed now. A push: reviewed
+      // incrementally once the pushes stop.
+      if (!opening) {
+        await this.ctx.storage.put("state", st);
+        return { action: "debounced", due: await this.debounce() };
+      }
+      await this.ctx.storage.delete("debounce");
       const job = await this.newJob(ev, st);
       return this.save(st, { action: "job", jobId: job.id });
     }
@@ -219,20 +328,30 @@ export class PrState {
   // throw); after MAX_ATTEMPTS it is dropped. A repeated dispatch is harmless:
   // a job can be claimed by one run only.
   async alarm() {
+    // A quiet period that is over becomes a job (and a dispatch in the outbox).
+    await this.fireDebounce();
     const box = (await this.ctx.storage.get("outbox")) ?? [];
-    if (!box.length) return;
-    const [item, ...rest] = box;
-    if (item.attempts >= MAX_ATTEMPTS) {
-      console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
-      await this.ctx.storage.put("outbox", rest);
-    } else {
-      item.attempts += 1;
-      await this.ctx.storage.put("outbox", [item, ...rest]);
-      await this.perform(item);
-      const now = (await this.ctx.storage.get("outbox")) ?? [];
-      await this.ctx.storage.put("outbox", now.filter((x) => x.id !== item.id));
+    if (box.length) {
+      const [item, ...rest] = box;
+      if (item.attempts >= MAX_ATTEMPTS) {
+        console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
+        await this.ctx.storage.put("outbox", rest);
+        // Its job would never get a runner: it must not stand in for later pushes.
+        if (item.jobId) await this.ctx.storage.delete(`job:${item.jobId}`);
+      } else {
+        item.attempts += 1;
+        await this.ctx.storage.put("outbox", [item, ...rest]);
+        await this.perform(item);
+        const now = (await this.ctx.storage.get("outbox")) ?? [];
+        await this.ctx.storage.put("outbox", now.filter((x) => x.id !== item.id));
+      }
     }
-    if (((await this.ctx.storage.get("outbox")) ?? []).length) await this.ctx.storage.setAlarm(this.now());
+    if (((await this.ctx.storage.get("outbox")) ?? []).length) {
+      await this.ctx.storage.setAlarm(this.now());
+    } else {
+      const d = await this.ctx.storage.get("debounce");
+      if (d) await this.ctx.storage.setAlarm(d.due);
+    }
   }
 
   // One job per outbox item, kept on the item so a retried alarm dispatches
@@ -244,6 +363,17 @@ export class PrState {
     await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
   }
 
+  // Starts the runner for a job that still exists (closing a PR deletes its
+  // jobs), and records when, so a push can tell a job on its way from one
+  // whose runner never came.
+  async dispatchJob(fx, jobId) {
+    if (!(await this.ctx.storage.get(`job:${jobId}`))) return undefined;
+    await fx.dispatch(jobId);
+    const job = await this.ctx.storage.get(`job:${jobId}`);
+    if (job) await this.ctx.storage.put(`job:${jobId}`, { ...job, dispatchedAt: this.now() });
+    return undefined;
+  }
+
   async perform(item) {
     // No App configured yet: throw, so the item is kept and retried.
     const cfg = this.effects ? null : await appConfig(this.env);
@@ -251,7 +381,7 @@ export class PrState {
     // Replies name the App by its own slug, so mentions people copy work.
     const slug = item.slug ?? cfg?.slug ?? DEFAULT_SLUG;
     const key = await this.ctx.storage.get("key");
-    if (item.type === "dispatch") return fx.dispatch(item.jobId);
+    if (item.type === "dispatch") return this.dispatchJob(fx, item.jobId);
     if (item.type === "comment") {
       if (!key) return undefined;
       // Re-checked here: several may have been queued before the first posted.
@@ -264,9 +394,15 @@ export class PrState {
     if (item.type === "author_check") {
       const st = await this.state();
       if (await fx.canWrite(item.repo.full, item.login)) {
-        if (st.paused) return undefined;
+        if (st.paused || st.closed) return undefined;
+        // A push waits for the quiet period, as a writer's own push does.
+        if (!item.opening) {
+          await this.debounce();
+          return undefined;
+        }
+        await this.ctx.storage.delete("debounce");
         await this.keepJobOnItem(item, st, {});
-        return fx.dispatch(item.jobId);
+        return this.dispatchJob(fx, item.jobId);
       }
       if (item.opening && (await this.mayReply(item.login, "note"))) {
         await fx.comment(item.repo.full, item.pr, needsApproval(slug));
@@ -294,9 +430,10 @@ export class PrState {
         await this.ctx.storage.put("state", st);
         return fx.comment(item.repo.full, item.pr, `Automatic reviews are back on. I'll review the next push, or comment \`@${slug} review\` now.`);
       }
-      // review / full review
+      // review / full review: now, and it covers any push still waiting.
+      await this.ctx.storage.delete("debounce");
       await this.keepJobOnItem(item, st, { full: item.cmd === "full review", requestedBy: item.login });
-      return fx.dispatch(item.jobId);
+      return this.dispatchJob(fx, item.jobId);
     }
     return undefined;
   }
@@ -311,6 +448,11 @@ export class PrState {
       return { error: "job expired" };
     }
     if (job.claimedBy && job.claimedBy !== String(runId)) return { error: "job already claimed" };
+    // An incremental job starts from the last review finished by the time it
+    // is claimed, not when it was made: a review that completed in between is
+    // not reviewed twice.
+    if (!job.claimedBy && job.full === false) job.since = (await this.state()).lastReviewed;
+    if (!job.claimedBy) job.claimedAt = this.now();
     job.claimedBy = String(runId);
     await this.ctx.storage.put(`job:${jobId}`, job);
     return { job };
@@ -320,7 +462,17 @@ export class PrState {
     const job = await this.ctx.storage.get(`job:${jobId}`);
     if (!job || job.claimedBy !== String(runId)) return { error: "not your job" };
     const st = await this.state();
-    if (/^[0-9a-f]{40}$/.test(String(reviewedSha))) st.lastReviewed = reviewedSha;
+    // Two reviews can overlap. The one claimed later almost always read the
+    // newer head (each run reads the head just after its claim), so one that
+    // finishes after it never moves lastReviewed back. If two runs read the
+    // head in the other order, a few commits are reviewed again: harmless.
+    const at = job.claimedAt ?? 0;
+    if (/^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
+      st.lastReviewed = reviewedSha;
+      st.lastClaimedAt = at;
+    }
+    // Pushes made before this run claimed its job are covered (see fireDebounce).
+    if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
     await this.ctx.storage.put("state", st);
     await this.ctx.storage.delete(`job:${jobId}`);
     return { ok: true };
