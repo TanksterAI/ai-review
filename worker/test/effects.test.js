@@ -90,5 +90,20 @@ test("postReview falls back to a body-only review on a 422", async () => {
   assert.equal(out.inline, 0);
   const second = app.log.calls[1].body;
   assert.equal(second.commit_id, undefined);
-  assert.match(second.body, /`a\.js:2`: fix this/);
+  // Each comment's first line only.
+  assert.match(second.body, /`a\.js:2`: fix$/);
+});
+
+test("postReview's fallback keeps a hostile path inside its code span", async () => {
+  let first = true;
+  const app = fakeApp(() => {
+    if (first) { first = false; return Object.assign(new Error("unprocessable"), { status: 422 }); }
+    return {};
+  });
+  await createEffects({}, { app }).postReview("TanksterAI/x", 3, {
+    commitId: "a".repeat(40), body: "B", comments: [{ path: "x`@octocat <img src=//e/t.png>\n# h.js", line: 2, body: "t" }],
+  });
+  const line = app.log.calls[1].body.body.split("\n").find((l) => l.startsWith("- `"));
+  assert.equal((line.match(/`/g) || []).length, 2);
+  assert.doesNotMatch(line, /@[a-z]|<[a-z]/);
 });

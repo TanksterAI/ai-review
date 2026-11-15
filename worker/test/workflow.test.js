@@ -115,7 +115,7 @@ test("a refused position or a moved head falls back to findings in the body", as
   // No commit_id: it posts on the PR as it is now, so a force-push cannot 422 it again.
   assert.equal(h.log.reviews[1].commit_id, undefined);
   assert.match(h.log.reviews[1].body, /Reviewed commit fffffff\./);
-  assert.match(h.log.reviews[1].body, /`a\.js:3`: \*\*Major \(bug\): x\*\* y/);
+  assert.match(h.log.reviews[1].body, /`a\.js:3`: \*\*Major \(bug\): x\*\*$/);
   assert.match(h.log.notices[0], /0 inline comment/);
 
   const noInline = harness({
@@ -215,4 +215,15 @@ test("callers convert dispatch inputs before passing them to review.yml", () => 
     assert.match(pr, /^\$\{\{ fromJSON\(inputs\.pr \|\| '0'\) \}\}$/, rel);
     assert.match(force, /^\$\{\{ fromJSON\(inputs\.force \|\| 'false'\) \}\}$/, rel);
   }
+});
+
+test("the v1 fallback keeps a hostile path inside its code span", async () => {
+  const hostile = { ...reviewed, review: { ...reviewed.review, comments: [{ path: "x`@octocat <img src=//e/t.png>\n# head.js", line: 3, side: "RIGHT", body: "**Major (bug): x**\n\ny" }] } };
+  const h = harness({
+    response: { json: hostile },
+    createReview: (args, n) => { if (n === 1) { const e = new Error("Unprocessable"); e.status = 422; throw e; } return { data: {} }; },
+  });
+  await h.go();
+  const line = h.log.reviews[1].body.split("\n").find((l) => l.startsWith("- `"));
+  assert.equal(line, "- `x'@\u200boctocat <\u200bimg src=//e/t.png>'# head.js:3`: **Major (bug): x**");
 });

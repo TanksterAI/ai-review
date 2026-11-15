@@ -26,7 +26,27 @@ pull request opened ─▶ caller workflow (each repo)
 - **Free.** Workers AI gives the Cloudflare account 10,000 neurons a day at no charge. On the Workers Free plan it refuses work past that and never bills. Reviews take at most `DAILY_NEURON_CAP` (6,000) of it, so other Workers that use Workers AI keep room. A typical review costs 300-1,200 neurons, so expect roughly 5-15 reviews a day. Past the cap, or when the account's whole allocation is used, a review is deferred to the next UTC day: the job warns and stays green. If Workers AI is out of capacity the Worker tries once more after 3 seconds, then the job warns.
 - **Secretless.** The Worker holds no GitHub credential and the workflow holds no Cloudflare one. GitHub's per-job OIDC token is the only authentication, so there is nothing to create, store, rotate or leak. The Worker's address is fixed in `review.yml`, so the token goes nowhere else. Each token is good for one review, and only `review.yml` at the `v1` tag or `main` is trusted: a branch or an arbitrary commit of it is refused. The trust boundary is therefore write access to this repository: GitHub Free cannot enforce rulesets on a private repository, so anyone who can move `v1` or push to `main` decides what the Worker trusts. Keep that list to the owner and his agents.
 - **Lean on CI.** The job runs on the light lane (Cloud Run, no Docker) and makes a few HTTPS calls. It uses no Actions minutes from the hosted pool and no Cloud Build minutes.
-- **Safe with untrusted input.** The diff, title, description and the names of skipped files are fenced as data in the prompt. Model output is sanitised and can only become comments on this pull request. Its prose has no @mentions, no HTML tags or comments, no images and no links (inline, reference or bare URLs), and its length is bounded. Code spans and fenced blocks are left exactly as written, since GitHub renders nothing inside them, so code copied from a finding is what the model wrote. The model has no tools. The Worker logs ids, counts and timings only, never code or model output.
+- **What a finding looks like** (CodeRabbit's format):
+  - **Labels.** A severity (critical, major, minor, trivial or info), a type (potential issue, nitpick or refactor suggestion) and a category.
+  - **A stable id.** Built from the file, the category and the title, so it stays the same when the code moves, as long as the title doesn't change. Ids are unique within a review, with a suffix such as `-2` for a repeat.
+  - **One-click fix.** When the fix is local and certain, a committable `suggestion` block. It is kept only if all of these hold:
+    - every line it replaces is on the new side of the diff the model was shown, so GitHub can commit it;
+    - it spans at most 40 lines and 3,000 characters;
+    - it changes something, and isn't empty (an empty suggestion would delete the lines);
+    - the file doesn't use CRLF line endings.
+
+    In an incremental review whose range has partly left the PR's diff, the comment stays on its line without the suggestion. A suggestion over several lines is a multi-line comment on that range.
+  - **A "Prompt for AI agents" block.** It tells a coding agent exactly what to change and where.
+  - **A machine-readable copy.** The review body's second line is an HTML comment, `<!-- tankster-ai-review:findings {...} -->`, holding every finding as JSON: id, place, labels, prompt, and each suggestion with the original lines it replaces. Agents and later commands (apply, resolve, track) read it from there, and the original lines let an apply refuse code that has moved on. The JSON escapes `<` and `>`, so nothing in it can close the comment.
+
+  Check a suggestion before committing it, as with any change. The next review covers whatever it changed.
+- **Safe with untrusted input.** The diff, title, description and the names of skipped files are fenced as data in the prompt. Model output is sanitised and can only become comments on this pull request. Its text has no @mentions, no issue references, no HTML tags or comments, no images, no links (inline, reference definitions in any container, or bare URLs) and no `suggestion` fences of its own, and its length is bounded.
+  - **Code too.** This holds inside code spans and fences as well. Whether GitHub treats a backtick run as code depends on CommonMark's container blocks: a blockquote or list item ends a fence early, and a table splits a code span at `|`. Text taken for code could therefore render as prose.
+  - **What that costs.** Inside real code the zero-width space added is invisible, but it is copied with the code.
+  - **Where exact code goes.** Code meant to be copied goes in a suggestion block. The Worker writes that fence itself, longer than any run of backticks in the code, so it cannot be closed early. Agent prompts are fenced the same way.
+  - **Comment layout.** An inline comment shows the one-line title and the finding id first, then the suggestion and the agent prompt, and the model's explanation last. A fence the explanation leaves open can therefore never take in the Worker's verbatim blocks. Character references (`&#...;`, `&name;`) are defused too, so none can spell a `suggestion` info string.
+  - **Nothing can forge the findings.** The findings JSON sits on the line straight after the marker, before any model text, and only that line is read back.
+  - **No tools, no content in logs.** The model has no tools. The Worker logs ids, counts and timings only, never code or model output.
 
 ## Using it in a repository
 
@@ -147,7 +167,11 @@ Deploy only what is on `main`.
 - **Light runner.** It cannot start a Node binary downloaded by `actions/setup-node` (its image has no `libatomic.so.1`), so this repository's CI runs the tests on the Node 24 that the runner ships for JavaScript actions. The review job is a JavaScript action and is unaffected.
 - **CPU.** Workers Free allows 10 ms of CPU per request. The workflow therefore sends at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it.
 - **Budget accuracy.** The ledger is in KV, which is eventually consistent and not atomic. Reviews that run at the same moment can each miss the others' spend, so a burst can overshoot the cap by several reviews. The check reserves each review's whole output allowance, which absorbs some of that. Past the cap, Cloudflare's own 10,000-neuron limit stops everything, never bills, and becomes a deferral. Replay protection is also only as strong as KV: a simultaneous replay is not stopped, but the cap bounds what it can cost.
-- **Model output.** Reasoning counts as output. If an answer is cut short, the Worker tries once more with low reasoning effort, when the budget allows. An answer that still cannot be parsed fails the job with a reason, and the neurons it used are still counted.
+- **Model output.** Reasoning counts as output. If the budget allows, the Worker tries once more, asking for no suggestions, when:
+  - an answer is cut short (with low reasoning effort);
+  - or an answer tried to be JSON but doesn't parse.
+
+  An answer that still cannot be parsed fails the job with a reason, and the neurons it used are still counted.
 
 ## Tests
 

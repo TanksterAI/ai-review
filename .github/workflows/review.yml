@@ -179,8 +179,12 @@ jobs:
               // GitHub refused a comment position, or the reviewed commit left the
               // PR (a force-push during the review). Keep every finding, in the
               // body, on the PR as it is now, and say which commit was reviewed.
+              // Each comment's first line only (labels and title): suggestion
+              // and prompt blocks do not flatten, and the body has a size limit.
+              // The path is the PR author's: no backtick or line break may leave
+              // its code span (the Worker's sanitiser is not available here).
               const listed = comments
-                .map((c) => `- \`${c.path}:${c.line}\`: ${c.body.replace(/\n+/g, " ")}`)
+                .map((c) => `- \`${String(c.path).replace(/[`\r\n]/g, "'").replace(/@/g, "@\u200b").replace(/</g, "<\u200b").slice(0, 200)}:${c.line}\`: ${c.body.split("\n")[0].slice(0, 300)}`)
                 .join("\n");
               const parts = [body, `Reviewed commit ${pr.head.sha.slice(0, 7)}.`];
               if (listed) parts.push(`#### Findings (GitHub would not place them inline)\n\n${listed}`);
