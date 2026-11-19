@@ -847,6 +847,33 @@ test("a job queued before job ids became opaque is re-issued, not lost, when it 
   assert.ok(!(await storage.get("outbox") ?? []).some((x) => x.jobId === old));
 });
 
+test("re-issuing an old job writes the new job and its queue entry together, so a crash loses nothing", async () => {
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  let cap = { ok: false, retryAt: NOW + 3600_000 };
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => NOW, effects: fx, capacity: async () => cap });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  const old = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"c".repeat(32)}`;
+  const job = await storage.get(`job:${out.jobId}`);
+  await storage.delete(`job:${out.jobId}`);
+  await storage.put(`job:${old}`, { ...job, id: old });
+  await storage.put("outbox", (await storage.get("outbox")).map((x) => (x.jobId === out.jobId ? { ...x, jobId: old } : x)));
+  // The object dies right after the re-issue's first write.
+  const put = storage.put;
+  const reissue = obj.reissue.bind(obj);
+  let inside = false;
+  let writes = 0;
+  obj.reissue = async (...a) => { inside = true; try { return await reissue(...a); } finally { inside = false; } };
+  storage.put = async (...a) => { await put(...a); if (inside && ++writes === 1) throw new Error("evicted"); };
+  await obj.alarm().catch(() => {});
+  storage.put = put;
+  assert.equal(writes, 1, "the crash happened inside the re-issue");
+  const queued = (await storage.get("outbox")).map((x) => x.jobId);
+  assert.equal(queued.length, 1);
+  assert.ok(objectOfJob(queued[0]), "the queue already names the new id");
+  assert.ok(await storage.get(`job:${queued[0]}`), "and the new job exists");
+});
+
 test("an old job held for capacity keeps its place in the queue under its new id", async () => {
   let t = NOW;
   let cap = { ok: false, retryAt: NOW + 3600_000 };

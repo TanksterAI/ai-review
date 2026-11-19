@@ -482,13 +482,18 @@ export class PrState {
     return undefined;
   }
 
-  // The same job under a fresh, opaque id; the queue follows it.
+  // The same job under a fresh, opaque id; the queue follows it. The new job
+  // and the queue are written in one atomic put, so the job cannot be lost;
+  // if the object dies before the old key is deleted, that key is an orphan
+  // nothing points at, swept with the other stale jobs.
   async reissue(jobId, held) {
     const id = jobIdFor(this.ctx.id?.toString());
-    await this.ctx.storage.put(`job:${id}`, { ...held, id });
-    await this.ctx.storage.delete(`job:${jobId}`);
     const box = (await this.ctx.storage.get("outbox")) ?? [];
-    if (box.some((x) => x.jobId === jobId)) await this.ctx.storage.put("outbox", box.map((x) => (x.jobId === jobId ? { ...x, jobId: id } : x)));
+    await this.ctx.storage.put({
+      [`job:${id}`]: { ...held, id },
+      outbox: box.map((x) => (x.jobId === jobId ? { ...x, jobId: id } : x)),
+    });
+    await this.ctx.storage.delete(`job:${jobId}`);
     return id;
   }
 
