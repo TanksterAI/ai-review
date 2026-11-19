@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { PrState, helpText, parseCommand } from "../src/pr-state.js";
 import { MARKER } from "../src/effects.js";
 import { doCtx, memoryStorage } from "./helpers.js";
-import { keepOpenFindings, listOpenFindings } from "../src/review-run.js";
+import { acceptThreads, acceptedSet, keepOpenFindings, listOpenFindings, reopenMark, reopenedSet } from "../src/review-run.js";
 
 const NOW = Date.UTC(2026, 10, 19, 21, 0, 0);
 const repo = { full: "TanksterAI/browser-relay", name: "browser-relay", ownerId: "259206056" };
@@ -196,14 +196,14 @@ test("a thread reopened by hand is remembered, and forgotten only once a writer 
   const m = await make();
   const ev = (action, login = "rishitank") => ({ kind: "thread", action, repo, pr: 39, sender: { login, bot: false }, threadId: "PRRT_9" });
   await m.obj.onEvent({ delivery: "d1", ev: ev("unresolved") });
-  assert.deepEqual(Object.keys(await m.storage.get("reopenedThreads")), ["PRRT_9"]);
+  assert.deepEqual([...(await reopenedSet(m.storage))], ["PRRT_9"]);
   // An outsider's resolve keeps the mark.
   await m.obj.onEvent({ delivery: "d2", ev: ev("resolved", "stranger") });
   await drain(m.obj);
-  assert.deepEqual(Object.keys(await m.storage.get("reopenedThreads")), ["PRRT_9"]);
+  assert.deepEqual([...(await reopenedSet(m.storage))], ["PRRT_9"]);
   await m.obj.onEvent({ delivery: "d3", ev: ev("resolved") });
   await drain(m.obj);
-  assert.deepEqual(await m.storage.get("reopenedThreads"), {});
+  assert.deepEqual([...(await reopenedSet(m.storage))], []);
 
   // A writer resolves, then it is reopened again before that resolve is
   // checked: the newer mark stays.
@@ -211,7 +211,7 @@ test("a thread reopened by hand is remembered, and forgotten only once a writer 
   await m.obj.onEvent({ delivery: "d5", ev: ev("resolved") });
   await m.obj.onEvent({ delivery: "d6", ev: ev("unresolved") });
   await drain(m.obj);
-  assert.deepEqual(Object.keys(await m.storage.get("reopenedThreads")), ["PRRT_9"]);
+  assert.deepEqual([...(await reopenedSet(m.storage))], ["PRRT_9"]);
 });
 
 test("a thread resolved by someone without write access still counts as open", async () => {
@@ -244,12 +244,15 @@ test("resolving that makes no progress is a failed attempt, not a loop", async (
 test("a merged pull request forgets its open findings, reopened threads and summary comment", async () => {
   const m = await make();
   await keepOpenFindings(m.storage, [{ id: "f1" }]);
-  await m.storage.put("reopenedThreads", ["PRRT_1"]);
+  await m.storage.put("reopened:PRRT_1", 1);
+  await acceptThreads(m.storage, ["PRRT_2"]);
   await m.storage.put("summaryComment", 5);
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: true } });
   await m.storage.put("reopenSeq", 3);
   await m.obj.onEvent({ delivery: "d9", ev: { kind: "closed", repo, pr: 39, merged: true } });
-  for (const k of ["reopenedThreads", "summaryComment", "acceptedThreads", "reopenSeq"]) assert.equal(await m.storage.get(k), undefined, k);
+  for (const k of ["summaryComment", "reopenSeq"]) assert.equal(await m.storage.get(k), undefined, k);
+  assert.equal((await reopenedSet(m.storage)).size, 0);
+  assert.equal((await acceptedSet(m.storage)).size, 0);
   assert.deepEqual(await listOpenFindings(m.storage), []);
   const kept = await make();
   await kept.storage.put("summaryComment", 5);
@@ -273,7 +276,7 @@ test("a stranger-resolved thread is cleared by a writer's approve, or once a rev
   assert.equal(approvals(cmd.calls).length, 1);
 
   const acc = await make({ threads: stranger(), writers: ["rishitank"] });
-  await acc.storage.put("acceptedThreads", ["t1"]);
+  await acceptThreads(acc.storage, ["t1"]);
   await decide(acc);
   assert.equal(approvals(acc.calls).length, 1);
 });
@@ -282,9 +285,9 @@ test("a writer's approve vouches for stranger-resolved threads for later decisio
   const m = await make({ threads: [{ id: "t1", resolved: true, resolvedBy: "stranger" }] });
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
   await drain(m.obj);
-  assert.deepEqual(await m.storage.get("acceptedThreads"), ["t1"]);
+  assert.deepEqual([...(await acceptedSet(m.storage))], ["t1"]);
   await m.obj.onEvent({ delivery: "d2", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t1" } });
-  assert.deepEqual(await m.storage.get("acceptedThreads"), []);
+  assert.deepEqual([...(await acceptedSet(m.storage))], []);
 });
 
 test("resolve: a thread GitHub refused keeps the command pending; nothing is cleared or decided until none is open", async () => {
@@ -332,7 +335,7 @@ test("every vouched thread is kept, past 500", async () => {
   const m = await make({ threads });
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
   await drain(m.obj);
-  assert.equal((await m.storage.get("acceptedThreads")).length, 700);
+  assert.equal((await acceptedSet(m.storage)).size, 700);
   // A later ordinary decision counts them all as resolved.
   m.w.decision = null;
   await decide(m);
@@ -362,12 +365,25 @@ test("a heavy item that arrives during a review step waits for the next alarm, i
   assert.equal(approvals(m.calls).length, 1);
 });
 
-test("reopen marks are never evicted while a thread could still be listed", async () => {
+test("reopen marks are never evicted: 2,001 reopens keep every mark until a writer resolves", async () => {
   const m = await make();
-  for (let i = 0; i < 1001; i++) {
+  for (let i = 0; i < 2001; i++) {
     await m.obj.onEvent({ delivery: `d${i}`, ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: `T${i}` } });
   }
-  const marks = await m.storage.get("reopenedThreads");
-  assert.equal(Object.keys(marks).length, 1001);
-  assert.ok("T0" in marks);
+  const marks = await reopenedSet(m.storage);
+  assert.equal(marks.size, 2001);
+  assert.ok(marks.has("T0"), "the oldest mark is kept");
+  assert.equal(await reopenMark(m.storage, "T0"), 1);
+});
+
+test("an accepted thread stays accepted however many others are accepted after it", async () => {
+  const m = await make({ threads: [{ id: "T", resolved: true, resolvedBy: "stranger" }] });
+  await acceptThreads(m.storage, ["T"]);
+  // 1,999 stale ids (threads no longer listed), then a new acceptance.
+  await acceptThreads(m.storage, Array.from({ length: 1999 }, (_, i) => `stale${i}`));
+  await acceptThreads(m.storage, ["U"]);
+  assert.ok((await acceptedSet(m.storage)).has("T"));
+  // A later ordinary decision still counts T as resolved.
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 1);
 });

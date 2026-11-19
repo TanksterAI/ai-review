@@ -91,15 +91,31 @@ export const SUMMARY_KEY = "summaryComment";
 // One key a finding (OPEN_FINDINGS + its id), so none is ever dropped for
 // space: each stays until it is addressed or cleared.
 export const OPEN_FINDINGS = "openfinding:";
-// Threads a person reopened by hand (pr-state.js), {threadId: mark number}:
-// never resolved again by the reviewer; they are that person's to close.
-export const REOPENED = "reopenedThreads";
-// Threads resolved by someone without write access that a later review found
-// fixed: they no longer hold back approval (pr-state.js decide).
-export const ACCEPTED = "acceptedThreads";
-// More than ownThreads can ever list (1,000), so no accepted thread (and no
-// reopen mark, pr-state.js) is ever evicted while it can still matter.
-export const MAX_ACCEPTED = 2000;
+// One key a thread, so no mark or acceptance is ever evicted to make room.
+// A thread a person reopened by hand (pr-state.js) keeps its mark (REOPENED +
+// thread id → mark number) until someone with write access resolves it or the
+// PR merges: the reviewer never resolves it again; it is that person's to close.
+export const REOPENED = "reopened:";
+// A thread resolved by someone without write access that a later review
+// found fixed, or that a writer's resolve/approve vouched for (ACCEPTED +
+// thread id): it no longer holds back approval (pr-state.js decide). It is
+// kept until the thread is reopened or the PR merges.
+export const ACCEPTED = "accepted:";
+export async function reopenMark(storage, threadId) {
+  return threadId ? storage.get(`${REOPENED}${threadId}`) : undefined;
+}
+async function idsUnder(storage, prefix) {
+  return new Set([...(await storage.list({ prefix })).keys()].map((k) => k.slice(prefix.length)));
+}
+export const reopenedSet = (storage) => idsUnder(storage, REOPENED);
+export const acceptedSet = (storage) => idsUnder(storage, ACCEPTED);
+export async function acceptThreads(storage, ids) {
+  for (let i = 0; i < ids.length; i += 128) await storage.put(Object.fromEntries(ids.slice(i, i + 128).map((id) => [`${ACCEPTED}${id}`, true])));
+}
+export async function clearPrefix(storage, prefix) {
+  const keys = [...(await storage.list({ prefix })).keys()];
+  for (let i = 0; i < keys.length; i += 128) await storage.delete(keys.slice(i, i + 128));
+}
 const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
 // GitHub calls one threads step may make (each counts as a subrequest).
@@ -754,8 +770,7 @@ export async function dropOpenFinding(storage, key) {
   await storage.delete(`${OPEN_FINDINGS}${key}`);
 }
 export async function clearOpenFindings(storage) {
-  const keys = [...(await storage.list({ prefix: OPEN_FINDINGS })).keys()];
-  for (let i = 0; i < keys.length; i += 128) await storage.delete(keys.slice(i, i + 128));
+  await clearPrefix(storage, OPEN_FINDINGS);
 }
 
 // --- threads: earlier findings the new commits addressed ------------------------
@@ -784,8 +799,8 @@ async function stageThreads(ctx, run, save) {
   if (!th) {
     const login = ctx.slug ?? DEFAULT_SLUG;
     const threads = await fx.ownThreads(run.repo.full, run.pr, login);
-    const reopened = (await ctx.storage.get(REOPENED)) ?? {};
-    const accepted = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
+    const reopened = await reopenedSet(ctx.storage);
+    const accepted = await acceptedSet(ctx.storage);
     // A thread resolved by someone without write access still holds back
     // approval until a review finds it fixed (it is then accepted) or a
     // writer resolves it.
@@ -803,7 +818,7 @@ async function stageThreads(ctx, run, save) {
       const stranger = await unendorsed(t);
       if (t.resolved && !stranger) continue;
       earlier++;
-      if (!t.path || reopened[t.id] !== undefined) continue;
+      if (!t.path || reopened.has(t.id)) continue;
       // The item's id is the thread's own: one finding can have two threads.
       items.push({ kind: stranger ? "accept" : "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
     }
@@ -885,7 +900,7 @@ async function stageThreads(ctx, run, save) {
   // Read again for each thread, and again after each GitHub call: a thread
   // reopened by hand while this review ran (a webhook can land while a call
   // is pending) is that person's, whatever the model said.
-  const reopenedNow = async (id) => Boolean(id) && ((await ctx.storage.get(REOPENED)) ?? {})[id] !== undefined;
+  const reopenedNow = async (id) => (await reopenMark(ctx.storage, id)) !== undefined;
   for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
     if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
     if (x.kind === "thread") {
@@ -897,9 +912,7 @@ async function stageThreads(ctx, run, save) {
       // it no longer holds back approval.
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
       if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
-      const acc = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
-      acc.add(x.threadId);
-      await ctx.storage.put(ACCEPTED, [...acc].slice(-MAX_ACCEPTED));
+      await acceptThreads(ctx.storage, [x.threadId]);
     } else {
       await dropOpenFinding(ctx.storage, x.findingKey);
     }

@@ -12,7 +12,7 @@ import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { ACCEPTED, MAX_ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, activeRun, clearOpenFindings, dropRun, listOpenFindings, startRun, stepRun } from "./review-run.js";
+import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -39,7 +39,6 @@ const TOP_LEVEL_ONLY = new Set(["resolve", "approve"]);
 // The rest are resolved by the next alarms.
 const RESOLVE_PER_STEP = 20;
 // Past what ownThreads can ever list (1,000): a live mark is never evicted.
-const MAX_REOPENED = MAX_ACCEPTED;
 
 export function helpText(slug = DEFAULT_SLUG) {
   return [
@@ -311,7 +310,9 @@ export class PrState {
       await this.ctx.storage.put("state", st);
       // Merged: what the reviewer kept about it is of no more use.
       if (ev.merged) {
-        await this.ctx.storage.delete([REOPENED, ACCEPTED, SUMMARY_KEY, "reopenSeq"]);
+        await this.ctx.storage.delete([SUMMARY_KEY, "reopenSeq"]);
+        await clearPrefix(this.ctx.storage, REOPENED);
+        await clearPrefix(this.ctx.storage, ACCEPTED);
         await clearOpenFindings(this.ctx.storage);
       }
       await this.ctx.storage.delete("debounce");
@@ -377,16 +378,16 @@ export class PrState {
       // Each mark has its own number, so an older resolve's check cannot
       // clear a newer reopen of the same thread.
       if (ev.threadId && ev.action === "unresolved") {
-        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
         const n = ((await this.ctx.storage.get("reopenSeq")) ?? 0) + 1;
-        marks[ev.threadId] = n;
-        const kept = Object.fromEntries(Object.entries(marks).sort((a, b) => a[1] - b[1]).slice(-MAX_REOPENED));
+        // The mark and the lost acceptance land together (no await between
+        // them, so the object writes them as one).
+        const put = this.ctx.storage.put({ [`${REOPENED}${ev.threadId}`]: n, reopenSeq: n });
         // A reopened thread loses any earlier acceptance.
-        const accepted = ((await this.ctx.storage.get(ACCEPTED)) ?? []).filter((id) => id !== ev.threadId);
-        await this.ctx.storage.put({ [REOPENED]: kept, reopenSeq: n, [ACCEPTED]: accepted });
+        const unaccept = this.ctx.storage.delete(`${ACCEPTED}${ev.threadId}`);
+        await Promise.all([put, unaccept]);
       } else if (ev.threadId && ev.sender?.login) {
-        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
-        if (marks[ev.threadId] !== undefined) await this.outbox({ type: "unmark", threadId: ev.threadId, mark: marks[ev.threadId], login: ev.sender.login });
+        const mark = await reopenMark(this.ctx.storage, ev.threadId);
+        if (mark !== undefined) await this.outbox({ type: "unmark", threadId: ev.threadId, mark, login: ev.sender.login });
       }
       await this.queueDecide({ reopened: ev.action === "unresolved" });
       return { action: "decide" };
@@ -609,12 +610,8 @@ export class PrState {
     if (item.type === "decide") return this.decide(fx, item, slug);
     if (item.type === "unmark") {
       if (await fx.canWrite(key?.repo, item.login)) {
-        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
         // Only the mark this resolve answered: a later reopen keeps its own.
-        if (marks[item.threadId] === item.mark) {
-          delete marks[item.threadId];
-          await this.ctx.storage.put(REOPENED, marks);
-        }
+        if ((await reopenMark(this.ctx.storage, item.threadId)) === item.mark) await this.ctx.storage.delete(`${REOPENED}${item.threadId}`);
       }
       return undefined;
     }
@@ -746,7 +743,7 @@ export class PrState {
     // A thread resolved by someone without write access counts as open,
     // unless a review since found it fixed (ACCEPTED) or a writer's command
     // vouches for every thread (force).
-    const accepted = new Set((await this.ctx.storage.get(ACCEPTED)) ?? []);
+    const accepted = await acceptedSet(this.ctx.storage);
     const open = [];
     for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
       if (!t.resolved) open.push(t);
@@ -791,9 +788,7 @@ export class PrState {
     if (done < open.length) return { holdUntil: this.now() + 1000 };
     // The writer vouched for every thread, those resolved by people without
     // write access included: later decisions count them as resolved too.
-    const accepted = new Set((await this.ctx.storage.get(ACCEPTED)) ?? []);
-    for (const t of threads) accepted.add(t.id);
-    await this.ctx.storage.put(ACCEPTED, [...accepted].slice(-MAX_ACCEPTED));
+    await acceptThreads(this.ctx.storage, threads.map((t) => t.id));
     await clearOpenFindings(this.ctx.storage);
     await this.queueDecide({ force: true, login: item.login });
     return undefined;

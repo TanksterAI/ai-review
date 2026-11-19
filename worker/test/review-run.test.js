@@ -782,7 +782,7 @@ test("a thread a person reopened is never resolved by the reviewer again", async
   const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
   const models = judging({ "t:PRRT_a": "fixed" });
   const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
-  await s.storage.put("reopenedThreads", { PRRT_a: 1 });
+  await s.storage.put("reopened:PRRT_a", 1);
   await runAll(s);
   assert.equal(models.judged.length, 0);
   assert.deepEqual(s.github.resolved, []);
@@ -844,7 +844,7 @@ test("a thread an outsider resolved is still checked: once a later commit fixes 
   assert.deepEqual(models.judged.map((l) => l.map((x) => x.id)), [["t:PRRT_a"]]);
   assert.deepEqual(s.github.resolved, [], "already resolved: not resolved again");
   assert.match(s.github.edits[0].body, /✅ Addressed in commit aaaaaaa$/);
-  assert.deepEqual(await s.storage.get("acceptedThreads"), ["PRRT_a"]);
+  assert.equal(await s.storage.get("accepted:PRRT_a"), true);
 });
 
 test("one finding reported at two places is kept twice; fixing one keeps the other", async () => {
@@ -864,7 +864,7 @@ test("a thread reopened by hand while the review ran is not resolved, whatever t
   const real = s.models;
   s.ctx.deps.fetch = async (url, init) => {
     const r = await real(url, init);
-    if (String(init?.body).includes("BEGIN ITEMS")) await s.storage.put("reopenedThreads", { PRRT_a: 7 });
+    if (String(init?.body).includes("BEGIN ITEMS")) await s.storage.put("reopened:PRRT_a", 7);
     return r;
   };
   await runAll(s);
@@ -883,7 +883,7 @@ test("a later thread reopened while an earlier thread's GitHub call is pending i
     await edit(r, id, body);
     // While the first thread's edit is pending, the second is reopened; and
     // the first itself right after its edit.
-    if (id === 71) await s.storage.put("reopenedThreads", { PRRT_b: 1, PRRT_a: 2 });
+    if (id === 71) await s.storage.put({ "reopened:PRRT_b": 1, "reopened:PRRT_a": 2 });
   };
   await runAll(s);
   assert.deepEqual(s.github.resolved, [], "neither is resolved");
