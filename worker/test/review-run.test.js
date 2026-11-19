@@ -723,7 +723,7 @@ test("findings with no thread (outside the diff) are kept as open findings, and 
 
   // The next review, at a new head: the change near it fixed it.
   const NEXT = "f".repeat(40);
-  const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [`b:${open[0].id}`]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [`b:${open[0].key}`]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
   await keepOpenFindings(later.storage, open);
   later.github.compare = async (_r, base, head) => (base === HEAD
     ? { status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: `@@ -${open[0].line},1 +${open[0].line},1 @@\n-x\n+y` }] }
@@ -782,7 +782,7 @@ test("a thread a person reopened is never resolved by the reviewer again", async
   const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
   const models = judging({ "t:PRRT_a": "fixed" });
   const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
-  await s.storage.put("reopenedThreads", ["PRRT_a"]);
+  await s.storage.put("reopenedThreads", { PRRT_a: 1 });
   await runAll(s);
   assert.equal(models.judged.length, 0);
   assert.deepEqual(s.github.resolved, []);
@@ -803,10 +803,10 @@ test("a commit with nothing reviewable (a file deleted) still re-checks earlier 
 test("kept findings are never dropped for space, and a retried post step keeps them still", async () => {
   const storage = memoryStorage();
   await keepOpenFindings(storage, Array.from({ length: 120 }, (_, i) => ({ id: `f${i}`, path: "a.js", line: i, text: "x", sha: HEAD })));
-  await keepOpenFindings(storage, [{ id: "f0", path: "b.js", line: 1, text: "again", sha: HEAD }]);
+  await keepOpenFindings(storage, [{ id: "f0", path: "a.js", line: 0, text: "again", sha: HEAD }]);
   const all = await listOpenFindings(storage);
   assert.equal(all.length, 120);
-  assert.equal(all.find((x) => x.id === "f0").path, "a.js", "keeping one twice changes nothing");
+  assert.equal(all.find((x) => x.id === "f0").text, "x", "keeping one twice changes nothing");
 
   // The post succeeds, then the step fails before anything is kept: the retry
   // posts nothing more and still keeps the findings.
@@ -845,4 +845,30 @@ test("a thread an outsider resolved is still checked: once a later commit fixes 
   assert.deepEqual(s.github.resolved, [], "already resolved: not resolved again");
   assert.match(s.github.edits[0].body, /✅ Addressed in commit aaaaaaa$/);
   assert.deepEqual(await s.storage.get("acceptedThreads"), ["PRRT_a"]);
+});
+
+test("one finding reported at two places is kept twice; fixing one keeps the other", async () => {
+  const storage = memoryStorage();
+  await keepOpenFindings(storage, [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }, { id: "f1", path: "a.js", line: 90, text: "x", sha: HEAD }]);
+  const all = await listOpenFindings(storage);
+  assert.deepEqual(all.map((x) => x.key).sort(), ["f1@a.js:3", "f1@a.js:90"]);
+});
+
+test("a thread reopened by hand while the review ran is not resolved, whatever the model said", async () => {
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const models = judging({ "t:PRRT_a": "fixed" });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  // Reopened between the model's verdict and the resolving step.
+  const plain = s.github.editReviewComment;
+  s.github.editReviewComment = async (...a) => plain(...a);
+  const real = s.models;
+  s.ctx.deps.fetch = async (url, init) => {
+    const r = await real(url, init);
+    if (String(init?.body).includes("BEGIN ITEMS")) await s.storage.put("reopenedThreads", { PRRT_a: 7 });
+    return r;
+  };
+  await runAll(s);
+  assert.equal(models.judged.length, 1);
+  assert.deepEqual(s.github.resolved, []);
+  assert.deepEqual(s.github.edits, []);
 });

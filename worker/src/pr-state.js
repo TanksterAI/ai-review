@@ -373,12 +373,19 @@ export class PrState {
       // resolves it again (review-run.js stageThreads).
       // The mark goes only when someone with write access resolves it
       // (checked by the alarm: an outsider's resolve keeps it).
+      // Each mark has its own number, so an older resolve's check cannot
+      // clear a newer reopen of the same thread.
       if (ev.threadId && ev.action === "unresolved") {
-        const reopened = new Set((await this.ctx.storage.get(REOPENED)) ?? []);
-        reopened.add(ev.threadId);
-        await this.ctx.storage.put(REOPENED, [...reopened].slice(-MAX_REOPENED));
+        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
+        const n = ((await this.ctx.storage.get("reopenSeq")) ?? 0) + 1;
+        marks[ev.threadId] = n;
+        const kept = Object.fromEntries(Object.entries(marks).sort((a, b) => a[1] - b[1]).slice(-MAX_REOPENED));
+        // A reopened thread loses any earlier acceptance.
+        const accepted = ((await this.ctx.storage.get(ACCEPTED)) ?? []).filter((id) => id !== ev.threadId);
+        await this.ctx.storage.put({ [REOPENED]: kept, reopenSeq: n, [ACCEPTED]: accepted });
       } else if (ev.threadId && ev.sender?.login) {
-        await this.outbox({ type: "unmark", threadId: ev.threadId, login: ev.sender.login });
+        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
+        if (marks[ev.threadId] !== undefined) await this.outbox({ type: "unmark", threadId: ev.threadId, mark: marks[ev.threadId], login: ev.sender.login });
       }
       await this.queueDecide({ reopened: ev.action === "unresolved" });
       return { action: "decide" };
@@ -590,8 +597,12 @@ export class PrState {
     if (item.type === "decide") return this.decide(fx, item, slug);
     if (item.type === "unmark") {
       if (await fx.canWrite(key?.repo, item.login)) {
-        const reopened = ((await this.ctx.storage.get(REOPENED)) ?? []).filter((id) => id !== item.threadId);
-        await this.ctx.storage.put(REOPENED, reopened);
+        const marks = (await this.ctx.storage.get(REOPENED)) ?? {};
+        // Only the mark this resolve answered: a later reopen keeps its own.
+        if (marks[item.threadId] === item.mark) {
+          delete marks[item.threadId];
+          await this.ctx.storage.put(REOPENED, marks);
+        }
       }
       return undefined;
     }
@@ -757,12 +768,20 @@ export class PrState {
   async resolveAll(fx, item, slug) {
     const key = await this.ctx.storage.get("key");
     if (!key || typeof fx.ownThreads !== "function") return undefined;
-    const open = (await fx.ownThreads(key.repo, key.pr, slug)).filter((t) => !t.resolved);
+    const threads = await fx.ownThreads(key.repo, key.pr, slug);
+    const open = threads.filter((t) => !t.resolved);
     let done = 0;
     for (const t of open.slice(0, RESOLVE_PER_STEP)) if (await fx.resolveThread(key.repo, t.id)) done++;
     // Nothing moved: an attempt that counts, so it cannot spin for ever.
     if (open.length && !done) throw new Error("no thread could be resolved");
-    if (open.length > RESOLVE_PER_STEP) return { holdUntil: this.now() + 1000 };
+    // Some still open (past this step's share, or refused): again shortly,
+    // and nothing is cleared or decided until none is.
+    if (done < open.length) return { holdUntil: this.now() + 1000 };
+    // The writer vouched for every thread, those resolved by people without
+    // write access included: later decisions count them as resolved too.
+    const accepted = new Set((await this.ctx.storage.get(ACCEPTED)) ?? []);
+    for (const t of threads) accepted.add(t.id);
+    await this.ctx.storage.put(ACCEPTED, [...accepted].slice(-500));
     await clearOpenFindings(this.ctx.storage);
     await this.queueDecide({ force: true, login: item.login });
     return undefined;

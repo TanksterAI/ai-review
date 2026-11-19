@@ -91,8 +91,8 @@ export const SUMMARY_KEY = "summaryComment";
 // One key a finding (OPEN_FINDINGS + its id), so none is ever dropped for
 // space: each stays until it is addressed or cleared.
 export const OPEN_FINDINGS = "openfinding:";
-// Threads a person reopened by hand (pr-state.js): never resolved again by
-// the reviewer; they are that person's to close.
+// Threads a person reopened by hand (pr-state.js), {threadId: mark number}:
+// never resolved again by the reviewer; they are that person's to close.
 export const REOPENED = "reopenedThreads";
 // Threads resolved by someone without write access that a later review found
 // fixed: they no longer hold back approval (pr-state.js decide).
@@ -733,18 +733,22 @@ async function stagePost(ctx, run, save) {
 
 // The PR's open body-only findings: kept, listed, dropped one by one, and
 // cleared. Keeping one twice changes nothing, so a retried step is safe.
+// A finding's occurrence: its id where it was reported. One finding id can be
+// reported at two places, and fixing one must not clear the other.
+export const occurrenceKey = (x) => `${x.id}@${x.path ?? ""}:${Number.isInteger(x.line) ? x.line : ""}`;
 export async function keepOpenFindings(storage, items) {
   for (const x of items) {
     if (!x.id) continue;
-    const k = `${OPEN_FINDINGS}${x.id}`;
-    if (!(await storage.get(k))) await storage.put(k, x);
+    const key = x.key ?? occurrenceKey(x);
+    const k = `${OPEN_FINDINGS}${key}`;
+    if (!(await storage.get(k))) await storage.put(k, { ...x, key });
   }
 }
 export async function listOpenFindings(storage) {
   return [...(await storage.list({ prefix: OPEN_FINDINGS })).values()];
 }
-export async function dropOpenFinding(storage, id) {
-  await storage.delete(`${OPEN_FINDINGS}${id}`);
+export async function dropOpenFinding(storage, key) {
+  await storage.delete(`${OPEN_FINDINGS}${key}`);
 }
 export async function clearOpenFindings(storage) {
   const keys = [...(await storage.list({ prefix: OPEN_FINDINGS })).keys()];
@@ -777,7 +781,7 @@ async function stageThreads(ctx, run, save) {
   if (!th) {
     const login = ctx.slug ?? DEFAULT_SLUG;
     const threads = await fx.ownThreads(run.repo.full, run.pr, login);
-    const reopened = new Set((await ctx.storage.get(REOPENED)) ?? []);
+    const reopened = (await ctx.storage.get(REOPENED)) ?? {};
     const accepted = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
     // A thread resolved by someone without write access still holds back
     // approval until a review finds it fixed (it is then accepted) or a
@@ -796,14 +800,15 @@ async function stageThreads(ctx, run, save) {
       const stranger = await unendorsed(t);
       if (t.resolved && !stranger) continue;
       earlier++;
-      if (!t.path || reopened.has(t.id)) continue;
+      if (!t.path || reopened[t.id] !== undefined) continue;
       // The item's id is the thread's own: one finding can have two threads.
       items.push({ kind: stranger ? "accept" : "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
     }
     const inBody = (await listOpenFindings(ctx.storage)).filter((f) => f.sha && f.sha !== run.headSha);
     for (const f of inBody) {
       if (!f.path) continue;
-      items.push({ kind: "body", id: `b:${f.id}`, findingId: f.id, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
+      const key = f.key ?? occurrenceKey(f);
+      items.push({ kind: "body", id: `b:${key}`, findingKey: key, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
     }
     th = { items, open: earlier + inBody.length, resolved: 0, unchecked: null };
     if (!items.length) return done(th);
@@ -874,7 +879,11 @@ async function stageThreads(ctx, run, save) {
   // Resolve what was fixed, a few a step: the note first, then the thread,
   // so a thread is never resolved without saying why.
   const fixed = th.items.filter((x) => x.state === "fixed");
+  // Read again now: a thread reopened by hand while this review ran is that
+  // person's, whatever the model said.
+  const marks = (await ctx.storage.get(REOPENED)) ?? {};
   for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
+    if (x.threadId && marks[x.threadId] !== undefined) { x.state = "open"; continue; }
     if (x.kind === "thread") {
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
       await fx.resolveThread(run.repo.full, x.threadId);
@@ -886,7 +895,7 @@ async function stageThreads(ctx, run, save) {
       acc.add(x.threadId);
       await ctx.storage.put(ACCEPTED, [...acc].slice(-500));
     } else {
-      await dropOpenFinding(ctx.storage, x.findingId);
+      await dropOpenFinding(ctx.storage, x.findingKey);
     }
     th.resolved++;
     x.state = "resolved";
