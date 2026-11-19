@@ -117,19 +117,23 @@ test("a refused session stops before any GitHub call", async () => {
   assert.equal(log.fetches.length, 1);
 });
 
-test("the token is revoked even when the run fails", async () => {
+test("the token is revoked even when the run fails, and the failure shows only its status", async () => {
   const log = await run({ prError: Object.assign(new Error("boom"), { status: 500 }) });
-  assert.match(String(log.threw), /boom/);
+  assert.equal(log.threw, undefined, "reported, not rethrown: a thrown error would print its request URL");
+  assert.equal(log.failed, "A GitHub API call failed (HTTP 500).");
   assert.equal(log.revoked, 1);
+  const other = await run({ prError: new TypeError("fetch failed for https://api.github.com/repos/TanksterAI/x") });
+  assert.equal(other.failed, "The run failed (TypeError).");
+  assert.equal(other.revoked, 1);
 });
 
 test("closed PRs, deferrals and failures are reported, not hidden", async () => {
   assert.match((await run({ pr: { state: "closed" } })).notices[0], /closed; nothing to review/);
-  assert.match((await run({ review: { status: 429, json: { reason: "spent", resets_at: "t" } } })).warnings[0], /deferred/);
+  assert.match((await run({ review: { status: 429, json: { reason: "spent", resets_at: "2026-11-20T00:00:00Z" } } })).warnings[0], /deferred.*after 2026-11-20T00:00:00Z/);
   // 502 and 503 are queued by the Worker and tried again: a warning, not a failure.
-  assert.match((await run({ review: { status: 502, json: { reason: "bad answer" } } })).warnings[0], /bad answer\. It is queued/);
-  assert.match((await run({ review: { status: 503, json: { reason: "busy" } } })).warnings[0], /busy\. It is queued/);
-  assert.match((await run({ review: { status: 500, json: { reason: "boom" } } })).failed, /boom/);
+  assert.match((await run({ review: { status: 502, json: { reason: "bad answer" } } })).warnings[0], /failed\. It is queued/);
+  assert.match((await run({ review: { status: 503, json: { reason: "busy" } } })).warnings[0], /not run yet\. It is queued/);
+  assert.equal((await run({ review: { status: 500, json: { reason: "boom" } } })).failed, "Review failed (HTTP 500).");
 });
 
 test("big patches are cut and the total is bounded", async () => {
@@ -149,15 +153,23 @@ test("public log lines name no repository, pull request, commit or cost", async 
     await run({ review: { status: 200, json: { status: "skipped", reason: "nothing changed" } } }),
     await run({ review: { status: 409, json: { status: "duplicate" } } }),
     await run({ pr: { state: "closed" } }),
+    // The Worker's reasons name models and spend: none may reach the log.
+    await run({ review: { status: 429, json: { reason: "gemini:gemini-3.5-flash-lite is out of quota; today's Anthropic budget is spent ($1.23 of $5.00) for claude-haiku-5-5", resets_at: "2026-11-20T00:00:00Z" } } }),
+    await run({ review: { status: 502, json: { reason: "claude-haiku-5-5 gave a bad answer for TanksterAI/browser-relay#39" } } }),
+    await run({ review: { status: 503, json: { reason: "4000 of 8000 neurons used" } } }),
+    await run({ review: { status: 500, json: { reason: "boom in TanksterAI/browser-relay" } } }),
+    await run({ review: { status: 200, json: { status: "skipped", reason: "only TanksterAI/browser-relay lockfiles changed" } } }),
+    // A failing GitHub call: Octokit's error carries the request URL.
+    await run({ prError: Object.assign(new Error(`Server Error - https://api.github.com/repos/TanksterAI/browser-relay/pulls/39 ${HEAD}`), { status: 502, request: { url: "https://api.github.com/repos/TanksterAI/browser-relay/pulls/39" } }) }),
   ];
   for (const log of logs) {
     const lines = [...log.notices, ...log.warnings, log.failed ?? ""].join("\n");
-    assert.ok(log.notices.length + log.warnings.length > 0, "each run still says what happened");
-    for (const secret of ["TanksterAI", "browser-relay", "#39", HEAD.slice(0, 7), "neurons", "$", "claude", "haiku"]) {
+    assert.ok(log.notices.length + log.warnings.length > 0 || log.failed, "each run still says what happened");
+    for (const secret of ["TanksterAI", "browser-relay", "#39", "/pulls/", HEAD.slice(0, 7), "neurons", "$", "claude", "haiku", "gemini", "boom", "lockfiles"]) {
       assert.ok(!lines.includes(secret), `"${secret}" in: ${lines}`);
     }
   }
   assert.match(logs[0].notices[0], /^Reviewed: 2 inline comment\(s\)\.$/);
-  assert.match(logs[2].notices[0], /nothing changed/);
+  assert.match(logs[2].notices[0], /^Nothing to review\.$/);
   assert.match(logs[3].notices[0], /already reviewed/);
 });

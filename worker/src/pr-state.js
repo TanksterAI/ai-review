@@ -463,6 +463,9 @@ export class PrState {
       return undefined;
     }
     if (this.mode() === "worker") return this.startWorkerRun(held, st);
+    // A job minted before job ids became opaque names its PR in the clear,
+    // and the runner refuses it: give it a new id first.
+    if (!objectOfJob(jobId)) return this.dispatchJob(fx, await this.reissue(jobId, held));
     // No model provider can take a review now (sized as the review itself,
     // when it was tried before), or the runner said when one will: hold the
     // dispatch rather than start a runner that can only defer. The job is
@@ -477,6 +480,16 @@ export class PrState {
     const job = await this.ctx.storage.get(`job:${jobId}`);
     if (job) await this.ctx.storage.put(`job:${jobId}`, { ...job, dispatchedAt: this.now(), firstRunAt: job.firstRunAt ?? this.now() });
     return undefined;
+  }
+
+  // The same job under a fresh, opaque id; the queue follows it.
+  async reissue(jobId, held) {
+    const id = jobIdFor(this.ctx.id?.toString());
+    await this.ctx.storage.put(`job:${id}`, { ...held, id });
+    await this.ctx.storage.delete(`job:${jobId}`);
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    if (box.some((x) => x.jobId === jobId)) await this.ctx.storage.put("outbox", box.map((x) => (x.jobId === jobId ? { ...x, jobId: id } : x)));
+    return id;
   }
 
   // Marks a commit as waiting for a writer. A review run sets the status

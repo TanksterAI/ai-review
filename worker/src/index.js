@@ -348,7 +348,7 @@ async function runnerJob(request, env, deps) {
     return json(400, { status: "rejected", reason: "body is not JSON" });
   }
   // Only the App's own dispatch starts a job run.
-  const stub = claims.run_id && claims.event_name === "workflow_dispatch" ? jobStub(env, body?.job) : null;
+  const stub = claims.run_id && claims.event_name === "workflow_dispatch" && typeof body?.job === "string" ? jobStub(env, body.job) : null;
   if (!stub) return json(403, { status: "refused", reason: "no such job" });
   const out = await ask(stub, { op: "claim", jobId: body.job, runId: String(claims.run_id) });
   if (!out.job) return json(403, { status: "refused", reason: out.error ?? "no such job" });

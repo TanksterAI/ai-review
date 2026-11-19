@@ -824,6 +824,52 @@ test("a held dispatch does not block other side effects behind it", async () => 
   assert.equal((await storage.get("outbox")).length, 1);
 });
 
+test("a job queued before job ids became opaque is re-issued, not lost, when it is dispatched", async () => {
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => NOW, effects: fx, capacity: async () => ({ ok: true }) });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  // Make it look like one minted by the old code: base64url("repo#pr").random.
+  const old = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"a".repeat(32)}`;
+  const job = await storage.get(`job:${out.jobId}`);
+  await storage.delete(`job:${out.jobId}`);
+  await storage.put(`job:${old}`, { ...job, id: old, requestedBy: "rishitank" });
+  await storage.put("outbox", (await storage.get("outbox")).map((x) => (x.jobId === out.jobId ? { ...x, jobId: old } : x)));
+  await drain(obj);
+  const sent = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.equal(sent.length, 1);
+  assert.notEqual(sent[0], old);
+  assert.ok(objectOfJob(sent[0]), "the runner gets an id it accepts");
+  assert.equal(await storage.get(`job:${old}`), undefined);
+  const claimed = await obj.claim({ jobId: sent[0], runId: "1" });
+  assert.equal(claimed.job.requestedBy, "rishitank", "the job keeps what it was");
+  assert.equal(claimed.job.id, sent[0]);
+  assert.ok(!(await storage.get("outbox") ?? []).some((x) => x.jobId === old));
+});
+
+test("an old job held for capacity keeps its place in the queue under its new id", async () => {
+  let t = NOW;
+  let cap = { ok: false, retryAt: NOW + 3600_000 };
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
+  const out = await obj.onEvent({ delivery: "d1", ev: review() });
+  const old = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"b".repeat(32)}`;
+  const job = await storage.get(`job:${out.jobId}`);
+  await storage.delete(`job:${out.jobId}`);
+  await storage.put(`job:${old}`, { ...job, id: old });
+  await storage.put("outbox", (await storage.get("outbox")).map((x) => (x.jobId === out.jobId ? { ...x, jobId: old } : x)));
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0, "held: no provider is free");
+  const queued = (await storage.get("outbox")).map((x) => x.jobId);
+  assert.ok(queued.length === 1 && objectOfJob(queued[0]), "the queue names the new id");
+  cap = { ok: true };
+  await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+  const sent = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.deepEqual(sent, queued);
+  assert.ok((await obj.claim({ jobId: sent[0], runId: "1" })).job);
+});
+
 test("a deferred review is given back: released, queued for the reset, claimable by a new run", async () => {
   let t = NOW;
   const storage = memoryStorage();

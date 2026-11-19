@@ -84,6 +84,11 @@ jobs:
             core.setSecret(token);
             const gh = getOctokit(token);
             const [owner, repo] = j.repo.full.split("/");
+            // This repository is public, and so are its runs' logs: they say
+            // what happened, never which repository, PR, commit or model, nor
+            // what it cost. The Worker's own logs hold those. So the Worker's
+            // reasons are not printed, and no error is rethrown: a thrown
+            // Octokit error prints its request URL, which names the PR.
             try {
               const { data: pr } = await gh.rest.pulls.get({ owner, repo, pull_number: j.pr });
               if (pr.state !== "open") {
@@ -129,16 +134,15 @@ jobs:
               };
 
               const { res, out } = await call("/v1/runner/review", payload);
-              // This repository is public, and so are its runs' logs: they say
-              // what happened, never which repository, PR, commit or model, nor
-              // what it cost. The Worker's own logs hold those.
               if (res.status === 409) core.notice("This commit was already reviewed.");
-              else if (res.status === 429) core.warning(`Review deferred: ${out.reason}. It is queued and runs again after ${out.resets_at}.`);
-              else if (res.status === 503) core.warning(`Review not run yet: ${out.reason ?? "the review service is unavailable"}. It is queued and tried again in about 5 minutes.`);
-              else if (res.status === 502) core.warning(`Review failed: ${out.reason ?? "no reason given"}. It is queued and tried again in about 15 minutes (3 tries in all).`);
-              else if (res.ok && out.status === "skipped") core.notice(`Nothing to review: ${out.reason}.`);
+              else if (res.status === 429) core.warning(`Review deferred: no model has quota now. It is queued and runs again after ${out.resets_at}.`);
+              else if (res.status === 503) core.warning("Review not run yet. It is queued and tried again in about 5 minutes.");
+              else if (res.status === 502) core.warning("Review failed. It is queued and tried again in about 15 minutes (3 tries in all).");
+              else if (res.ok && out.status === "skipped") core.notice("Nothing to review.");
               else if (res.ok && out.status === "reviewed") core.notice(`Reviewed: ${out.inline ?? 0} inline comment(s).`);
-              else core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
+              else core.setFailed(`Review failed (HTTP ${res.status}).`);
+            } catch (e) {
+              core.setFailed(e?.status ? `A GitHub API call failed (HTTP ${e.status}).` : `The run failed (${e?.name ?? "Error"}).`);
             } finally {
               // The token dies with the run, whatever happened.
               await gh.request("DELETE /installation/token").catch(() => {});

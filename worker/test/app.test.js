@@ -131,6 +131,7 @@ test("runner: job ids say nothing of the PR, and unroutable ones are refused, no
     `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${rand}`, // the old, readable form
     `${"g".repeat(64)}.${rand}`,
     "",
+    [jobId], // not a string: refused rather than coerced
   ]) {
     const res = await handleRunnerSession(await runnerReq("/v1/runner/session", { job }), e, deps(e));
     assert.equal(res.status, 403, job);
