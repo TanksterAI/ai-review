@@ -82,7 +82,10 @@ jobs:
             }
             const { job: j, token } = session.out;
             core.setSecret(token);
-            const gh = getOctokit(token);
+            // Octokit's own logger would print request URLs (on a deprecation
+            // notice, say), and they name the PR: it says nothing here.
+            const quiet = () => {};
+            const gh = getOctokit(token, { log: { debug: quiet, info: quiet, warn: quiet, error: quiet } });
             const [owner, repo] = j.repo.full.split("/");
             // This repository is public, and so are its runs' logs: they say
             // what happened, never which repository, PR, commit or model, nor

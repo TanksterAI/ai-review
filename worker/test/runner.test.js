@@ -47,8 +47,12 @@ function run({ job = JOB, session, review, pr = {}, compare, files = [{ filename
     const r = review ?? { status: 200, json: { status: "reviewed", inline: 2, usage: { neurons: 120 } } };
     return Response.json(r.json, { status: r.status });
   };
-  const getOctokit = (token) => {
+  const getOctokit = (token, opts) => {
     assert.equal(token, "ghs_clone");
+    // Octokit's own logger prints request URLs (on deprecation notices, say).
+    for (const level of ["debug", "info", "warn", "error"]) assert.equal(typeof opts?.log?.[level], "function", `log.${level} is silenced`);
+    for (const level of ["debug", "info", "warn", "error"]) assert.equal(opts.log[level]("GET /repos/TanksterAI/browser-relay/pulls/39"), undefined);
+    assert.notEqual(opts.log.warn, console.warn);
     const listFiles = Symbol("listFiles");
     return {
       rest: {
