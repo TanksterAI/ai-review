@@ -73,8 +73,9 @@ export function nearHunks(patch, line, window = ADDRESSED_WINDOW) {
   const near = Number.isInteger(line) ? hunks.filter((h) => h.to >= line - window && h.from <= line + window) : hunks;
   if (!near.length) return { touched: false, text: "" };
   let out = near.map((h) => h.lines.join("\n")).join("\n");
-  if (out.length > MAX_NEAR_CHARS) out = `${out.slice(0, MAX_NEAR_CHARS)}\n…(cut)`;
-  return { touched: true, text: out };
+  const cut = out.length > MAX_NEAR_CHARS;
+  if (cut) out = `${out.slice(0, MAX_NEAR_CHARS)}\n…(cut)`;
+  return { touched: true, text: out, ...(cut ? { cut: true } : {}) };
 }
 
 function randomTag() {
@@ -149,13 +150,13 @@ export async function judgeAddressed({ items, env, cfg, deps }) {
   if (!items.length) return { results: new Map(), outcome: { kind: "ok" }, ...spend, by: null };
   const providers = createProviders(env, cfg, parseChain(env.ADDRESSED_CHAIN || DEFAULT_ADDRESSED_CHAIN), deps);
   const reasons = [];
-  // The first provider after `skip` (ids) that answers about `list`.
+  // The first provider not of a kind in `skip` that answers about `list`.
   async function ask(list, skip) {
     const { system, user } = addressedPrompt({ items: list, tag: randomTag() });
     const chars = system.length + user.length;
     const ids = new Set(list.map((x) => x.id));
     for (const p of providers) {
-      if (!p.configured || skip.has(p.id)) continue;
+      if (!p.configured || skip.has(p.kind)) continue;
       if (await p.exhausted()) { reasons.push(`${p.id} is out of quota`); continue; }
       const a = await p.affordable(chars, MAX_OUTPUT);
       if (!a.ok) { reasons.push(a.reason ?? `${p.id} cannot take it`); continue; }
@@ -171,7 +172,9 @@ export async function judgeAddressed({ items, env, cfg, deps }) {
       spend.usd += r.usd ?? 0;
       const results = readResults(r.text, ids);
       deps.log?.({ ev: "addressed_checked", provider: p.id, items: list.length, answered: results.size });
-      return { results, by: p.id };
+      // No usable answer at all (not JSON, no ids): the next provider.
+      if (!results.size) { reasons.push(`${p.id} gave no usable answer`); continue; }
+      return { results, by: p.id, kind: p.kind };
     }
     return null;
   }
@@ -180,8 +183,9 @@ export async function judgeAddressed({ items, env, cfg, deps }) {
   const results = first.results;
   const severe = items.filter((x) => x.severe && results.get(x.id) === "fixed");
   if (severe.length) {
-    // Another provider only: the same one asked twice is no second opinion.
-    const second = await ask(severe, new Set([first.by]));
+    // Another kind of provider only: the same family asked twice is no
+    // second opinion.
+    const second = await ask(severe, new Set([first.kind]));
     for (const x of severe) if (second?.results.get(x.id) !== "fixed") results.set(x.id, "uncertain");
   }
   return { results, outcome: { kind: "ok" }, ...spend, by: first.by };

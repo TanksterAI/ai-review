@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DRAFT_PARALLEL, STEP_SUBREQUESTS, activeRun, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
+import { DRAFT_PARALLEL, STEP_SUBREQUESTS, activeRun, keepOpenFindings, listOpenFindings, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
 import { config } from "../src/config.js";
 import { parseFindingsBlock } from "../src/review.js";
 import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
@@ -716,7 +716,7 @@ test("findings with no thread (outside the diff) are kept as open findings, and 
   await runAll(s);
   assert.equal(s.github.posted[0].event, "REQUEST_CHANGES");
   assert.equal(s.github.posted[0].comments.length, 0, "GitHub could not place it inline");
-  const open = await s.storage.get("openFindings");
+  const open = await listOpenFindings(s.storage);
   assert.equal(open.length, 1);
   assert.equal(open[0].path, "worker/src/m3.js");
   assert.equal(open[0].sha, HEAD);
@@ -724,12 +724,12 @@ test("findings with no thread (outside the diff) are kept as open findings, and 
   // The next review, at a new head: the change near it fixed it.
   const NEXT = "f".repeat(40);
   const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [`b:${open[0].id}`]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
-  await later.storage.put("openFindings", open);
+  await keepOpenFindings(later.storage, open);
   later.github.compare = async (_r, base, head) => (base === HEAD
     ? { status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: `@@ -${open[0].line},1 +${open[0].line},1 @@\n-x\n+y` }] }
     : { status: "diverged", merge_base_commit: { sha: MERGE_BASE }, files: [] });
   await runAll(later);
-  assert.deepEqual(await later.storage.get("openFindings"), []);
+  assert.deepEqual(await listOpenFindings(later.storage), []);
 });
 
 test("findings GitHub would not place inline (its 422 fallback) are kept as open findings, with those off the diff", async () => {
@@ -738,7 +738,7 @@ test("findings GitHub would not place inline (its 422 fallback) are kept as open
   const s = setup({ github, models: fakeModels() });
   await runAll(s);
   assert.equal(s.github.posted.length, 1);
-  const open = await s.storage.get("openFindings");
+  const open = await listOpenFindings(s.storage);
   assert.equal(open.length, 1);
   assert.match(open[0].id, /^[0-9a-f]{8}$/);
   assert.equal(open[0].path, "worker/src/m3.js");
@@ -766,7 +766,7 @@ test("nitpicks block approval too: listed in the body, kept as open findings; th
   assert.equal(chill.github.posted.length, 1);
   assert.equal(chill.github.posted[0].event, "REQUEST_CHANGES");
   assert.equal(chill.github.posted[0].comments.length, 0, "a nitpick goes in the body under the chill profile");
-  const open = await chill.storage.get("openFindings");
+  const open = await listOpenFindings(chill.storage);
   assert.equal(open.length, 1);
   assert.equal(open[0].severe, false);
   assert.match(chill.github.summaries[0].body, /Actionable comments posted: 1\./);
@@ -774,7 +774,7 @@ test("nitpicks block approval too: listed in the body, kept as open findings; th
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
   assert.equal(quiet.github.posted.length, 0, "nothing shown, nothing to resolve: no review");
-  assert.equal((await quiet.storage.get("openFindings")) ?? null, null);
+  assert.deepEqual(await listOpenFindings(quiet.storage), []);
   assert.match(quiet.github.summaries[0].body, /No actionable comments were generated/);
 });
 
@@ -798,4 +798,51 @@ test("a commit with nothing reviewable (a file deleted) still re-checks earlier 
   assert.match(s.github.summaries[0].body, /No reviewable changes/);
   assert.equal(s.github.statuses.at(-1).state, "success");
   assert.equal(s.done[0].reviewedSha, HEAD);
+});
+
+test("kept findings are never dropped for space, and a retried post step keeps them still", async () => {
+  const storage = memoryStorage();
+  await keepOpenFindings(storage, Array.from({ length: 120 }, (_, i) => ({ id: `f${i}`, path: "a.js", line: i, text: "x", sha: HEAD })));
+  await keepOpenFindings(storage, [{ id: "f0", path: "b.js", line: 1, text: "again", sha: HEAD }]);
+  const all = await listOpenFindings(storage);
+  assert.equal(all.length, 120);
+  assert.equal(all.find((x) => x.id === "f0").path, "a.js", "keeping one twice changes nothing");
+
+  // The post succeeds, then the step fails before anything is kept: the retry
+  // posts nothing more and still keeps the findings.
+  const github = threadsGithub({ files: SMALL });
+  const s = setup({ github, models: fakeModels({ finding: { severity: "trivial", type: "nitpick" } }) });
+  const real = s.storage.put.bind(s.storage);
+  let failOnce = true;
+  s.storage.put = async (k, v) => {
+    if (failOnce && typeof k === "string" && k.startsWith("openfinding:")) { failOnce = false; throw new Error("storage hiccup"); }
+    return real(k, v);
+  };
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.equal((await listOpenFindings(s.storage)).length, 1);
+});
+
+test("a diff near the finding cut to fit is not judged: the thread stays open for a person", async () => {
+  const long = `@@ -1,1 +1,3000 @@\n${Array.from({ length: 3000 }, (_, i) => `+line ${i} ${"x".repeat(20)}`).join("\n")}`;
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: long }] });
+  const models = judging({ "t:PRRT_a": "fixed" });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread({ originalLine: 2 })], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(s);
+  assert.equal(models.judged.length, 0);
+  assert.deepEqual(s.github.resolved, []);
+});
+
+test("a thread an outsider resolved is still checked: once a later commit fixes it, it is accepted and noted", async () => {
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const models = judging({ "t:PRRT_a": "fixed" });
+  const github = threadsGithub({ files: SMALL, threads: [ownThread({ resolved: true, resolvedBy: "stranger" }), ownThread({ id: "PRRT_w", resolved: true, resolvedBy: "rishitank" })], since });
+  github.canWrite = async (_r, login) => { github.calls.push(`canWrite:${login}`); return login === "rishitank"; };
+  const s = setup({ github, models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(s);
+  // Only the outsider's thread is judged; a writer's resolve stands.
+  assert.deepEqual(models.judged.map((l) => l.map((x) => x.id)), [["t:PRRT_a"]]);
+  assert.deepEqual(s.github.resolved, [], "already resolved: not resolved again");
+  assert.match(s.github.edits[0].body, /✅ Addressed in commit aaaaaaa$/);
+  assert.deepEqual(await s.storage.get("acceptedThreads"), ["PRRT_a"]);
 });

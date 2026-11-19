@@ -12,7 +12,7 @@ import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { MAX_RUN_LIFE_MS, OPEN_FINDINGS, REOPENED, RUN, RUN_META, SUMMARY_KEY, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
+import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, activeRun, clearOpenFindings, dropRun, listOpenFindings, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -309,7 +309,10 @@ export class PrState {
       st.closed = true;
       await this.ctx.storage.put("state", st);
       // Merged: what the reviewer kept about it is of no more use.
-      if (ev.merged) await this.ctx.storage.delete([OPEN_FINDINGS, REOPENED, SUMMARY_KEY]);
+      if (ev.merged) {
+        await this.ctx.storage.delete([REOPENED, ACCEPTED, SUMMARY_KEY]);
+        await clearOpenFindings(this.ctx.storage);
+      }
       await this.ctx.storage.delete("debounce");
       await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
       // A review in progress stops: nothing is posted on a closed PR.
@@ -368,11 +371,14 @@ export class PrState {
       if (st.closed) return { action: "closed" };
       // A thread reopened by hand is that person's: the reviewer never
       // resolves it again (review-run.js stageThreads).
-      const reopened = new Set((await this.ctx.storage.get(REOPENED)) ?? []);
-      if (ev.threadId) {
-        if (ev.action === "unresolved") reopened.add(ev.threadId);
-        else reopened.delete(ev.threadId);
+      // The mark goes only when someone with write access resolves it
+      // (checked by the alarm: an outsider's resolve keeps it).
+      if (ev.threadId && ev.action === "unresolved") {
+        const reopened = new Set((await this.ctx.storage.get(REOPENED)) ?? []);
+        reopened.add(ev.threadId);
         await this.ctx.storage.put(REOPENED, [...reopened].slice(-MAX_REOPENED));
+      } else if (ev.threadId && ev.sender?.login) {
+        await this.outbox({ type: "unmark", threadId: ev.threadId, login: ev.sender.login });
       }
       await this.queueDecide({ reopened: ev.action === "unresolved" });
       return { action: "decide" };
@@ -582,6 +588,13 @@ export class PrState {
     }
 
     if (item.type === "decide") return this.decide(fx, item, slug);
+    if (item.type === "unmark") {
+      if (await fx.canWrite(key?.repo, item.login)) {
+        const reopened = ((await this.ctx.storage.get(REOPENED)) ?? []).filter((id) => id !== item.threadId);
+        await this.ctx.storage.put(REOPENED, reopened);
+      }
+      return undefined;
+    }
 
     if (item.type === "status") {
       if (!key || !item.sha) return undefined;
@@ -707,12 +720,16 @@ export class PrState {
       if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
       return writers.get(login);
     };
+    // A thread resolved by someone without write access counts as open,
+    // unless a review since found it fixed (ACCEPTED) or a writer's command
+    // vouches for every thread (force).
+    const accepted = new Set((await this.ctx.storage.get(ACCEPTED)) ?? []);
     const open = [];
     for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
       if (!t.resolved) open.push(t);
-      else if (t.resolvedBy && t.resolvedBy !== slug && !(await isWriter(t.resolvedBy))) open.push(t);
+      else if (!item.force && t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
     }
-    const inBody = (await this.ctx.storage.get(OPEN_FINDINGS)) ?? [];
+    const inBody = await listOpenFindings(this.ctx.storage);
     const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {
@@ -725,7 +742,7 @@ export class PrState {
     }
     if (open.length || inBody.length || decision?.state === "APPROVED") return undefined;
     const now = await fx.pullRequest(key.repo, key.pr);
-    if (now?.head?.sha !== head || now?.state !== "open") return undefined;
+    if (now?.head?.sha !== head || now?.state !== "open" || now.draft) return undefined;
     const body = item.force && item.login
       ? `Approved at @${item.login}'s request: its review threads are resolved.`
       : `Approved: every finding is resolved, and commit \`${head.slice(0, 7)}\` was reviewed in full.`;
@@ -746,7 +763,7 @@ export class PrState {
     // Nothing moved: an attempt that counts, so it cannot spin for ever.
     if (open.length && !done) throw new Error("no thread could be resolved");
     if (open.length > RESOLVE_PER_STEP) return { holdUntil: this.now() + 1000 };
-    await this.ctx.storage.put(OPEN_FINDINGS, []);
+    await clearOpenFindings(this.ctx.storage);
     await this.queueDecide({ force: true, login: item.login });
     return undefined;
   }

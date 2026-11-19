@@ -286,3 +286,10 @@ test("a 422 for the decision itself still posts the findings, as a comment; a re
   const boom = fakeApp(() => err(500));
   await assert.rejects(createEffects({}, { app: boom }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }));
 });
+
+test("ownThreads never returns a partial list: past its page limit it fails", async () => {
+  const page = { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c" }, nodes: [] } } } } };
+  const app = fakeApp(() => page);
+  await assert.rejects(createEffects({}, { app }).ownThreads("TanksterAI/x", 3, "tankster-ai-review"), /too many review threads/);
+  assert.equal(app.log.calls.length, 20);
+});

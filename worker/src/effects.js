@@ -269,10 +269,12 @@ export function createEffects(env, deps = {}) {
             resolvedBy: t.resolvedBy?.login ?? null,
           });
         }
-        if (!conn?.pageInfo?.hasNextPage) break;
+        if (!conn?.pageInfo?.hasNextPage) return out;
         after = conn.pageInfo.endCursor;
       }
-      return out;
+      // Never a partial list: open threads past it would go unseen, and an
+      // approval follow. The caller fails and tries again later.
+      throw new Error("too many review threads to list");
     },
 
     async resolveThread(repoFull, threadId) {

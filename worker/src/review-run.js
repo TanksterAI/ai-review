@@ -88,11 +88,15 @@ const planKey = (id) => `${RUN}${id}:plan`;
 // Kept by the PR's object across runs: the summary comment's id, and the
 // findings a review could only list in its body (they have no thread).
 export const SUMMARY_KEY = "summaryComment";
-export const OPEN_FINDINGS = "openFindings";
+// One key a finding (OPEN_FINDINGS + its id), so none is ever dropped for
+// space: each stays until it is addressed or cleared.
+export const OPEN_FINDINGS = "openfinding:";
 // Threads a person reopened by hand (pr-state.js): never resolved again by
 // the reviewer; they are that person's to close.
 export const REOPENED = "reopenedThreads";
-const MAX_OPEN_FINDINGS = 50;
+// Threads resolved by someone without write access that a later review found
+// fixed: they no longer hold back approval (pr-state.js decide).
+export const ACCEPTED = "acceptedThreads";
 const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
 // GitHub calls one threads step may make (each counts as a subrequest).
@@ -686,6 +690,11 @@ async function stagePost(ctx, run, save) {
   if (!posted && shownCount > 0) {
     posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: "REQUEST_CHANGES" });
     run.posted = { inline: posted?.inline ?? 0 };
+    await save(run);
+  }
+  // Outside the post's guard: a step retried after the post still keeps them
+  // (keeping one twice changes nothing).
+  if (shownCount > 0 && run.posted && !run.posted.none) {
     // Findings with no thread of their own (nitpicks and findings outside the
     // diff, listed in the body; or GitHub would not place them) are kept, so
     // they too must be addressed before approval. One that names no file
@@ -701,11 +710,10 @@ async function stagePost(ctx, run, save) {
       await keepOpenFindings(ctx.storage, inBody.map((x) => ({
         id: x.id, path: x.path, line: x.line ?? null, text: String(x.text).slice(0, 2500), sha: run.headSha,
         severe: x.severe ?? (x.severity === "critical" || x.severity === "major" || x.category === "security"),
-      })), ctx.deps.log);
+      })));
     }
-    await save(run);
   }
-  if (!posted) run.posted = { inline: 0, none: true };
+  if (!run.posted) run.posted = { inline: 0, none: true };
   const complete = cov.complete;
   // Only a complete review marks the commit done and moves the PR's last
   // reviewed commit on: after an incomplete one, the next review starts from
@@ -723,14 +731,24 @@ async function stagePost(ctx, run, save) {
   return ctx.deps.now();
 }
 
-// Adds findings to the PR's list of open body findings (one entry per id).
-// Past MAX_OPEN_FINDINGS the oldest go, and the log says so.
-async function keepOpenFindings(storage, items, log) {
-  const have = (await storage.get(OPEN_FINDINGS)) ?? [];
-  const ids = new Set(have.map((x) => x.id));
-  for (const x of items) if (x.id && !ids.has(x.id)) { have.push(x); ids.add(x.id); }
-  if (have.length > MAX_OPEN_FINDINGS) log?.({ ev: "open_findings_dropped", dropped: have.length - MAX_OPEN_FINDINGS });
-  await storage.put(OPEN_FINDINGS, have.slice(-MAX_OPEN_FINDINGS));
+// The PR's open body-only findings: kept, listed, dropped one by one, and
+// cleared. Keeping one twice changes nothing, so a retried step is safe.
+export async function keepOpenFindings(storage, items) {
+  for (const x of items) {
+    if (!x.id) continue;
+    const k = `${OPEN_FINDINGS}${x.id}`;
+    if (!(await storage.get(k))) await storage.put(k, x);
+  }
+}
+export async function listOpenFindings(storage) {
+  return [...(await storage.list({ prefix: OPEN_FINDINGS })).values()];
+}
+export async function dropOpenFinding(storage, id) {
+  await storage.delete(`${OPEN_FINDINGS}${id}`);
+}
+export async function clearOpenFindings(storage) {
+  const keys = [...(await storage.list({ prefix: OPEN_FINDINGS })).keys()];
+  for (let i = 0; i < keys.length; i += 128) await storage.delete(keys.slice(i, i + 128));
 }
 
 // --- threads: earlier findings the new commits addressed ------------------------
@@ -760,17 +778,29 @@ async function stageThreads(ctx, run, save) {
     const login = ctx.slug ?? DEFAULT_SLUG;
     const threads = await fx.ownThreads(run.repo.full, run.pr, login);
     const reopened = new Set((await ctx.storage.get(REOPENED)) ?? []);
+    const accepted = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
+    // A thread resolved by someone without write access still holds back
+    // approval until a review finds it fixed (it is then accepted) or a
+    // writer resolves it.
+    const writers = new Map();
+    const unendorsed = async (t) => {
+      if (!t.resolved || !t.resolvedBy || t.resolvedBy === login || accepted.has(t.id) || typeof fx.canWrite !== "function") return false;
+      if (!writers.has(t.resolvedBy)) writers.set(t.resolvedBy, await fx.canWrite(run.repo.full, t.resolvedBy));
+      return !writers.get(t.resolvedBy);
+    };
     const items = [];
     let earlier = 0;
     for (const t of threads) {
       // This review's own threads were written at this head: nothing since.
-      if (t.resolved || !t.originalCommit || t.originalCommit === run.headSha) continue;
+      if (!t.originalCommit || t.originalCommit === run.headSha) continue;
+      const stranger = await unendorsed(t);
+      if (t.resolved && !stranger) continue;
       earlier++;
       if (!t.path || reopened.has(t.id)) continue;
       // The item's id is the thread's own: one finding can have two threads.
-      items.push({ kind: "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
+      items.push({ kind: stranger ? "accept" : "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
     }
-    const inBody = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.sha && f.sha !== run.headSha);
+    const inBody = (await listOpenFindings(ctx.storage)).filter((f) => f.sha && f.sha !== run.headSha);
     for (const f of inBody) {
       if (!f.path) continue;
       items.push({ kind: "body", id: `b:${f.id}`, findingId: f.id, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
@@ -804,6 +834,8 @@ async function stageThreads(ctx, run, save) {
         if (typeof f.patch !== "string") { x.state = "open"; continue; }
         const near = nearHunks(f.patch, x.line);
         if (!near.touched) { x.state = "untouched"; continue; }
+        // Cut to fit: the model would judge part of the change. A person does.
+        if (near.cut) { x.state = "open"; continue; }
         x.near = near.text;
         x.state = "judge";
       }
@@ -846,9 +878,15 @@ async function stageThreads(ctx, run, save) {
     if (x.kind === "thread") {
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
       await fx.resolveThread(run.repo.full, x.threadId);
+    } else if (x.kind === "accept") {
+      // Already resolved (by someone without write access): the note, and
+      // it no longer holds back approval.
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      const acc = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
+      acc.add(x.threadId);
+      await ctx.storage.put(ACCEPTED, [...acc].slice(-500));
     } else {
-      const left = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.id !== x.findingId);
-      await ctx.storage.put(OPEN_FINDINGS, left);
+      await dropOpenFinding(ctx.storage, x.findingId);
     }
     th.resolved++;
     x.state = "resolved";

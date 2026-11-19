@@ -52,6 +52,8 @@ test("a long diff near the line is cut, and says so", () => {
   assert.equal(near.touched, true);
   assert.ok(near.text.length < 9000);
   assert.match(near.text, /…\(cut\)$/);
+  assert.equal(near.cut, true);
+  assert.equal(nearHunks(SINCE, 11).cut, undefined);
 });
 
 test("the prompt fences every piece of PR text, and its answer is read strictly", () => {
@@ -167,4 +169,37 @@ test("critical, major and security findings need a second model, of another prov
   // No second provider at all: never fixed on one word.
   const one = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite" });
   assert.equal((await judgeAddressed({ items, env: one, cfg: config(one), deps: deps(fetch) })).results.get("s1"), "uncertain");
+});
+
+test("a model with no usable answer hands over to the next one", async () => {
+  const seen = [];
+  const fetch = async (url) => {
+    const who = url.includes("anthropic") ? "anthropic" : "gemini";
+    seen.push(who);
+    if (who === "gemini") return reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: "not json" }] } }] });
+    return reply(200, { content: [{ type: "text", text: JSON.stringify({ results: [{ id: "f1", status: "uncertain" }] }) }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } });
+  };
+  const e = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite,anthropic:claude-haiku-5-5" });
+  const out = await judgeAddressed({ items: [{ id: "f1", path: "a.js", finding: "x", original: "o", since: SINCE }], env: e, cfg: config(e), deps: deps(fetch) });
+  assert.deepEqual(seen, ["gemini", "anthropic"]);
+  assert.equal(out.outcome.kind, "ok");
+  assert.equal(out.results.get("f1"), "uncertain");
+  // Nobody answered usably: unavailable, so the summary says so.
+  const bad = async () => reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: "{}" }] } }] });
+  const one = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite" });
+  assert.equal((await judgeAddressed({ items: [{ id: "f1", path: "a.js", finding: "x", original: "o", since: SINCE }], env: one, cfg: config(one), deps: deps(bad) })).outcome.kind, "unavailable");
+});
+
+test("the second opinion on a severe finding is another kind of provider, never the same family", async () => {
+  const asked = [];
+  const fetch = async (url, init) => {
+    const model = decodeURIComponent(/models\/([^:]+):/.exec(url)?.[1] ?? "anthropic");
+    asked.push(model);
+    const out = JSON.stringify({ results: [{ id: "s1", status: "fixed", reason: "r" }] });
+    return reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: out }] } }] });
+  };
+  const e = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it" });
+  const out = await judgeAddressed({ items: [{ id: "s1", severe: true, path: "a.js", finding: "x", original: "o", since: SINCE }], env: e, cfg: config(e), deps: deps(fetch) });
+  assert.deepEqual(asked, ["gemini-3.5-flash-lite"]);
+  assert.equal(out.results.get("s1"), "uncertain");
 });

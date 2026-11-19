@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { PrState, helpText, parseCommand } from "../src/pr-state.js";
 import { MARKER } from "../src/effects.js";
 import { doCtx, memoryStorage } from "./helpers.js";
+import { keepOpenFindings, listOpenFindings } from "../src/review-run.js";
 
 const NOW = Date.UTC(2026, 10, 19, 21, 0, 0);
 const repo = { full: "TanksterAI/browser-relay", name: "browser-relay", ownerId: "259206056" };
@@ -65,7 +66,7 @@ test("does not approve while a thread or a body-only finding is open, or the lat
   assert.equal(approvals(open.calls).length, 0);
 
   const body = await make();
-  await body.storage.put("openFindings", [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }]);
+  await keepOpenFindings(body.storage, [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }]);
   await decide(body);
   assert.equal(approvals(body.calls).length, 0);
 
@@ -114,9 +115,10 @@ test("a finished review, and a resolved or reopened thread, each ask for a decis
   assert.equal(out.action, "decide");
   // A second event while one waits adds nothing.
   await m.obj.onEvent({ delivery: "d2", ev: { kind: "thread", action: "resolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t2" } });
-  assert.deepEqual(((await m.storage.get("outbox")) ?? []).map((x) => [x.type, Boolean(x.reopened)]), [["decide", false]]);
+  const decisions = async () => ((await m.storage.get("outbox")) ?? []).filter((x) => x.type === "decide").map((x) => [x.type, Boolean(x.reopened)]);
+  assert.deepEqual(await decisions(), [["decide", false]]);
   await m.obj.onEvent({ delivery: "d3", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t2" } });
-  assert.deepEqual(((await m.storage.get("outbox")) ?? []).map((x) => [x.type, Boolean(x.reopened)]), [["decide", false], ["decide", true]]);
+  assert.deepEqual(await decisions(), [["decide", false], ["decide", true]]);
 
   // A closed pull request gets no decision.
   const closed = await make();
@@ -143,12 +145,12 @@ test("resolve and approve: top-level commands from writers that resolve every th
   for (const cmd of ["resolve", "approve"]) {
     // No complete review of the head is needed for these, as CodeRabbit's.
     const m = await make({ threads: [thread("t1", false), thread("t2", true), thread("t3", false)], reviewed: "b".repeat(40) });
-    await m.storage.put("openFindings", [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }]);
+    await keepOpenFindings(m.storage, [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }]);
     const out = await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: `@tankster-ai-review ${cmd}` } });
     assert.equal(out.cmd, cmd);
     await drain(m.obj);
     assert.deepEqual(m.calls.filter((c) => c[0] === "resolveThread").map((c) => c[1]), ["t1", "t3"]);
-    assert.deepEqual(await m.storage.get("openFindings"), []);
+    assert.deepEqual(await listOpenFindings(m.storage), []);
     const [[, review]] = approvals(m.calls);
     assert.match(review.body, /@rishitank/);
   }
@@ -190,12 +192,17 @@ test("a thread reopened after an approval asks for changes even when the head ha
   assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 1);
 });
 
-test("a thread reopened by hand is remembered, and forgotten once resolved again", async () => {
+test("a thread reopened by hand is remembered, and forgotten only once a writer resolves it", async () => {
   const m = await make();
-  const ev = (action) => ({ kind: "thread", action, repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "PRRT_9" });
+  const ev = (action, login = "rishitank") => ({ kind: "thread", action, repo, pr: 39, sender: { login, bot: false }, threadId: "PRRT_9" });
   await m.obj.onEvent({ delivery: "d1", ev: ev("unresolved") });
   assert.deepEqual(await m.storage.get("reopenedThreads"), ["PRRT_9"]);
-  await m.obj.onEvent({ delivery: "d2", ev: ev("resolved") });
+  // An outsider's resolve keeps the mark.
+  await m.obj.onEvent({ delivery: "d2", ev: ev("resolved", "stranger") });
+  await drain(m.obj);
+  assert.deepEqual(await m.storage.get("reopenedThreads"), ["PRRT_9"]);
+  await m.obj.onEvent({ delivery: "d3", ev: ev("resolved") });
+  await drain(m.obj);
   assert.deepEqual(await m.storage.get("reopenedThreads"), []);
 });
 
@@ -228,13 +235,35 @@ test("resolving that makes no progress is a failed attempt, not a loop", async (
 
 test("a merged pull request forgets its open findings, reopened threads and summary comment", async () => {
   const m = await make();
-  await m.storage.put("openFindings", [{ id: "f1" }]);
+  await keepOpenFindings(m.storage, [{ id: "f1" }]);
   await m.storage.put("reopenedThreads", ["PRRT_1"]);
   await m.storage.put("summaryComment", 5);
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: true } });
-  for (const k of ["openFindings", "reopenedThreads", "summaryComment"]) assert.equal(await m.storage.get(k), undefined, k);
+  for (const k of ["reopenedThreads", "summaryComment"]) assert.equal(await m.storage.get(k), undefined, k);
+  assert.deepEqual(await listOpenFindings(m.storage), []);
   const kept = await make();
   await kept.storage.put("summaryComment", 5);
   await kept.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: false } });
   assert.equal(await kept.storage.get("summaryComment"), 5, "closed unmerged may be reopened");
+});
+
+test("the approval is re-checked against a draft too: a PR made a draft meanwhile is not approved", async () => {
+  const m = await make();
+  let n = 0;
+  m.fx.pullRequest = async () => ({ state: "open", draft: n++ > 0, head: { sha: HEAD } });
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0);
+});
+
+test("a stranger-resolved thread is cleared by a writer's approve, or once a review accepted it as fixed", async () => {
+  const stranger = () => [{ id: "t1", resolved: true, resolvedBy: "stranger" }];
+  const cmd = await make({ threads: stranger(), writers: ["rishitank"] });
+  await cmd.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
+  await drain(cmd.obj);
+  assert.equal(approvals(cmd.calls).length, 1);
+
+  const acc = await make({ threads: stranger(), writers: ["rishitank"] });
+  await acc.storage.put("acceptedThreads", ["t1"]);
+  await decide(acc);
+  assert.equal(approvals(acc.calls).length, 1);
 });
