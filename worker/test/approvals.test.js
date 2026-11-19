@@ -247,7 +247,9 @@ test("a merged pull request forgets its open findings, reopened threads and summ
   await m.storage.put("reopenedThreads", ["PRRT_1"]);
   await m.storage.put("summaryComment", 5);
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: true } });
-  for (const k of ["reopenedThreads", "summaryComment"]) assert.equal(await m.storage.get(k), undefined, k);
+  await m.storage.put("reopenSeq", 3);
+  await m.obj.onEvent({ delivery: "d9", ev: { kind: "closed", repo, pr: 39, merged: true } });
+  for (const k of ["reopenedThreads", "summaryComment", "acceptedThreads", "reopenSeq"]) assert.equal(await m.storage.get(k), undefined, k);
   assert.deepEqual(await listOpenFindings(m.storage), []);
   const kept = await make();
   await kept.storage.put("summaryComment", 5);
@@ -307,4 +309,20 @@ test("resolve: a thread GitHub refused keeps the command pending; nothing is cle
   }
   assert.deepEqual(await listOpenFindings(m.storage), []);
   assert.equal(approvals(m.calls).length, 1);
+});
+
+test("a decision due now gets the alarm to itself: the review in progress steps at the next one", async () => {
+  const m = await make();
+  await m.storage.put("runmeta:j1", { id: "j1", stage: "draft" });
+  let stepped = 0;
+  m.obj.stepActiveRun = async () => { stepped++; return null; };
+  await m.obj.outbox({ type: "decide" });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 0, "no review step beside the decision");
+  assert.equal(approvals(m.calls).length, 1);
+  assert.ok(m.storage.alarm !== null, "the review is woken again");
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 1);
 });

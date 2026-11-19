@@ -310,7 +310,7 @@ export class PrState {
       await this.ctx.storage.put("state", st);
       // Merged: what the reviewer kept about it is of no more use.
       if (ev.merged) {
-        await this.ctx.storage.delete([REOPENED, ACCEPTED, SUMMARY_KEY]);
+        await this.ctx.storage.delete([REOPENED, ACCEPTED, SUMMARY_KEY, "reopenSeq"]);
         await clearOpenFindings(this.ctx.storage);
       }
       await this.ctx.storage.delete("debounce");
@@ -426,10 +426,15 @@ export class PrState {
     // run is looked at again shortly.
     // Failures here (before the run's own step, which counts its own) back
     // off, and six in a row give the run up: it must never wake for ever.
+    // A decision or a resolve/approve command due now gets this invocation to
+    // itself: it may make two dozen GitHub calls, and a review step's would
+    // share Workers Free's 50 subrequests. The review moves on at the next.
+    const due = ((await this.ctx.storage.get("outbox")) ?? []).find((x) => !(x.notBefore > this.now()));
+    const heavy = due && (due.type === "decide" || (due.type === "command" && (due.cmd === "resolve" || due.cmd === "approve")));
     let runNext;
     try {
-      runNext = await this.stepActiveRun();
-      await this.ctx.storage.delete("runFailures");
+      runNext = heavy ? ((await activeRun(this.ctx.storage)) ? this.now() : null) : await this.stepActiveRun();
+      if (!heavy) await this.ctx.storage.delete("runFailures");
     } catch (e) {
       const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
       console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
