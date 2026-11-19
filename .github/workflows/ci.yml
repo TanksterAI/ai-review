@@ -19,21 +19,16 @@ permissions:
 jobs:
   test:
     name: test
-    # Light lane, run-bound so a light runner only ever takes a job of this
-    # run: see "Light lane" in TanksterAI/.github's README. No Docker, no
-    # toolchain, no install.
-    runs-on: >-
-      ${{ (vars.CI_LIGHT_RUNNER == 'tankster-light'
-      && format('tankster-light-{0}-{1}', github.run_id, github.run_attempt))
-      || vars.CI_RUNNER || 'ubuntu-latest' }}
+    # This repository is public: GitHub-hosted runners are free and unlimited
+    # here, and the org's own runners refuse public repositories.
+    runs-on: ubuntu-latest # hosted-only: public repository
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The light image cannot start a downloaded Node (it has no
-      # libatomic.so.1), so the tests run on the Node 24 the runner itself
-      # ships for JavaScript actions: github-script's process.execPath.
+      # The tests run on the Node 24 the runner ships for JavaScript actions
+      # (github-script's process.execPath), so no toolchain is installed.
       - name: Test
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:

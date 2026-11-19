@@ -35,5 +35,8 @@ jobs:
     # through fromJSON too, which accepts a boolean or the string
     # 'true'/'false' (an API dispatch may send either).
     with:
+      # This repository is public: GitHub-hosted runners are free here, and
+      # the org's own runners refuse public repositories.
+      runs-on: ubuntu-latest
       pr-number: ${{ fromJSON(inputs.pr || '0') }}
       force: ${{ fromJSON(inputs.force || 'false') }}

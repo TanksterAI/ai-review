@@ -80,7 +80,7 @@ GitHub ──webhook──▶ Worker /v1/github/webhook ──▶ PR Durable Obj
                     (read-only App token)          (coverage.js)                         + commit status
                                                                                          "Tankster AI Review"
 
-REVIEW_MODE=runner (the earlier path): the alarm starts runner.yml (light lane, OIDC), which
+REVIEW_MODE=runner (the earlier path): the alarm starts runner.yml (hosted runner, OIDC), which
 sends the diff to Worker /v1/runner/review in one request (one prompt, at most 90,000 characters).
 ```
 
@@ -283,7 +283,7 @@ These are Worker settings for now; a per-repository key (`reviews.profile` in `.
 ## Limits worth knowing
 
 - **What it reads.** It sees the diff, not the whole repository, so it can miss problems that need wider context. The App's review (REVIEW_MODE=worker) reads every reviewable file, in batches (see "Full coverage"). The single-prompt paths (v1's `review.yml`, and REVIEW_MODE=runner) still read at most 90,000 characters of diff, 20,000 per file, and list what they did not read; they set no coverage status, so they never satisfy the merge gate.
-- **Light runner.** It cannot start a Node binary downloaded by `actions/setup-node` (its image has no `libatomic.so.1`), so this repository's CI runs the tests on the Node 24 that the runner ships for JavaScript actions. The review job is a JavaScript action and is unaffected.
+- **This repository's own CI runs on GitHub-hosted runners.** The repository is public, so they are free here, and the org's own runners refuse public repositories. The tests run on the Node 24 that the runner ships for JavaScript actions. `review.yml`, which private repositories call, still follows the org's `CI_RUNNER` and light lane.
 - **CPU.** Workers Free allows 10 ms of CPU per request, so the single-prompt paths' workflows send at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it. A Durable Object alarm has 30 s, which is why the full-coverage review runs there. The grounding gate collects the diff's words once and reads only a few lines per finding.
 - **Verification narrows errors; it cannot end them.**
   - Two models can agree on a wrong finding.
