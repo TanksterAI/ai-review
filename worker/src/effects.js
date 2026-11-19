@@ -17,6 +17,9 @@ const PR_SCOPE = { pull_requests: "write" };
 // The Worker's own review reads the pull request and its files with this.
 const READ_SCOPE = { contents: "read", pull_requests: "read" };
 const STATUS_SCOPE = { statuses: "write" };
+// Reading threads through GraphQL names each comment's commit: Commit
+// objects need contents:read as well.
+const THREAD_SCOPE = { contents: "read", pull_requests: "write" };
 export const STATUS_CONTEXT = "Tankster AI Review";
 export const MARKER = "<!-- tankster-ai-review -->";
 
@@ -194,7 +197,14 @@ export function createEffects(env, deps = {}) {
         const text = [body, `Reviewed commit ${String(commitId).slice(0, 7)}.`, listed && `#### Findings (GitHub would not place them inline)\n\n${listed}`]
           .filter(Boolean)
           .join("\n\n");
-        await app.call("POST", path, { token, body: { event, body: text } });
+        try {
+          await app.call("POST", path, { token, body: { event, body: text } });
+        } catch (e2) {
+          // Refused for the event itself (GitHub allows no decision on some
+          // pull requests): the findings are still posted, as a comment.
+          if (e2.status !== 422 || event === "COMMENT") throw e2;
+          await app.call("POST", path, { token, body: { event: "COMMENT", body: text } });
+        }
         return { inline: 0 };
       }
     },
@@ -203,14 +213,22 @@ export function createEffects(env, deps = {}) {
 
     // An approval of exactly the commit that was checked: GitHub refuses it if
     // that commit is no longer the PR's (the caller checks the head first).
+    // false when GitHub refuses it (422: the commit left the PR, or the App
+    // may not approve this pull request), rather than an error retried for ever.
     async approve(repoFull, pr, { commitId, body }) {
       const name = nameOf(repoFull);
       if (!SHA.test(String(commitId))) throw new Error("approve takes a commit id");
       const token = await app.installationToken([name], PR_SCOPE);
-      await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`, {
-        token,
-        body: { commit_id: commitId, event: "APPROVE", body: `${MARKER}\n${body}` },
-      });
+      try {
+        await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`, {
+          token,
+          body: { commit_id: commitId, event: "APPROVE", body: `${MARKER}\n${body}` },
+        });
+        return true;
+      } catch (e) {
+        if (e.status === 422) return false;
+        throw e;
+      }
     },
 
     // The App's own review decision as GitHub counts it: its latest review
@@ -234,7 +252,7 @@ export function createEffects(env, deps = {}) {
     // finding each is about. botLogin as GraphQL names it: the slug, no [bot].
     async ownThreads(repoFull, pr, botLogin) {
       const name = nameOf(repoFull);
-      const token = await app.installationToken([name], PR_SCOPE);
+      const token = await app.installationToken([name], THREAD_SCOPE);
       const out = [];
       let after = null;
       for (let page = 0; page < 20; page++) {
@@ -248,6 +266,7 @@ export function createEffects(env, deps = {}) {
             line: Number.isInteger(t.line) ? t.line : null, originalLine: Number.isInteger(t.originalLine) ? t.originalLine : null,
             commentId: c.databaseId, body: String(c.body ?? ""), diffHunk: String(c.diffHunk ?? ""),
             originalCommit: c.originalCommit?.oid ?? null, findingId: findingIdOf(c.body),
+            resolvedBy: t.resolvedBy?.login ?? null,
           });
         }
         if (!conn?.pageInfo?.hasNextPage) break;
@@ -259,7 +278,7 @@ export function createEffects(env, deps = {}) {
     async resolveThread(repoFull, threadId) {
       const name = nameOf(repoFull);
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(threadId))) throw new Error("not a thread id");
-      const token = await app.installationToken([name], PR_SCOPE);
+      const token = await app.installationToken([name], THREAD_SCOPE);
       const data = await graphql(token, RESOLVE_MUTATION, { id: threadId });
       return data?.resolveReviewThread?.thread?.isResolved === true;
     },
@@ -310,7 +329,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after:
       reviewThreads(first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated path line originalLine
+          id isResolved isOutdated path line originalLine resolvedBy { login }
           comments(first: 1) { nodes { databaseId author { login } body diffHunk originalCommit { oid } } }
         }
       }

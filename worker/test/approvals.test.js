@@ -179,6 +179,62 @@ test("many threads are resolved over several alarms, never more than the step al
     most = Math.max(most, m.calls.slice(before).filter((c) => c[0] === "resolveThread").length);
   }
   assert.equal(m.calls.filter((c) => c[0] === "resolveThread").length, 95);
-  assert.ok(most <= 40, `at most 40 a step (was ${most})`);
+  assert.ok(most <= 20, `at most 20 a step (was ${most})`);
   assert.equal(approvals(m.calls).length, 1);
+});
+
+test("a thread reopened after an approval asks for changes even when the head has no complete review", async () => {
+  // Approved by command at a head that was never reviewed in full.
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD }, reviewed: "b".repeat(40) });
+  await decide(m, { reopened: true });
+  assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 1);
+});
+
+test("a thread reopened by hand is remembered, and forgotten once resolved again", async () => {
+  const m = await make();
+  const ev = (action) => ({ kind: "thread", action, repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "PRRT_9" });
+  await m.obj.onEvent({ delivery: "d1", ev: ev("unresolved") });
+  assert.deepEqual(await m.storage.get("reopenedThreads"), ["PRRT_9"]);
+  await m.obj.onEvent({ delivery: "d2", ev: ev("resolved") });
+  assert.deepEqual(await m.storage.get("reopenedThreads"), []);
+});
+
+test("a thread resolved by someone without write access still counts as open", async () => {
+  const m = await make({ threads: [{ id: "t1", resolved: true, resolvedBy: "stranger" }], writers: ["rishitank"] });
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0);
+  const ok = await make({ threads: [{ id: "t1", resolved: true, resolvedBy: "rishitank" }, { id: "t2", resolved: true, resolvedBy: "tankster-ai-review" }] });
+  await decide(ok);
+  assert.equal(approvals(ok.calls).length, 1);
+  // The App's own resolving needs no permission check.
+  assert.equal(ok.calls.some((c) => c[0] === "canWrite" && c[1] === "tankster-ai-review"), false);
+});
+
+test("resolving that makes no progress is a failed attempt, not a loop", async () => {
+  const m = await make({ threads: [thread("t1", false)] });
+  m.fx.resolveThread = async (_r, id) => { m.calls.push(["resolveThread", id]); return false; };
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  let threw = 0;
+  for (let i = 0; i < 20 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    m.storage.alarm = null;
+    // As the runtime: an alarm that throws is retried.
+    try { await m.obj.alarm(); } catch { threw++; }
+  }
+  assert.ok(threw >= 1);
+  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0, "given up after its attempts");
+  assert.ok(m.calls.filter((c) => c[0] === "resolveThread").length <= 5);
+  assert.equal(approvals(m.calls).length, 0);
+});
+
+test("a merged pull request forgets its open findings, reopened threads and summary comment", async () => {
+  const m = await make();
+  await m.storage.put("openFindings", [{ id: "f1" }]);
+  await m.storage.put("reopenedThreads", ["PRRT_1"]);
+  await m.storage.put("summaryComment", 5);
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: true } });
+  for (const k of ["openFindings", "reopenedThreads", "summaryComment"]) assert.equal(await m.storage.get(k), undefined, k);
+  const kept = await make();
+  await kept.storage.put("summaryComment", 5);
+  await kept.obj.onEvent({ delivery: "d1", ev: { kind: "closed", repo, pr: 39, merged: false } });
+  assert.equal(await kept.storage.get("summaryComment"), 5, "closed unmerged may be reopened");
 });

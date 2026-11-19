@@ -43,7 +43,7 @@ import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
-import { addressedNote, findingIdOf, judgeAddressed, nearHunks } from "./addressed.js";
+import { addressedNote, findingIdOf, judgeAddressed, nearHunks, severeFinding } from "./addressed.js";
 import { DEFAULT_SLUG } from "./webhook.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
@@ -89,6 +89,9 @@ const planKey = (id) => `${RUN}${id}:plan`;
 // findings a review could only list in its body (they have no thread).
 export const SUMMARY_KEY = "summaryComment";
 export const OPEN_FINDINGS = "openFindings";
+// Threads a person reopened by hand (pr-state.js): never resolved again by
+// the reviewer; they are that person's to close.
+export const REOPENED = "reopenedThreads";
 const MAX_OPEN_FINDINGS = 50;
 const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
@@ -424,8 +427,15 @@ async function stagePlan(ctx, run, save) {
   for (const [i, parts] of batches.entries()) await ctx.storage.put(batchKey(run.id, i), { parts, status: "pending", draftTries: 0, verifyTries: 0, waitUntil: 0 });
   run.batches = batches.length;
   if (!batches.length && !plan.uncovered.length) {
-    // Nothing reviewable at all: a pass.
-    return finish(ctx, run, save, { state: "success", description: "No reviewable changes (deleted, binary or generated files only).", reviewedSha: run.headSha });
+    // Nothing reviewable at all: a pass. Earlier threads are still checked (a
+    // commit that deletes a file can address them), then the summary.
+    await ctx.storage.put(summaryKey(run.id), { summary: "No reviewable changes (deleted, binary or generated files only).", about: "", shown: 0, complete: true, none: true, since: run.since ?? null, covered: 0, reviewable: 0 });
+    run.result = { complete: true, shown: 0, covered: 0, reviewable: 0, none: true };
+    run.posted = { inline: 0, none: true };
+    await ctx.env.LEDGER?.put(doneKeyOf(run), utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
+    run.stage = "threads";
+    await save(run);
+    return ctx.deps.now();
   }
   if (!batches.length) {
     // Reviewable files, none of which could be taken: the review says so.
@@ -665,7 +675,9 @@ async function stagePost(ctx, run, save) {
     if (off.length) text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
     text += `\n\n_Incremental review: commits after \`${run.since.slice(0, 7)}\`._`;
   }
-  const shownCount = merged.shown.inline.length + merged.shown.general.length;
+  // Every finding the review shows blocks approval, whatever its severity
+  // (CodeRabbit's default); those the quiet profile leaves out are not shown.
+  const shownCount = review.blocking;
   // Posted once, and only with findings: a step retried after the post (a
   // failed write below) does not post the review again. A review with no
   // findings posts nothing (CodeRabbit does not either); the summary comment
@@ -674,15 +686,23 @@ async function stagePost(ctx, run, save) {
   if (!posted && shownCount > 0) {
     posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: "REQUEST_CHANGES" });
     run.posted = { inline: posted?.inline ?? 0 };
-    // Findings with no thread of their own (outside the diff, or GitHub would
-    // not place them) are kept, so they too must be addressed before approval.
+    // Findings with no thread of their own (nitpicks and findings outside the
+    // diff, listed in the body; or GitHub would not place them) are kept, so
+    // they too must be addressed before approval. One that names no file
+    // cannot be checked against later changes, so it is not kept: it would
+    // block approval with nothing to resolve.
     const inBody = [
-      ...merged.shown.general.map((f) => ({ id: f.id, path: f.path ?? null, line: Number.isInteger(f.line) ? f.line : null, text: `${f.title}\n\n${f.body ?? ""}` })),
+      ...review.listed,
       // GitHub's refusal (422) moves every inline comment to the body; those
       // off the diff are in the body either way.
-      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])].map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, text: c.body })),
-    ];
-    if (inBody.length) await keepOpenFindings(ctx.storage, inBody.map((x) => ({ ...x, text: String(x.text).slice(0, 2500), sha: run.headSha })));
+      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])].map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, severe: severeFinding(c.body), text: c.body })),
+    ].filter((x) => x.id && x.path);
+    if (inBody.length) {
+      await keepOpenFindings(ctx.storage, inBody.map((x) => ({
+        id: x.id, path: x.path, line: x.line ?? null, text: String(x.text).slice(0, 2500), sha: run.headSha,
+        severe: x.severe ?? (x.severity === "critical" || x.severity === "major" || x.category === "security"),
+      })), ctx.deps.log);
+    }
     await save(run);
   }
   if (!posted) run.posted = { inline: 0, none: true };
@@ -704,10 +724,12 @@ async function stagePost(ctx, run, save) {
 }
 
 // Adds findings to the PR's list of open body findings (one entry per id).
-async function keepOpenFindings(storage, items) {
+// Past MAX_OPEN_FINDINGS the oldest go, and the log says so.
+async function keepOpenFindings(storage, items, log) {
   const have = (await storage.get(OPEN_FINDINGS)) ?? [];
   const ids = new Set(have.map((x) => x.id));
   for (const x of items) if (x.id && !ids.has(x.id)) { have.push(x); ids.add(x.id); }
+  if (have.length > MAX_OPEN_FINDINGS) log?.({ ev: "open_findings_dropped", dropped: have.length - MAX_OPEN_FINDINGS });
   await storage.put(OPEN_FINDINGS, have.slice(-MAX_OPEN_FINDINGS));
 }
 
@@ -719,6 +741,13 @@ async function keepOpenFindings(storage, items) {
 
 async function stageThreads(ctx, run, save) {
   const fx = ctx.fx;
+  // Every step ends with save(run): stepRun counts a step as failed until it
+  // is saved, and six in a row give the run up.
+  const again = async (th) => {
+    await ctx.storage.put(threadsKey(run.id), th);
+    await save(run);
+    return ctx.deps.now();
+  };
   const done = async (th) => {
     if (th) await ctx.storage.put(threadsKey(run.id), th);
     run.stage = "summary";
@@ -730,20 +759,25 @@ async function stageThreads(ctx, run, save) {
   if (!th) {
     const login = ctx.slug ?? DEFAULT_SLUG;
     const threads = await fx.ownThreads(run.repo.full, run.pr, login);
+    const reopened = new Set((await ctx.storage.get(REOPENED)) ?? []);
     const items = [];
+    let earlier = 0;
     for (const t of threads) {
       // This review's own threads were written at this head: nothing since.
-      if (t.resolved || !t.path || !t.originalCommit || t.originalCommit === run.headSha) continue;
-      items.push({ kind: "thread", id: t.findingId ?? t.id, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, state: "new" });
+      if (t.resolved || !t.originalCommit || t.originalCommit === run.headSha) continue;
+      earlier++;
+      if (!t.path || reopened.has(t.id)) continue;
+      // The item's id is the thread's own: one finding can have two threads.
+      items.push({ kind: "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
     }
-    for (const f of (await ctx.storage.get(OPEN_FINDINGS)) ?? []) {
-      if (!f.sha || f.sha === run.headSha || !f.path) continue;
-      items.push({ kind: "body", id: f.id, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, state: "new" });
+    const inBody = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.sha && f.sha !== run.headSha);
+    for (const f of inBody) {
+      if (!f.path) continue;
+      items.push({ kind: "body", id: `b:${f.id}`, findingId: f.id, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
     }
-    th = { items, open: threads.filter((t) => !t.resolved).length, resolved: 0, unchecked: null };
-    await ctx.storage.put(threadsKey(run.id), th);
+    th = { items, open: earlier + inBody.length, resolved: 0, unchecked: null };
     if (!items.length) return done(th);
-    return ctx.deps.now();
+    return again(th);
   }
 
   // The diffs since each finding's commit, a few commits a step.
@@ -774,8 +808,7 @@ async function stageThreads(ctx, run, save) {
         x.state = "judge";
       }
     }
-    await ctx.storage.put(threadsKey(run.id), th);
-    return ctx.deps.now();
+    return again(th);
   }
 
   // One model call a step, for as many items as fit.
@@ -790,7 +823,7 @@ async function stageThreads(ctx, run, save) {
       chars += size;
     }
     const out = await judgeAddressed({
-      items: batch.map((x) => ({ id: x.id, path: x.path, finding: x.body, original: x.original, since: x.near })),
+      items: batch.map((x) => ({ id: x.id, path: x.path, finding: x.body, original: x.original, since: x.near, severe: x.severe })),
       env: ctx.env, cfg: ctx.cfg, deps: ctx.deps,
     });
     run.spend.neurons += out.neurons ?? 0;
@@ -803,9 +836,7 @@ async function stageThreads(ctx, run, save) {
       for (const x of batch) x.state = out.results.get(x.id) === "fixed" ? "fixed" : "open";
     }
     for (const x of batch) delete x.near;
-    await ctx.storage.put(threadsKey(run.id), th);
-    await save(run);
-    return ctx.deps.now();
+    return again(th);
   }
 
   // Resolve what was fixed, a few a step: the note first, then the thread,
@@ -815,38 +846,35 @@ async function stageThreads(ctx, run, save) {
     if (x.kind === "thread") {
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
       await fx.resolveThread(run.repo.full, x.threadId);
-      th.resolved++;
     } else {
-      const left = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.id !== x.id);
+      const left = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.id !== x.findingId);
       await ctx.storage.put(OPEN_FINDINGS, left);
     }
+    th.resolved++;
     x.state = "resolved";
   }
-  if (fixed.length > APPLIES_PER_STEP) {
-    await ctx.storage.put(threadsKey(run.id), th);
-    return ctx.deps.now();
-  }
+  if (fixed.length > APPLIES_PER_STEP) return again(th);
   return done(th);
 }
 
 // --- summary: the one comment, edited in place ------------------------------
 
-export function summaryText({ headSha, summary, about, shown, complete, since, threads }) {
+export function summaryText({ headSha, summary, about, shown, complete, since, threads, none = false }) {
   const lines = ["### Tankster AI Review", ""];
   lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
-  if (!complete) lines.push(summary, "");
+  if (!complete || none) lines.push(summary, "");
   else if (shown) lines.push(`Actionable comments posted: ${shown}. ${summary}`, "");
   else lines.push("No actionable comments were generated in the latest review. 🎉", "");
   if (threads) {
     const parts = [];
-    if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier thread")} addressed and resolved`);
+    if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);
     const stillOpen = Math.max(0, threads.open - threads.resolved);
     if (stillOpen) parts.push(`${stillOpen} still open`);
     if (parts.length) lines.push(`Earlier findings: ${parts.join("; ")}.`, "");
     if (threads.unchecked) lines.push(`Some open threads could not be checked this time (${threads.unchecked}); they stay open.`, "");
   }
-  lines.push(about);
-  return lines.join("\n");
+  if (about) lines.push(about);
+  return lines.join("\n").trimEnd();
 }
 
 async function stageSummary(ctx, run, save) {
@@ -861,7 +889,9 @@ async function stageSummary(ctx, run, save) {
   const r = run.result ?? { complete: false, shown: 0, covered: 0, reviewable: 0 };
   return finish(ctx, run, save, {
     state: r.complete ? "success" : "failure",
-    description: r.complete
+    description: r.none
+      ? "No reviewable changes (deleted, binary or generated files only)."
+      : r.complete
       ? `Reviewed all ${plural(r.reviewable, "file")} (100%): ${plural(r.shown, "confirmed finding")}.`
       : `Incomplete: ${r.covered} of ${r.reviewable} files reviewed. Comment "review" to try again.`,
     posted: Boolean(run.posted && !run.posted.none),

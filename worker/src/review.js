@@ -770,7 +770,9 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     ...(verification ? [verificationLine(confirmed, hidden, verification)] : []),
     reviewedLine,
     meta.costLine ?? `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
-    "- Its decision follows its findings, as CodeRabbit's Automatic Approvals do: changes requested while any is open, approved once its threads are resolved and the latest commit is reviewed in full. A second opinion beside the Claude review, not a replacement.",
+    meta.advisory
+      ? "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement."
+      : "- Its decision follows its findings, as CodeRabbit's Automatic Approvals do: changes requested while any is open, approved once its threads are resolved and the latest commit is reviewed in full. A second opinion beside the Claude review, not a replacement.",
     meta.again ?? "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
     "- Suggestions can be committed from the comment; check them first, like any change. Each finding also has a prompt for AI coding agents, and an id that stays the same while its title does.",
     "",
@@ -780,7 +782,11 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   // A last bound: what is cut is the end of the text, never the block.
   if (body.length > MAX_BODY_CHARS) body = `${body.slice(0, MAX_BODY_CHARS - 40)}\n\n…(cut to GitHub's size limit)`;
   // For the summary comment: the Worker's own summary line and the details.
-  return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n") };
+  // blocking: every finding the review shows (inline, nitpicks, outside the
+  // diff); those the quiet profile left out are not shown, so they never
+  // block. listed: the ones shown only in the body, which have no thread.
+  const inBody = [...nitpicks, ...outside].map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
+  return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n"), blocking: total, listed: inBody };
 }
 
 // A comment's first line (its labels and title), for lists where the whole

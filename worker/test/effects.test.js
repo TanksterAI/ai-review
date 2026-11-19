@@ -220,10 +220,15 @@ const thread = (over = {}) => ({
 test("ownThreads: the App's own threads across pages, read through GraphQL with the finding id", async () => {
   const pages = [
     { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [thread(), thread({ id: "PRRT_2", comments: { nodes: [{ databaseId: 12, author: { login: "coderabbitai" }, body: "x", diffHunk: "", originalCommit: { oid: "1".repeat(40) } }] } })] } } } } },
-    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [thread({ id: "PRRT_3", isResolved: true, line: null })] } } } } },
+    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [thread({ id: "PRRT_3", isResolved: true, line: null, resolvedBy: { login: "rishitank" } })] } } } } },
   ];
   const app = fakeApp(() => pages.shift());
   const list = await createEffects({}, { app }).ownThreads("TanksterAI/x", 3, "tankster-ai-review");
+  // Commit objects in GraphQL need contents:read too.
+  assert.deepEqual(app.log.tokens[0], { repos: ["x"], permissions: { contents: "read", pull_requests: "write" } });
+  assert.match(app.log.calls[0].body.query, /resolvedBy \{ login \}/);
+  assert.equal(list[1].resolvedBy, "rishitank");
+  assert.equal(list[0].resolvedBy, null);
   assert.equal(app.log.calls[0].path, "/graphql");
   assert.deepEqual(app.log.calls[0].body.variables, { owner: "TanksterAI", name: "x", pr: 3, after: null });
   assert.equal(app.log.calls[1].body.variables.after, "c1");
@@ -266,4 +271,18 @@ test("upsertSummary: edits the summary comment in place, and posts a new one onl
   // Deleted by someone: a new one.
   assert.equal(await fx.upsertSummary("TanksterAI/x", 3, 7, "S3"), 8);
   assert.equal(app.log.calls.at(-1).method, "POST");
+});
+
+test("a 422 for the decision itself still posts the findings, as a comment; a refused approval is false, not an error", async () => {
+  let n = 0;
+  const app = fakeApp((m, path, opts) => {
+    n++;
+    if (opts.body.event !== "COMMENT") return err(422);
+    return {};
+  });
+  await createEffects({}, { app }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
+  assert.deepEqual(app.log.calls.map((c) => c.body.event), ["REQUEST_CHANGES", "REQUEST_CHANGES", "COMMENT"]);
+  assert.equal(await createEffects({}, { app }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }), false);
+  const boom = fakeApp(() => err(500));
+  await assert.rejects(createEffects({}, { app: boom }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }));
 });

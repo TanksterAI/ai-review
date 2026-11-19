@@ -8,6 +8,9 @@
 //     since the finding's commit leaves it open, with no model call.
 //   - Otherwise one model reads the finding, the code it was written about and
 //     the changes near it since, and answers fixed, present or uncertain.
+//   - A critical, major or security finding needs a second model, of another
+//     provider, to agree it is fixed: one model's word on text the PR's author
+//     controls is not enough for those.
 //   - Anything else (no model could answer, the diff is gone or cut, the
 //     answer is unclear) leaves the thread open for a person to resolve.
 
@@ -120,6 +123,13 @@ export function readResults(text, ids) {
   return out;
 }
 
+// From our comment's label line ("**Major (security): …**"): whether a
+// finding needs two models to agree it is fixed.
+export function severeFinding(body) {
+  const first = String(body ?? "").split("\n")[0];
+  return /^\*\*(Critical|Major) \(/.test(first) || /^\*\*\w+ \(security\):/.test(first);
+}
+
 /** The comment's body with CodeRabbit's note, added once. */
 export function addressedNote(body, sha) {
   const note = `${ADDRESSED_MARK} Addressed in commit ${String(sha).slice(0, 7)}`;
@@ -128,35 +138,51 @@ export function addressedNote(body, sha) {
 }
 
 /**
- * Asks the first model of ADDRESSED_CHAIN that can answer. Returns {results:
- * Map id -> status, outcome: {kind: "ok" | "unavailable", reason?}, neurons,
- * usd, by}. Never throws for a model's failure: the threads stay open.
+ * Asks the first model of ADDRESSED_CHAIN that can answer; items marked
+ * severe that it calls fixed go to a second model of another provider, and
+ * stay uncertain unless it agrees. Returns {results: Map id -> status,
+ * outcome: {kind: "ok" | "unavailable", reason?}, neurons, usd, by}. Never
+ * throws for a model's failure: the threads stay open.
  */
 export async function judgeAddressed({ items, env, cfg, deps }) {
   const spend = { neurons: 0, usd: 0 };
   if (!items.length) return { results: new Map(), outcome: { kind: "ok" }, ...spend, by: null };
-  const { system, user } = addressedPrompt({ items, tag: randomTag() });
-  const chars = system.length + user.length;
-  const ids = new Set(items.map((x) => x.id));
+  const providers = createProviders(env, cfg, parseChain(env.ADDRESSED_CHAIN || DEFAULT_ADDRESSED_CHAIN), deps);
   const reasons = [];
-  for (const p of createProviders(env, cfg, parseChain(env.ADDRESSED_CHAIN || DEFAULT_ADDRESSED_CHAIN), deps)) {
-    if (!p.configured) continue;
-    if (await p.exhausted()) { reasons.push(`${p.id} is out of quota`); continue; }
-    const a = await p.affordable(chars, MAX_OUTPUT);
-    if (!a.ok) { reasons.push(a.reason ?? `${p.id} cannot take it`); continue; }
-    let r;
-    try {
-      r = await p.complete({ system, user, maxOutput: MAX_OUTPUT, ...(p.kind === "anthropic" ? { schema: RESULT_SCHEMA } : {}) });
-    } catch (e) {
-      if (!(e instanceof ProviderError)) throw e;
-      reasons.push(e.reason);
-      continue;
+  // The first provider after `skip` (ids) that answers about `list`.
+  async function ask(list, skip) {
+    const { system, user } = addressedPrompt({ items: list, tag: randomTag() });
+    const chars = system.length + user.length;
+    const ids = new Set(list.map((x) => x.id));
+    for (const p of providers) {
+      if (!p.configured || skip.has(p.id)) continue;
+      if (await p.exhausted()) { reasons.push(`${p.id} is out of quota`); continue; }
+      const a = await p.affordable(chars, MAX_OUTPUT);
+      if (!a.ok) { reasons.push(a.reason ?? `${p.id} cannot take it`); continue; }
+      let r;
+      try {
+        r = await p.complete({ system, user, maxOutput: MAX_OUTPUT, ...(p.kind === "anthropic" ? { schema: RESULT_SCHEMA } : {}) });
+      } catch (e) {
+        if (!(e instanceof ProviderError)) throw e;
+        reasons.push(e.reason);
+        continue;
+      }
+      spend.neurons += r.neurons ?? 0;
+      spend.usd += r.usd ?? 0;
+      const results = readResults(r.text, ids);
+      deps.log?.({ ev: "addressed_checked", provider: p.id, items: list.length, answered: results.size });
+      return { results, by: p.id };
     }
-    spend.neurons += r.neurons ?? 0;
-    spend.usd += r.usd ?? 0;
-    const results = readResults(r.text, ids);
-    deps.log?.({ ev: "addressed_checked", provider: p.id, items: items.length, answered: results.size });
-    return { results, outcome: { kind: "ok" }, ...spend, by: p.id };
+    return null;
   }
-  return { results: new Map(), outcome: { kind: "unavailable", reason: reasons.at(-1) ?? "no model is set up to check them" }, ...spend, by: null };
+  const first = await ask(items, new Set());
+  if (!first) return { results: new Map(), outcome: { kind: "unavailable", reason: reasons.at(-1) ?? "no model is set up to check them" }, ...spend, by: null };
+  const results = first.results;
+  const severe = items.filter((x) => x.severe && results.get(x.id) === "fixed");
+  if (severe.length) {
+    // Another provider only: the same one asked twice is no second opinion.
+    const second = await ask(severe, new Set([first.by]));
+    for (const x of severe) if (second?.results.get(x.id) !== "fixed") results.set(x.id, "uncertain");
+  }
+  return { results, outcome: { kind: "ok" }, ...spend, by: first.by };
 }

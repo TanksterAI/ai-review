@@ -65,7 +65,7 @@ const geminiDay = reply(429, { error: { details: [{ violations: [{ quotaId: "Gen
 
 // Model providers: Gemini models draft (one finding on any batch that shows
 // `flag`), Claude Haiku verifies (confirms all). Overrides per model by name.
-function fakeModels({ flag = "worker/src/m3.js", gemini = {}, anthropic = null } = {}) {
+function fakeModels({ flag = "worker/src/m3.js", gemini = {}, anthropic = null, finding = {} } = {}) {
   const calls = [];
   const fetch = async (url, init) => {
     const body = JSON.parse(init.body);
@@ -78,7 +78,7 @@ function fakeModels({ flag = "worker/src/m3.js", gemini = {}, anthropic = null }
       const findings = [];
       if (shownFiles(text).includes(flag)) {
         const { line, evidence } = firstLine(text, flag);
-        findings.push({ path: flag, line, severity: "minor", type: "issue", category: "bug", title: "Off by one", evidence, claim: "It is off by one.", symbols: [], body: "Fix the bound." });
+        findings.push({ path: flag, line, severity: "minor", type: "issue", category: "bug", title: "Off by one", evidence, claim: "It is off by one.", symbols: [], body: "Fix the bound.", ...finding });
       }
       return reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: JSON.stringify({ summary: "s", findings }) }] } }] });
     }
@@ -667,10 +667,11 @@ test("earlier threads: fixed ones get CodeRabbit's note and are resolved; untouc
     ownThread({ id: "PRRT_g", findingId: "eeee5555", commentId: 75, body: "**Minor (bug): g**\n<sub>Potential issue · finding `eeee5555`</sub>\n\ng" }),
   ];
   const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }, { filename: "worker/src/gone.js", status: "removed" }] });
-  const models = judging({ aaaa1111: "fixed", cccc3333: "present" });
+  const models = judging({ "t:PRRT_a": "fixed", "t:PRRT_c": "present" });
   const s = setup({ github: threadsGithub({ files: SMALL, threads, since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
   await runAll(s);
-  assert.deepEqual(models.judged.map((l) => l.map((x) => x.id)), [["aaaa1111", "cccc3333", "eeee5555"]]);
+  // Items are named by their thread: one finding can have two threads.
+  assert.deepEqual(models.judged.map((l) => l.map((x) => x.id)), [["t:PRRT_a", "t:PRRT_c", "t:PRRT_g"]]);
   // This review's own thread is not compared with anything.
   assert.equal(s.github.calls.some((c) => c.startsWith("compare:a")), false);
   // The model saw the finding, the original code and the change near it, as data.
@@ -684,17 +685,18 @@ test("earlier threads: fixed ones get CodeRabbit's note and are resolved; untouc
   // The note goes on before the thread is resolved.
   assert.ok(s.github.calls.indexOf("edit:71") < s.github.calls.indexOf("resolve:PRRT_a"));
   assert.ok(s.github.calls.includes("ownThreads:tankster-ai-review"));
-  assert.match(s.github.summaries[0].body, /Earlier findings: 2 earlier threads addressed and resolved; 4 still open\./);
+  // Five earlier threads were open (not this review's own, nor the resolved one).
+  assert.match(s.github.summaries[0].body, /Earlier findings: 2 earlier findings addressed and resolved; 3 still open\./);
 });
 
 test("threads after a force-push, or when no model can answer, stay open; the review still finishes", async () => {
-  const diverged = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => ({ status: "diverged", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] }) }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  const diverged = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => ({ status: "diverged", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] }) }), models: judging({ "t:PRRT_a": "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
   await runAll(diverged);
   assert.deepEqual(diverged.github.resolved, []);
   assert.equal(diverged.models.judged.length, 0);
 
   const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
-  const none = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "workers-ai:@cf/openai/gpt-oss-120b" } });
+  const none = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models: judging({ "t:PRRT_a": "fixed" }), env: { ADDRESSED_CHAIN: "workers-ai:@cf/openai/gpt-oss-120b" } });
   await runAll(none);
   assert.deepEqual(none.github.resolved, []);
   assert.match(none.github.summaries[0].body, /Some open threads could not be checked this time \([^)]+\); they stay open\./);
@@ -702,7 +704,7 @@ test("threads after a force-push, or when no model can answer, stay open; the re
   assert.equal(none.done[0].reviewedSha, HEAD);
 
   // A finding whose commit is gone (404) stays open too.
-  const gone = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => { throw Object.assign(new Error("nf"), { status: 404 }); } }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  const gone = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => { throw Object.assign(new Error("nf"), { status: 404 }); } }), models: judging({ "t:PRRT_a": "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
   await runAll(gone);
   assert.deepEqual(gone.github.resolved, []);
 });
@@ -721,7 +723,7 @@ test("findings with no thread (outside the diff) are kept as open findings, and 
 
   // The next review, at a new head: the change near it fixed it.
   const NEXT = "f".repeat(40);
-  const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [open[0].id]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [`b:${open[0].id}`]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
   await later.storage.put("openFindings", open);
   later.github.compare = async (_r, base, head) => (base === HEAD
     ? { status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: `@@ -${open[0].line},1 +${open[0].line},1 @@\n-x\n+y` }] }
@@ -740,4 +742,60 @@ test("findings GitHub would not place inline (its 422 fallback) are kept as open
   assert.equal(open.length, 1);
   assert.match(open[0].id, /^[0-9a-f]{8}$/);
   assert.equal(open[0].path, "worker/src/m3.js");
+});
+
+test("a review that checks threads from many commits still finishes: every threads step counts as a success", async () => {
+  // 30 threads, each from its own commit: six compare steps, then the rest.
+  const commits = Array.from({ length: 30 }, (_, i) => (i + 10).toString(16).padStart(40, "0"));
+  const threads = commits.map((c, i) => ownThread({ id: `PRRT_${i}`, findingId: null, commentId: 100 + i, originalCommit: c }));
+  const github = threadsGithub({ files: SMALL, threads });
+  const plain = github.compare;
+  github.compare = async (r, base, head) => (commits.includes(base) ? { status: "ahead", files: [] } : plain(r, base, head));
+  const s = setup({ github, models: fakeModels({ flag: "nothing-here.js" }) });
+  await runAll(s);
+  assert.equal(s.done[0].gaveUp, false);
+  assert.equal(s.done[0].reviewedSha, HEAD);
+  assert.equal(s.github.summaries.length, 1);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+});
+
+test("nitpicks block approval too: listed in the body, kept as open findings; the quiet profile's left-out ones do not", async () => {
+  const nit = { severity: "trivial", type: "nitpick", title: "Name it better" };
+  const chill = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }) });
+  await runAll(chill);
+  assert.equal(chill.github.posted.length, 1);
+  assert.equal(chill.github.posted[0].event, "REQUEST_CHANGES");
+  assert.equal(chill.github.posted[0].comments.length, 0, "a nitpick goes in the body under the chill profile");
+  const open = await chill.storage.get("openFindings");
+  assert.equal(open.length, 1);
+  assert.equal(open[0].severe, false);
+  assert.match(chill.github.summaries[0].body, /Actionable comments posted: 1\./);
+
+  const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
+  await runAll(quiet);
+  assert.equal(quiet.github.posted.length, 0, "nothing shown, nothing to resolve: no review");
+  assert.equal((await quiet.storage.get("openFindings")) ?? null, null);
+  assert.match(quiet.github.summaries[0].body, /No actionable comments were generated/);
+});
+
+test("a thread a person reopened is never resolved by the reviewer again", async () => {
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const models = judging({ "t:PRRT_a": "fixed" });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await s.storage.put("reopenedThreads", ["PRRT_a"]);
+  await runAll(s);
+  assert.equal(models.judged.length, 0);
+  assert.deepEqual(s.github.resolved, []);
+  assert.match(s.github.summaries[0].body, /1 still open/);
+});
+
+test("a commit with nothing reviewable (a file deleted) still re-checks earlier threads, then says so", async () => {
+  const github = threadsGithub({ files: [file("worker/src/m3.js", undefined, { status: "removed", additions: 0, deletions: 30 })], threads: [ownThread()], since: () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "removed" }] }) });
+  const s = setup({ github, models: fakeModels({ flag: "nothing-here.js" }) });
+  await runAll(s);
+  assert.deepEqual(s.github.resolved, ["PRRT_a"]);
+  assert.equal(s.github.posted.length, 0);
+  assert.match(s.github.summaries[0].body, /No reviewable changes/);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+  assert.equal(s.done[0].reviewedSha, HEAD);
 });

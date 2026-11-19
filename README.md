@@ -88,22 +88,22 @@ sends the diff to Worker /v1/runner/review in one request (one prompt, at most 9
 
 Checked on 19 Nov 2026 against CodeRabbit's docs (Automatic Approvals, the request-changes workflow) and against what it did on TanksterAI/ai-review#14.
 
-- **A review only when there is something to say.** A review with findings is filed as **Changes requested**, with its inline comments. A review with no findings posts no review at all; CodeRabbit does not either.
+- **A review only when there is something to say.** A review with findings is filed as **Changes requested**, with its inline comments. A review with no findings posts no review at all; CodeRabbit does not either. Every finding the review shows counts, nitpicks included (the chill profile lists them in the body); those the quiet profile leaves out are not shown, so they count for nothing. Runner mode and v1 stay advisory: a comment review every time, with no summary comment, thread checks or approvals.
 - **One summary comment, edited in place.** The first review creates it, and every later one edits it (its id is kept in the PR's object; a deleted one is posted again). It names the commit reviewed, the commits since the last review, "Actionable comments posted: N" or "No actionable comments were generated in the latest review. 🎉", how many earlier threads were resolved, and the details (models, coverage, cost).
 - **Earlier threads, re-checked on every review** (`addressed.js`). For each of the App's own open threads written at an earlier commit:
   - its file deleted since: addressed;
   - no change within 40 lines of the finding since its commit: left open, with no model call;
-  - changed near it: one model (`ADDRESSED_CHAIN`, free models first, Claude Haiku last) reads the finding, the code it was about and the change, and answers fixed, present or uncertain. Only "fixed" counts.
+  - changed near it: one model (`ADDRESSED_CHAIN`, free models first, Claude Haiku last) reads the finding, the code it was about and the change, and answers fixed, present or uncertain. Only "fixed" counts. A critical, major or security finding also needs a second model, of another provider, to say fixed; without one it stays open.
 
-  An addressed thread gets CodeRabbit's note, "✅ Addressed in commit abc1234", then is resolved. Anything unclear stays open for a person: no model could answer (the summary says so), the finding's commit is gone, or a force-push means its commit is no longer behind the head. Findings a review could only list in its body (outside the diff, or GitHub would not place them) are kept in the PR's object and checked the same way.
+  An addressed thread gets CodeRabbit's note, "✅ Addressed in commit abc1234", then is resolved. Anything unclear stays open for a person: no model could answer (the summary says so), the finding's commit is gone, or a force-push means its commit is no longer behind the head. A thread a person reopened by hand is never resolved by the reviewer again. Findings a review could only list in its body (nitpicks, findings outside the diff, or ones GitHub would not place) are kept in the PR's object and checked the same way; one naming no file cannot be checked, so it is not kept. A merged pull request's kept findings and summary comment id are cleared.
 - **Approval** (`pr-state.js` `decide`), checked after every complete review, every thread resolved or reopened by hand, and the commands. It approves the head when:
   - the latest commit has a complete review (100% coverage);
-  - none of the App's own threads, and none of its body-only findings, is open. Every finding blocks, whatever its severity (CodeRabbit's default). Other people's threads and the Claude review's are theirs to manage;
+  - none of the App's own threads, and none of its body-only findings, is open. Every finding blocks, whatever its severity (CodeRabbit's default). A thread resolved by someone without write access still counts as open. Other people's threads and the Claude review's are theirs to manage;
   - it has not approved already;
   - the head is unchanged when it checks again just before approving.
 
-  A thread of its own reopened after its approval files Changes requested again. Drafts and closed pull requests are never approved.
-- **`resolve` and `approve`** (top-level comments by people with write access) resolve all of its threads, clear its body-only findings, and approve without waiting for a complete review, as CodeRabbit's do. Up to 40 threads are resolved an alarm; the rest go in the next ones.
+  A thread of its own reopened after its approval files Changes requested again, whatever commit was reviewed. Drafts and closed pull requests are never approved.
+- **`resolve` and `approve`** (top-level comments by people with write access) do the same, as CodeRabbit's do: they resolve all of its threads, clear its body-only findings, and approve without waiting for a complete review of the latest commit. Up to 20 threads are resolved an alarm; the rest go in the next ones, and the decision is its own outbox item.
 
 ### Full coverage: every file, however big the pull request
 

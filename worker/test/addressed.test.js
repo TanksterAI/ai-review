@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  ADDRESSED_MARK, ADDRESSED_WINDOW, DEFAULT_ADDRESSED_CHAIN, addressedNote, addressedPrompt, findingIdOf, judgeAddressed, nearHunks, readResults,
+  ADDRESSED_MARK, ADDRESSED_WINDOW, DEFAULT_ADDRESSED_CHAIN, addressedNote, addressedPrompt, findingIdOf, judgeAddressed, nearHunks, readResults, severeFinding,
 } from "../src/addressed.js";
 import { config } from "../src/config.js";
 import { memoryKv, testSleep } from "./helpers.js";
@@ -132,4 +132,39 @@ test("the judge moves past a model that is out of quota or fails, and reports wh
   const empty = await judgeAddressed({ items: [], env: e, cfg: config(e), deps: deps(fetch) });
   assert.equal(empty.outcome.kind, "ok");
   assert.equal(seen.length, calls);
+});
+
+test("critical, major and security findings need a second model, of another provider, to agree they are fixed", async () => {
+  assert.equal(severeFinding("**Major (bug): x**\n<sub>…</sub>"), true);
+  assert.equal(severeFinding("**Critical (reliability): x**"), true);
+  assert.equal(severeFinding("**Minor (security): x**"), true);
+  assert.equal(severeFinding("**Minor (bug): x**"), false);
+  assert.equal(severeFinding("quoted **Major (bug): x**"), false);
+
+  const answers = { gemini: { s1: "fixed", m1: "fixed" }, anthropic: { s1: "present" } };
+  const asked = [];
+  const fetch = async (url, init) => {
+    const who = url.includes("anthropic") ? "anthropic" : "gemini";
+    const body = JSON.parse(init.body);
+    const text = who === "gemini" ? body.contents[0].parts[0].text : body.messages[0].content;
+    const list = JSON.parse(/<<<BEGIN ITEMS (\w+)>>>\n([\s\S]*?)\n<<<END ITEMS \1>>>/.exec(text)[2]);
+    asked.push([who, list.map((x) => x.id)]);
+    const out = JSON.stringify({ results: list.map((x) => ({ id: x.id, status: answers[who][x.id] ?? "uncertain", reason: "r" })) });
+    return who === "gemini"
+      ? reply(200, { candidates: [{ finishReason: "STOP", content: { parts: [{ text: out }] } }] })
+      : reply(200, { content: [{ type: "text", text: out }], stop_reason: "end_turn", usage: { input_tokens: 10, output_tokens: 10 } });
+  };
+  const e = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite,anthropic:claude-haiku-5-5" });
+  const items = [{ id: "s1", severe: true, path: "a.js", finding: "x", original: "o", since: SINCE }, { id: "m1", path: "a.js", finding: "y", original: "o", since: SINCE }];
+  const out = await judgeAddressed({ items, env: e, cfg: config(e), deps: deps(fetch) });
+  // Only the severe one went to the second model; it disagreed.
+  assert.deepEqual(asked, [["gemini", ["s1", "m1"]], ["anthropic", ["s1"]]]);
+  assert.equal(out.results.get("s1"), "uncertain");
+  assert.equal(out.results.get("m1"), "fixed");
+  // Both agree: fixed.
+  answers.anthropic.s1 = "fixed";
+  assert.equal((await judgeAddressed({ items, env: e, cfg: config(e), deps: deps(fetch) })).results.get("s1"), "fixed");
+  // No second provider at all: never fixed on one word.
+  const one = env({ ADDRESSED_CHAIN: "gemini:gemini-3.5-flash-lite" });
+  assert.equal((await judgeAddressed({ items, env: one, cfg: config(one), deps: deps(fetch) })).results.get("s1"), "uncertain");
 });

@@ -25,7 +25,7 @@
 // with more than read access ever leaves the Worker.
 
 import { createJwksCache, verifyGithubOidc, OidcError } from "./oidc.js";
-import { buildPrompt, classifyFindings, codeSpan, parseFindingsBlock, placeComments, prepareFiles, renderReview, titleLine } from "./review.js";
+import { buildPrompt, classifyFindings, codeSpan, placeComments, prepareFiles, renderReview, titleLine } from "./review.js";
 import { draftWithChain } from "./draft.js";
 import { createLedger, createSerial, nextUtcMidnight, utcDay } from "./budget.js";
 import { capacity, createProviders, draftChain, verifyOff } from "./providers.js";
@@ -244,7 +244,7 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   const review = renderReview({
     answer, classified: shown, hidden, prepared,
     verification: { off: verified.off, weak: verified.weak, fallback: verified.fallback, fallbackBy: verified.fallbackBy, selfExcluded: verified.selfExcluded },
-    meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha, profile: cfg.profile },
+    meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha, profile: cfg.profile, advisory: true },
   });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
@@ -404,14 +404,12 @@ export async function handleRunnerReview(request, env, deps = {}) {
       }
       text += `\n\n_Incremental review: commits after \`${since.slice(0, 7)}\`._`;
     }
-    // As the Worker's own review (review-run.js): a review only when it has
-    // findings, filed as "Changes requested"; a clean one posts nothing.
+    // Runner mode stays advisory (a COMMENT review every time): it has no
+    // summary comment, no thread checks and no approvals, which only the
+    // Worker's own review (review-run.js) does.
     // If posting throws, the job is left open: a re-run of the runner (same
     // run id, next attempt) reviews again and posts.
-    const shown = (parseFindingsBlock(review.body)?.findings ?? []).filter((f) => f.status === "confirmed").length;
-    const posted = shown > 0 || comments.length > 0
-      ? await fx.postReview(job.repo.full, job.pr, { commitId: headSha, body: text, comments, event: "REQUEST_CHANGES" })
-      : { inline: 0 };
+    const posted = await fx.postReview(job.repo.full, job.pr, { commitId: headSha, body: text, comments });
     await finish();
     return json(200, { status: "reviewed", inline: posted.inline, usage: out.body.usage });
   }
