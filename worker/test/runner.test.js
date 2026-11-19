@@ -51,8 +51,19 @@ function run({ job = JOB, session, review, pr = {}, compare, files = [{ filename
     assert.equal(token, "ghs_clone");
     // Octokit's own logger prints request URLs (on deprecation notices, say).
     for (const level of ["debug", "info", "warn", "error"]) assert.equal(typeof opts?.log?.[level], "function", `log.${level} is silenced`);
-    for (const level of ["debug", "info", "warn", "error"]) assert.equal(opts.log[level]("GET /repos/TanksterAI/browser-relay/pulls/39"), undefined);
-    assert.notEqual(opts.log.warn, console.warn);
+    // Silent means nothing reaches the console, whatever the logger returns.
+    const printed = [];
+    const saved = {};
+    for (const m of ["log", "debug", "info", "warn", "error"]) {
+      saved[m] = console[m];
+      console[m] = (...a) => printed.push([m, ...a]);
+    }
+    try {
+      for (const level of ["debug", "info", "warn", "error"]) assert.equal(opts.log[level]("GET /repos/TanksterAI/browser-relay/pulls/39"), undefined);
+    } finally {
+      Object.assign(console, saved);
+    }
+    assert.deepEqual(printed, [], "Octokit's logger printed something");
     const listFiles = Symbol("listFiles");
     return {
       rest: {
