@@ -89,20 +89,64 @@ test("old delivery ids are pruned to the last 200", async () => {
   assert.ok(!kept.has("delivery:d0") && kept.has("delivery:d204"));
 });
 
-test("drafts wait; forks and bots need a writer to ask; outsiders are checked first", async () => {
+test("drafts wait; forks need a writer to ask; outsiders are checked first", async () => {
   const { obj, fx } = make({ writers: ["rishitank", "privatemember"] });
   assert.equal((await obj.onEvent({ delivery: "1", ev: review({ draft: true }) })).action, "draft");
   assert.equal((await obj.onEvent({ delivery: "2", ev: review({ fork: true }) })).action, "needs_approval");
-  assert.equal((await obj.onEvent({ delivery: "3", ev: review({ author: { login: "renovate[bot]", association: "NONE", bot: true } }) })).action, "needs_approval");
+  // A bot can only push a branch to this repository with write access, so it is reviewed.
+  assert.equal((await obj.onEvent({ delivery: "3", ev: review({ author: { login: "renovate[bot]", association: "NONE", bot: true } }) })).action, "job");
   // An org member whose association under-reports is reviewed after the API says so.
   assert.equal((await obj.onEvent({ delivery: "4", ev: review({ author: { login: "privatemember", association: "CONTRIBUTOR", bot: false } }) })).action, "author_check");
   // A real outsider gets the note, once, on opening.
   assert.equal((await obj.onEvent({ delivery: "5", ev: review({ author: { login: "someone", association: "CONTRIBUTOR", bot: false } }) })).action, "author_check");
   await drain(obj);
-  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "only the private member's PR");
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 2, "the bot's and the private member's PRs");
   const notes = fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
   assert.equal(notes.length, 2, "one for the fork, one for the outsider; none for the bot");
   assert.ok(notes.every((n) => /write access can comment/.test(n)));
+});
+
+// The merge gate requires the "Tankster AI Review" status on every pull
+// request, so one that waits for a writer must say so, not stay blank.
+test("a pull request that waits for a writer gets a pending status saying so", async () => {
+  const { obj, fx } = make({ writers: ["rishitank"] });
+  const fork = { fork: true, head: { sha: "b".repeat(40) }, author: { login: "outsider", association: "NONE", bot: false } };
+  await obj.onEvent({ delivery: "1", ev: review(fork) });
+  // A push to the fork's branch moves the head: the new commit waits too.
+  await obj.onEvent({ delivery: "2", ev: review({ ...fork, action: "synchronize", head: { sha: "c".repeat(40) } }) });
+  // A bot pushing from a fork has shown no write access: it waits like anyone.
+  await obj.onEvent({ delivery: "3", ev: review({ ...fork, head: { sha: "d".repeat(40) }, author: { login: "evil[bot]", association: "NONE", bot: true } }) });
+  // An outsider whose branch is in this repository (no write access by the API).
+  await obj.onEvent({ delivery: "4", ev: review({ head: { sha: "e".repeat(40) }, author: { login: "someone", association: "CONTRIBUTOR", bot: false } }) });
+  await drain(obj);
+  const statuses = fx.calls.filter((c) => c[0] === "setStatus");
+  assert.deepEqual(statuses.map((c) => [c[1], c[2], c[3]]), [
+    [repo.full, "b".repeat(40), "pending"],
+    [repo.full, "c".repeat(40), "pending"],
+    [repo.full, "d".repeat(40), "pending"],
+    [repo.full, "e".repeat(40), "pending"],
+  ]);
+  for (const c of statuses) {
+    assert.match(c[4], /write access/);
+    assert.match(c[4], /@tankster-ai-review review/);
+    assert.ok(c[4].length <= 140, "GitHub keeps 140 characters of a status description");
+  }
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0, "nothing is reviewed unasked");
+});
+
+test("a writer's own pull request is never marked as waiting for a writer", async () => {
+  const { obj, fx } = make({ writers: ["rishitank", "privatemember"] });
+  await obj.onEvent({ delivery: "1", ev: review() });
+  await obj.onEvent({ delivery: "2", ev: review({ pr: 40, author: { login: "privatemember", association: "CONTRIBUTOR", bot: false } }) });
+  await obj.onEvent({ delivery: "3", ev: review({ author: { login: "renovate[bot]", association: "NONE", bot: true } }) });
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "setStatus").length, 0);
+});
+
+test("a bot's push is reviewed after the quiet period, as a writer's is", async () => {
+  const { obj } = make();
+  const bot = { author: { login: "renovate[bot]", association: "NONE", bot: true } };
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review({ ...bot, action: "synchronize" }) })).action, "debounced");
 });
 
 test("pause and resume need write access, checked through the API", async () => {

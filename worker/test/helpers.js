@@ -122,6 +122,7 @@ export function fakeEffects({ writers = [] } = {}) {
     async dispatch(jobId) { calls.push(["dispatch", jobId]); },
     async comment(repo, pr, body) { calls.push(["comment", repo, pr, body]); },
     async canWrite(repo, login) { calls.push(["canWrite", repo, login]); return writers.includes(login); },
+    async setStatus(repo, sha, state, description) { calls.push(["setStatus", repo, sha, state, description]); return true; },
     async cloneToken(repo) { calls.push(["cloneToken", repo]); return "ghs_clone"; },
     async postReview(repo, pr, review) { calls.push(["postReview", repo, pr, review]); return { inline: review.comments.length }; },
     prLinesMap: new Map(),
