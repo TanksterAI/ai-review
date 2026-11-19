@@ -872,3 +872,20 @@ test("a thread reopened by hand while the review ran is not resolved, whatever t
   assert.deepEqual(s.github.resolved, []);
   assert.deepEqual(s.github.edits, []);
 });
+
+test("a later thread reopened while an earlier thread's GitHub call is pending is left open", async () => {
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const second = ownThread({ id: "PRRT_b", findingId: "bbbb2222", commentId: 72, body: "**Minor (bug): b**\n<sub>Potential issue · finding `bbbb2222`</sub>\n\nb" });
+  const models = judging({ "t:PRRT_a": "fixed", "t:PRRT_b": "fixed" });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread(), second], since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  const edit = s.github.editReviewComment.bind(s.github);
+  s.github.editReviewComment = async (r, id, body) => {
+    await edit(r, id, body);
+    // While the first thread's edit is pending, the second is reopened; and
+    // the first itself right after its edit.
+    if (id === 71) await s.storage.put("reopenedThreads", { PRRT_b: 1, PRRT_a: 2 });
+  };
+  await runAll(s);
+  assert.deepEqual(s.github.resolved, [], "neither is resolved");
+  assert.deepEqual(s.github.edits.map((e) => e.id), [71], "the second is not even noted");
+});

@@ -12,7 +12,7 @@ import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, activeRun, clearOpenFindings, dropRun, listOpenFindings, startRun, stepRun } from "./review-run.js";
+import { ACCEPTED, MAX_ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, activeRun, clearOpenFindings, dropRun, listOpenFindings, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -38,7 +38,8 @@ const TOP_LEVEL_ONLY = new Set(["resolve", "approve"]);
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
 const RESOLVE_PER_STEP = 20;
-const MAX_REOPENED = 200;
+// Past what ownThreads can ever list (1,000): a live mark is never evicted.
+const MAX_REOPENED = MAX_ACCEPTED;
 
 export function helpText(slug = DEFAULT_SLUG) {
   return [
@@ -430,7 +431,11 @@ export class PrState {
     // itself: it may make two dozen GitHub calls, and a review step's would
     // share Workers Free's 50 subrequests. The review moves on at the next.
     const due = ((await this.ctx.storage.get("outbox")) ?? []).find((x) => !(x.notBefore > this.now()));
-    const heavy = due && (due.type === "decide" || (due.type === "command" && (due.cmd === "resolve" || due.cmd === "approve")));
+    const isHeavy = (x) => Boolean(x) && (x.type === "decide" || (x.type === "command" && (x.cmd === "resolve" || x.cmd === "approve")));
+    const heavy = isHeavy(due);
+    // Whether a review step runs in this invocation: a heavy item that
+    // arrives while it runs (webhooks land during its GitHub calls) waits too.
+    const stepping = !heavy && Boolean(await activeRun(this.ctx.storage));
     let runNext;
     try {
       runNext = heavy ? ((await activeRun(this.ctx.storage)) ? this.now() : null) : await this.stepActiveRun();
@@ -454,7 +459,9 @@ export class PrState {
     }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     const isDue = (x) => !(x.notBefore > this.now());
-    const item = box.find(isDue);
+    const found = box.find(isDue);
+    // Left for the next alarm, its attempts untouched: a review step ran here.
+    const item = stepping && isHeavy(found) ? null : found;
     if (item) {
       if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
@@ -786,7 +793,7 @@ export class PrState {
     // write access included: later decisions count them as resolved too.
     const accepted = new Set((await this.ctx.storage.get(ACCEPTED)) ?? []);
     for (const t of threads) accepted.add(t.id);
-    await this.ctx.storage.put(ACCEPTED, [...accepted].slice(-500));
+    await this.ctx.storage.put(ACCEPTED, [...accepted].slice(-MAX_ACCEPTED));
     await clearOpenFindings(this.ctx.storage);
     await this.queueDecide({ force: true, login: item.login });
     return undefined;

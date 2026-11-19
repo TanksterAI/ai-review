@@ -97,6 +97,9 @@ export const REOPENED = "reopenedThreads";
 // Threads resolved by someone without write access that a later review found
 // fixed: they no longer hold back approval (pr-state.js decide).
 export const ACCEPTED = "acceptedThreads";
+// More than ownThreads can ever list (1,000), so no accepted thread (and no
+// reopen mark, pr-state.js) is ever evicted while it can still matter.
+export const MAX_ACCEPTED = 2000;
 const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
 // GitHub calls one threads step may make (each counts as a subrequest).
@@ -879,21 +882,24 @@ async function stageThreads(ctx, run, save) {
   // Resolve what was fixed, a few a step: the note first, then the thread,
   // so a thread is never resolved without saying why.
   const fixed = th.items.filter((x) => x.state === "fixed");
-  // Read again now: a thread reopened by hand while this review ran is that
-  // person's, whatever the model said.
-  const marks = (await ctx.storage.get(REOPENED)) ?? {};
+  // Read again for each thread, and again after each GitHub call: a thread
+  // reopened by hand while this review ran (a webhook can land while a call
+  // is pending) is that person's, whatever the model said.
+  const reopenedNow = async (id) => Boolean(id) && ((await ctx.storage.get(REOPENED)) ?? {})[id] !== undefined;
   for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
-    if (x.threadId && marks[x.threadId] !== undefined) { x.state = "open"; continue; }
+    if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
     if (x.kind === "thread") {
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
       await fx.resolveThread(run.repo.full, x.threadId);
     } else if (x.kind === "accept") {
       // Already resolved (by someone without write access): the note, and
       // it no longer holds back approval.
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
       const acc = new Set((await ctx.storage.get(ACCEPTED)) ?? []);
       acc.add(x.threadId);
-      await ctx.storage.put(ACCEPTED, [...acc].slice(-500));
+      await ctx.storage.put(ACCEPTED, [...acc].slice(-MAX_ACCEPTED));
     } else {
       await dropOpenFinding(ctx.storage, x.findingKey);
     }

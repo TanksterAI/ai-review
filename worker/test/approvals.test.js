@@ -326,3 +326,48 @@ test("a decision due now gets the alarm to itself: the review in progress steps 
   await m.obj.alarm();
   assert.equal(stepped, 1);
 });
+
+test("every vouched thread is kept, past 500", async () => {
+  const threads = Array.from({ length: 700 }, (_, i) => ({ id: `t${i}`, resolved: true, resolvedBy: "stranger" }));
+  const m = await make({ threads });
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
+  await drain(m.obj);
+  assert.equal((await m.storage.get("acceptedThreads")).length, 700);
+  // A later ordinary decision counts them all as resolved.
+  m.w.decision = null;
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 2);
+});
+
+test("a heavy item that arrives during a review step waits for the next alarm, its attempts untouched", async () => {
+  const m = await make();
+  await m.storage.put("runmeta:j1", { id: "j1", stage: "draft" });
+  let stepped = 0;
+  m.obj.stepActiveRun = async () => {
+    stepped++;
+    // A resolve command lands while the step's GitHub calls are pending.
+    if (stepped === 1) await m.obj.outbox({ type: "decide" });
+    return m.now?.() ?? NOW;
+  };
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 1);
+  assert.equal(approvals(m.calls).length, 0, "not in the step's invocation");
+  const [left] = (await m.storage.get("outbox")) ?? [];
+  assert.equal(left.attempts, 0);
+  assert.ok(m.storage.alarm !== null);
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 1, "the decision has its own invocation");
+  assert.equal(approvals(m.calls).length, 1);
+});
+
+test("reopen marks are never evicted while a thread could still be listed", async () => {
+  const m = await make();
+  for (let i = 0; i < 1001; i++) {
+    await m.obj.onEvent({ delivery: `d${i}`, ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: `T${i}` } });
+  }
+  const marks = await m.storage.get("reopenedThreads");
+  assert.equal(Object.keys(marks).length, 1001);
+  assert.ok("T0" in marks);
+});
