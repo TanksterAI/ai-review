@@ -22,7 +22,10 @@ function jobs(text) {
   assert.ok(start >= 0, "no jobs: block");
   const out = [];
   for (const line of lines.slice(start + 1)) {
-    const key = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(line);
+    // Comments and blank lines never end the block, wherever they sit.
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    // A job key, which may carry a trailing comment.
+    const key = /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line);
     if (key) out.push({ name: key[1], lines: [] });
     else if (/^\S/.test(line)) break;
     else if (out.length) out[out.length - 1].lines.push(line);
@@ -58,4 +61,27 @@ test("review.yml, which private repositories call, still follows the org's runne
   const text = read("review.yml");
   assert.match(text, /inputs\.runs-on/);
   assert.match(text, /vars\.CI_RUNNER \|\| 'ubuntu-latest'/);
+});
+
+test("the job reader sees every job, past comments and with trailing comments", () => {
+  const text = [
+    "on: push",
+    "jobs:",
+    "  a:",
+    "    runs-on: ubuntu-latest # hosted-only",
+    "# a comment at column 0 inside jobs:",
+    "",
+    "  b: # a trailing comment",
+    "    runs-on: self-hosted",
+    "    steps:",
+    "      - run: echo",
+    "  c:",
+    "    uses: ./x.yml",
+    "env:",
+    "  X: 1",
+  ].join("\n");
+  const found = jobs(text);
+  assert.deepEqual(found.map((j) => j.name), ["a", "b", "c"]);
+  assert.ok(found[1].lines.some((l) => /runs-on: self-hosted/.test(l)), "b keeps its own lines");
+  assert.ok(!found[2].lines.some((l) => /X: 1/.test(l)), "jobs end at the next top-level key");
 });
