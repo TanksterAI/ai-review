@@ -15,3 +15,7 @@ permissions:
 jobs:
   actionlint:
     uses: TanksterAI/.github/.github/workflows/workflows-lint.yml@v1
+    with:
+      # This repository is public: GitHub-hosted runners are free here, and
+      # the org's own runners refuse public repositories.
+      runs-on: ubuntu-latest

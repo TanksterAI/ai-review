@@ -33,12 +33,9 @@ concurrency:
 jobs:
   review:
     name: Review
-    # Light lane, run-bound so a light runner only ever takes a job of this
-    # run: see "Light lane" in TanksterAI/.github's README.
-    runs-on: >-
-      ${{ (vars.CI_LIGHT_RUNNER == 'tankster-light'
-      && format('tankster-light-{0}-{1}', github.run_id, github.run_attempt))
-      || vars.CI_RUNNER || 'ubuntu-latest' }}
+    # This repository is public: GitHub-hosted runners are free and unlimited
+    # here, and the org's own runners refuse public repositories.
+    runs-on: ubuntu-latest # hosted-only: public repository
     timeout-minutes: 15
     permissions:
       id-token: write
