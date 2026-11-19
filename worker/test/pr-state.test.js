@@ -1015,3 +1015,30 @@ test("a runner's complete message cannot claim full coverage", async () => {
   assert.equal(st.lastReviewed, "e".repeat(40));
   assert.equal(st.lastCompleteReviewed, undefined);
 });
+
+// github-actions[bot] opens PRs for workflows, some of which an outsider can
+// drive (pull_request_target, issue_comment): its PRs prove no write access.
+test("github-actions[bot]'s pull requests wait for a writer, like an outsider's", async () => {
+  const { obj, fx } = make({ writers: ["rishitank"] });
+  const gha = { head: { sha: "f".repeat(40) }, author: { login: "github-actions[bot]", association: "NONE", bot: true } };
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review(gha) })).action, "author_check");
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  assert.deepEqual(fx.calls.filter((c) => c[0] === "setStatus").map((c) => [c[2], c[3]]), [["f".repeat(40), "pending"]]);
+});
+
+test("the waiting status never replaces the result of a commit already reviewed or under review", async () => {
+  const { obj, fx, storage } = make({ writers: ["rishitank"] });
+  const A = "a".repeat(40), B = "b".repeat(40), C = "c".repeat(40);
+  const fork = (sha, action = "ready_for_review") => review({ action, fork: true, head: { sha }, author: { login: "outsider", association: "NONE", bot: false } });
+  // A writer asked for a review of A, and it finished.
+  await storage.put("state", { lastReviewed: A, lastCompleteReviewed: A, paused: false, closed: false });
+  await obj.onEvent({ delivery: "1", ev: fork(A) });
+  // B is being reviewed right now.
+  await storage.put("runmeta:r1", { id: "r1", stage: "draft", headSha: B });
+  await obj.onEvent({ delivery: "2", ev: fork(B, "synchronize") });
+  // C is neither: it waits.
+  await obj.onEvent({ delivery: "3", ev: fork(C, "synchronize") });
+  await drain(obj);
+  assert.deepEqual(fx.calls.filter((c) => c[0] === "setStatus").map((c) => c[2]), [C]);
+});

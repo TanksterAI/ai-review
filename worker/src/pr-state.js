@@ -97,6 +97,8 @@ export function needsApproval(slug = DEFAULT_SLUG) {
 // The pending status a pull request shows while it waits for a writer to ask
 // for its review. The merge gate requires the status, so it must not be blank.
 // GitHub keeps 140 characters of a description.
+const ACTIONS_BOT = /^github-actions(\[bot\])?$/i;
+
 export function waitingStatus(slug = DEFAULT_SLUG) {
   return `Waiting: someone with write access must comment @${slug} review`;
 }
@@ -327,9 +329,13 @@ export class PrState {
       }
       // A bot (Renovate, Dependabot, an agent's App) can push a branch to this
       // repository only with write access, so it is reviewed as a writer is.
+      // github-actions[bot] is the exception: workflows that an outsider can
+      // drive (pull_request_target, issue_comment) open PRs as it, so it is
+      // checked like anyone else (and has no write access of its own).
       // author_association can under-report (private org membership), so a
       // non-writer association is checked against the permission API first.
-      if (!ev.author.bot && !WRITER_ASSOCIATIONS.has(ev.author.association)) {
+      const trustedBot = ev.author.bot && !ACTIONS_BOT.test(ev.author.login);
+      if (!trustedBot && !WRITER_ASSOCIATIONS.has(ev.author.association)) {
         await this.ctx.storage.put("state", st);
         await this.outbox({ type: "author_check", login: ev.author.login, repo: ev.repo, pr: ev.pr, opening, sha: ev.head?.sha });
         return { action: "author_check" };
@@ -476,8 +482,13 @@ export class PrState {
 
   // Marks a commit as waiting for a writer. A review run sets the status
   // itself when it starts, so this never overwrites a real result.
+  // A commit already reviewed (a writer asked), or under review now, keeps the
+  // status its run set or will set.
   async waitingFor(fx, repoFull, sha, slug) {
     if (typeof fx.setStatus !== "function") return;
+    const st = await this.state();
+    if (sha === st.lastReviewed || sha === st.lastCompleteReviewed) return;
+    if ((await activeRun(this.ctx.storage))?.headSha === sha) return;
     await fx.setStatus(repoFull, sha, "pending", waitingStatus(slug));
   }
 
