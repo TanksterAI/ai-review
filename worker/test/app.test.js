@@ -187,6 +187,8 @@ test("webhook to runner to review: the whole path", async () => {
   const post = e.fx.calls.find((c) => c[0] === "postReview");
   assert.equal(post[1], "TanksterAI/browser-relay");
   assert.equal(post[3].commitId, "a".repeat(40));
+  // A review with findings asks for changes, as CodeRabbit's does.
+  assert.equal(post[3].event, "REQUEST_CHANGES");
   // The footer names the App's own commands, not v1's label and workflow.
   assert.match(post[3].body, /comment `@tankster-ai-review review` for the commits since this review/);
   assert.doesNotMatch(post[3].body, /ai-review` label/);
@@ -385,4 +387,33 @@ test("runner review: findings no verifier can check are never posted; the job wa
   assert.ok(box[0].notBefore > NOW_MS);
   // The drafter is not blamed: it is not skipped next time.
   assert.deepEqual((await obj.ctx.storage.get(`job:${jobId}`)).skip ?? [], []);
+});
+
+test("runner review with no findings posts no review, and still finishes its job", async () => {
+  const e = env({ AI: { async run() { return responsesResult(JSON.stringify({ summary: "Fine.", findings: [] })); } } });
+  const jobId = await openPr(e);
+  const files = [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }];
+  const r = await handleRunnerReview(await runnerReq("/v1/runner/review", { job: jobId, head_sha: "a".repeat(40), title: "t", body: "b", files }), e, deps(e));
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).status, "reviewed");
+  assert.equal(e.fx.calls.some((c) => c[0] === "postReview"), false);
+  const again = await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, deps(e));
+  assert.equal(again.status, 403, "the job is finished");
+});
+
+test("webhook: a thread of the App's own resolved by hand reaches the PR's object, which decides its approval", async () => {
+  const e = env();
+  const body = JSON.stringify({
+    action: "resolved",
+    repository: { full_name: "TanksterAI/browser-relay", name: "browser-relay", owner: { id: 259206056 } },
+    sender: { login: "rishitank", type: "User" },
+    pull_request: { number: 39 },
+    thread: { node_id: "PRRT_1", comments: [{ user: { login: "tankster-ai-review[bot]", type: "Bot" } }] },
+  });
+  const r = await handleWebhook(hook(body, { event: "pull_request_review_thread" }), e);
+  assert.equal(r.status, 202);
+  assert.deepEqual(await r.json(), { status: "accepted", action: "decide" });
+  // CodeRabbit's thread, or the App's own resolving: ignored.
+  const theirs = body.replace("tankster-ai-review[bot]", "coderabbitai[bot]");
+  assert.equal((await (await handleWebhook(hook(theirs, { event: "pull_request_review_thread" }), e)).json()).status, "ignored");
 });

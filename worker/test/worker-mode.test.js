@@ -28,6 +28,8 @@ function world({ files, head = sha("a") } = {}) {
     async fileSha() { return null; },
     async setStatus(_r, s, st, d) { fx.statuses.push({ sha: s, state: st, description: d }); return true; },
     async postReview(_r, _p, review) { fx.posted.push(review); return { inline: review.comments.length }; },
+    summaries: [],
+    async upsertSummary(_r, _p, id, body) { fx.summaries.push({ id, body }); return id ?? 501; },
     async prLines() { return new Map(); },
   };
   return { state, fx };
@@ -72,8 +74,8 @@ test("an opened PR is reviewed by the Worker itself: no runner, every file, one 
   await m.obj.onEvent({ delivery: "d1", ev: ev() });
   await settle(m);
   assert.ok(!m.fx.calls.some((c) => c[0] === "dispatch"), "no runner was started");
-  assert.equal(m.fx.posted.length, 1);
-  assert.match(m.fx.posted[0].body, /Coverage: 12 of 12 reviewable files \(100%\), [\d,]+ characters of diff, in \d+ passes\./);
+  assert.equal(m.fx.summaries.length, 1);
+  assert.match(m.fx.summaries[0].body, /Coverage: 12 of 12 reviewable files \(100%\), [\d,]+ characters of diff, in \d+ passes\./);
   assert.equal(m.fx.statuses.at(-1).state, "success");
   const st = await m.storage.get("state");
   assert.equal(st.lastReviewed, sha("a"));
@@ -92,10 +94,12 @@ test("a push during a review waits for it, then the next review covers only the 
   await m.obj.onEvent({ delivery: "d2", ev: { kind: "command", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review review" } });
   await settle(m);
   // The first review finished on its own commit; the second read from it on.
-  assert.equal(m.fx.posted.length, 2);
+  assert.equal(m.fx.summaries.length, 2);
   assert.ok(m.fx.calls.some((c) => c[0] === "compare" && c[1] === sha("a") && c[2] === sha("e")));
-  assert.match(m.fx.posted[1].body, /_Incremental review: commits after `aaaaaaa`\._/);
-  assert.match(m.fx.posted[1].body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+  assert.match(m.fx.summaries[1].body, /\*\*Latest review:\*\* commit `\w{7}`, the commits after `aaaaaaa`\./);
+  // One summary comment, edited in place: the second review edits the first's.
+  assert.equal(m.fx.summaries[1].id, 501);
+  assert.match(m.fx.summaries[1].body, /Coverage: 1 of 1 reviewable file \(100%\)/);
   assert.equal((await m.storage.get("state")).lastReviewed, sha("e"));
 });
 
@@ -159,7 +163,7 @@ test("after a single-prompt review (the runner), the first Worker review covers 
   await settle(m, NOW + 7200_000);
   assert.ok(m.fx.calls.some((c) => c[0] === "listFiles"), "the whole PR was listed");
   assert.ok(!m.fx.calls.some((c) => c[0] === "compare" && c[1] === sha("a")), "no review started from the runner's commit");
-  assert.match(m.fx.posted[0].body, /Coverage: 12 of 12 reviewable files \(100%\)/);
+  assert.match(m.fx.summaries[0].body, /Coverage: 12 of 12 reviewable files \(100%\)/);
   assert.equal((await m.storage.get("state")).lastCompleteReviewed, sha("e"));
 });
 
@@ -194,8 +198,10 @@ test("a review that waits for hours still records its finish: the next review is
   out = false;
   await settle(m, NOW + 2 * 24 * 3600_000);
   const st = await m.storage.get("state");
-  assert.equal(m.fx.posted.length, 2, "the waiting review, then the push's");
-  assert.match(m.fx.posted[1].body, /_Incremental review: commits after `aaaaaaa`\._/);
+  assert.equal(m.fx.summaries.length, 2, "the waiting review, then the push's");
+  assert.match(m.fx.summaries[1].body, /\*\*Latest review:\*\* commit `\w{7}`, the commits after `aaaaaaa`\./);
+  // One summary comment, edited in place: the second review edits the first's.
+  assert.equal(m.fx.summaries[1].id, 501);
   assert.equal(st.lastCompleteReviewed, sha("e"));
 });
 

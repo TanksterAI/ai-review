@@ -49,7 +49,9 @@ export function manifest(origin) {
       // reviewable file of the pull request was covered (the merge gate).
       statuses: "write",
     },
-    default_events: ["pull_request", "issue_comment", "pull_request_review_comment"],
+    // pull_request_review_thread: a thread resolved or reopened by hand
+    // decides the App's approval (pr-state.js decide).
+    default_events: ["pull_request", "issue_comment", "pull_request_review_comment", "pull_request_review_thread"],
   };
 }
 

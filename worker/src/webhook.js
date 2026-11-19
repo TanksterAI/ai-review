@@ -67,6 +67,18 @@ export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
     return null;
   }
 
+  // A thread resolved or reopened: only the App's own threads decide its
+  // approval (as CodeRabbit's do), and its own resolving needs no answer.
+  if (event === "pull_request_review_thread") {
+    if (p.action !== "resolved" && p.action !== "unresolved") return null;
+    const prNumber = p.pull_request?.number;
+    if (!Number.isInteger(prNumber)) return null;
+    const bot = `${slug}[bot]`;
+    if (sender.login === bot) return null;
+    if (p.thread?.comments?.[0]?.user?.login !== bot) return null;
+    return { kind: "thread", action: p.action, repo, pr: prNumber, sender, threadId: String(p.thread?.node_id ?? "") };
+  }
+
   // Commands: a mention of the bot in a PR conversation comment or a review
   // thread reply. The bot's own comments and other bots never command it.
   const isComment = event === "issue_comment" || event === "pull_request_review_comment";

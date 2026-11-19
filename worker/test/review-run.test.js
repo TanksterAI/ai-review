@@ -41,6 +41,9 @@ function fakeGithub({ files = PR9, pr = {}, compare = null, blobs = new Map(), s
     async fileSha(_r, path, ref) { calls.push(`fileSha:${path}@${ref.slice(0, 1)}`); return shas.get(`${path}@${ref}`) ?? null; },
     async setStatus(_r, sha, state, description) { calls.push("setStatus"); if (!statusOk) return false; this.statuses.push({ sha, state, description }); return true; },
     async postReview(_r, pr, review) { calls.push("postReview"); this.posted.push(review); return { inline: review.comments.length }; },
+    // The summary comment: one per PR, edited in place (its id is kept).
+    summaries: [],
+    async upsertSummary(_r, _p, id, body) { calls.push("upsertSummary"); this.summaries.push({ id, body }); return id ?? 501; },
     prLinesMap: new Map(),
     async prLines() { calls.push("prLines"); return this.prLinesMap; },
   };
@@ -231,7 +234,7 @@ test("a binary file without a patch is not reviewable; lockfiles and deletions a
   // The .png is never fetched; the .dat is, and found binary.
   assert.ok(!github.calls.includes("blob:11"));
   assert.ok(github.calls.includes("blob:22"));
-  const body = github.posted[0].body;
+  const body = github.summaries[0].body;
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
   assert.match(body, /Not reviewable \(4\): /);
   assert.equal(github.statuses.at(-1).state, "success");
@@ -250,8 +253,8 @@ test("every step stays inside Workers Free's 50 subrequests, however big the pul
     if (at === null) break;
     if (at > s.getNow()) s.setNow(at);
   }
-  assert.equal(github.posted.length, 1);
-  assert.match(github.posted[0].body, /Coverage: 250 of 250 reviewable files \(100%\)/);
+  assert.equal(github.summaries.length, 1);
+  assert.match(github.summaries[0].body, /Coverage: 250 of 250 reviewable files \(100%\)/);
   // GitHub calls are bounded per step by design, model and KV calls by the counter.
   assert.ok(worst <= 50, `the busiest step made ${worst} subrequests`);
   assert.ok(STEP_SUBREQUESTS < 50 && DRAFT_PARALLEL >= 2);
@@ -313,7 +316,7 @@ test("a batch no model can review after three tries makes the review incomplete,
   wrapped.calls = models.calls;
   const s = setup({ models: wrapped, env: { DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it" } });
   await runAll(s);
-  const { body } = s.github.posted[0];
+  const { body } = s.github.summaries[0];
   assert.match(body, /\*\*Incomplete review: \d+ of 18 reviewable files were covered\.\*\*/);
   assert.match(body, /Not covered \(\d+\): [^\n]*`worker\/src\/m3\.js` \(the model did not return a usable answer; try again later\)/);
   assert.equal(s.github.statuses.at(-1).state, "failure");
@@ -360,8 +363,8 @@ test("worst case, every free model refusing: still within 50 subrequests a step,
     assert.ok(at <= s.getNow() + 1, "no step waits: Claude can always draft");
   }
   assert.ok(worst <= 50, `the busiest step made ${worst} subrequests`);
-  assert.match(github.posted[0].body, /Coverage: 120 of 120 reviewable files \(100%\)/);
-  assert.match(github.posted[0].body, /`claude-haiku-5-5`/);
+  assert.match(github.summaries[0].body, /Coverage: 120 of 120 reviewable files \(100%\)/);
+  assert.match(github.summaries[0].body, /`claude-haiku-5-5`/);
 });
 
 test("an incomplete review marks nothing done, so the next one starts from the last complete review", async () => {
@@ -439,7 +442,7 @@ test("files GitHub sent without a patch are fetched only while they fit the pull
   assert.ok(fetched <= 6, `${fetched} blobs were fetched`);
   const stored = [...s.storage.map.keys()].filter((k) => /:p\d+$/.test(k)).length;
   assert.ok(stored <= 2, `${stored} patches were stored`);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /Not covered \(\d+\): `data\/big[1-5]\.js` \(the pull request is over the reviewer's limit of 100,000 characters of diff\)/);
   assert.equal(github.statuses.at(-1).state, "failure");
 });
@@ -490,7 +493,7 @@ test("a single line far longer than a batch (minified or generated data) is not 
   const github = fakeGithub({ files: [file("fixtures/data.json", huge), file("src/blob.js", long), file("src/a.js", added(5, "a_"))] });
   const s = setup({ github });
   await runAll(s);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /Coverage: 2 of 2 reviewable files \(100%\)/);
   assert.match(body, /Not reviewable \(1\): `fixtures\/data\.json` \(a line over 240,000 characters: minified or generated data\)/);
   assert.ok(!s.models.calls.some((c) => c.files?.includes("fixtures/data.json")));
@@ -500,7 +503,7 @@ test("when no reviewable file can be taken at all, a review still says so, and t
   const github = fakeGithub({ files: [file("src/a.js", added(400, "a_")), file("src/b.js", added(400, "b_"))] });
   const s = setup({ github, env: { MAX_PR_CHARS: "1000" } });
   await runAll(s);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /\*\*Incomplete review: 0 of 2 reviewable files were covered\.\*\*/);
   assert.match(body, /\n- Model: none: no file of this pull request could be sent to a model\.\n/);
   assert.equal(github.statuses.at(-1).state, "failure");
@@ -516,7 +519,7 @@ test("a minified file never uses up the pull request's limit, whatever the file 
     if (order === "bundle last") files.reverse();
     const s = setup({ github: fakeGithub({ files }), env: { MAX_PR_CHARS: "200000" } });
     await runAll(s);
-    const { body } = s.github.posted[0];
+    const { body } = s.github.summaries[0];
     assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/, order);
     assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/, order);
     assert.equal(s.github.statuses.at(-1).state, "success", order);
@@ -530,7 +533,7 @@ test("a minified file GitHub sent without a patch is not counted against the lim
   const github = fakeGithub({ files, blobs: new Map([[sha1, "y".repeat(300_000)], [sha2, "const b0 = 1;\nconst b1 = 2;\nconst b2 = 3;"]]) });
   const s = setup({ github, env: { MAX_PR_CHARS: "200000" } });
   await runAll(s);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
   assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/);
 });
@@ -542,7 +545,7 @@ test("a minified file without a patch is named as not reviewable, even when the 
   // src/a.js (about 127,000 characters annotated) leaves less than a batch of the limit.
   const s = setup({ github, env: { MAX_PR_CHARS: "150000" } });
   await runAll(s);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
   assert.match(body, /`data\/catalog\.json` \(a line over 240,000 characters: minified or generated data\)/);
   assert.equal(github.statuses.at(-1).state, "success");
@@ -567,8 +570,174 @@ test("a code file whose only change is one line too long to show is not covered:
   const github = fakeGithub({ files: [file("public/app.bundle.js", bundle), file("src/a.js", added(5, "a_"))] });
   const s = setup({ github });
   await runAll(s);
-  const { body } = github.posted[0];
+  const { body } = github.summaries[0];
   assert.match(body, /Coverage: 1 of 2 reviewable files \(50%\)/);
   assert.match(body, /`public\/app\.bundle\.js` \(1 added line over 240,000 characters could not be shown to a model \(generated code belongs under dist\/ or in a \.min\.js file\)\)/);
   assert.equal(github.statuses.at(-1).state, "failure");
+});
+
+// --- CodeRabbit parity: decisions, threads and the summary comment ----------
+
+const OLD = "d".repeat(40);
+// One of our inline comments, as GitHub returns its thread (effects.ownThreads).
+const ownThread = (over = {}) => ({
+  id: "PRRT_a", resolved: false, outdated: false, path: "worker/src/m3.js", line: 20, originalLine: 20, commentId: 71,
+  body: "**Minor (bug): Off by one**\n<sub>Potential issue · finding `aaaa1111`</sub>\n\nFix the bound.",
+  diffHunk: "@@ -18,3 +18,3 @@\n+const bound = n + 1;", originalCommit: OLD, findingId: "aaaa1111", ...over,
+});
+// A diff since OLD that changes the lines near 20 of m3.js.
+const NEAR_20 = "@@ -19,3 +19,3 @@\n keep();\n-const bound = n + 1;\n+const bound = n;\n more();";
+
+function threadsGithub({ threads = [], since = () => ({ status: "ahead", files: [] }), ...rest } = {}) {
+  const g = fakeGithub(rest);
+  Object.assign(g, {
+    threads, resolved: [], edits: [],
+    async ownThreads(_r, _p, login) { g.calls.push(`ownThreads:${login}`); return g.threads; },
+    async resolveThread(_r, id) { g.calls.push(`resolve:${id}`); g.resolved.push(id); return true; },
+    async editReviewComment(_r, id, body) { g.calls.push(`edit:${id}`); g.edits.push({ id, body }); },
+  });
+  const plain = g.compare.bind(g);
+  g.compare = async (r, base, head) => (base === OLD || base === "e".repeat(40) ? (g.calls.push(`compareSince:${base.slice(0, 1)}`), since(base, head)) : plain(r, base, head));
+  return g;
+}
+
+// Claude Haiku verifies findings, and judges whether threads were addressed.
+function judging(statuses) {
+  const judged = [];
+  const models = fakeModels({
+    flag: "nothing-here.js",
+    anthropic: (body, asked) => {
+      const text = body.messages[0].content;
+      const items = /<<<BEGIN ITEMS (\w+)>>>\n([\s\S]*?)\n<<<END ITEMS \1>>>/.exec(text);
+      if (items) {
+        const list = JSON.parse(items[2]);
+        judged.push(list);
+        const out = JSON.stringify({ results: list.map((x) => ({ id: x.id, status: statuses[x.id] ?? "uncertain", reason: "r" })) });
+        return reply(200, { content: [{ type: "text", text: out }], stop_reason: "end_turn", usage: { input_tokens: 100, output_tokens: 10 } });
+      }
+      const v = JSON.stringify({ verdicts: asked.map((f) => ({ id: f.id, verdict: "confirmed", severity: f.severity, suggestion_ok: false, prompt_ok: false, reason: "r" })) });
+      return reply(200, { content: [{ type: "text", text: v }], stop_reason: "end_turn", usage: { input_tokens: 100, output_tokens: 10 } });
+    },
+  });
+  models.judged = judged;
+  return models;
+}
+
+const SMALL = [file("worker/src/m3.js", added(30, "m3_")), file("README.md", added(5, "doc_"))];
+
+test("findings: one review, filed as Changes requested; and the summary comment says how many", async () => {
+  const s = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels() });
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.equal(s.github.posted[0].event, "REQUEST_CHANGES");
+  assert.equal(s.github.summaries.length, 1);
+  assert.equal(s.github.summaries[0].id, null, "the first summary comment is a new one");
+  assert.match(s.github.summaries[0].body, /^### Tankster AI Review\n\n\*\*Latest review:\*\* commit `aaaaaaa`\.\n\nActionable comments posted: 1\. /);
+  assert.equal(await s.storage.get("summaryComment"), 501);
+  assert.equal(s.done[0].reviewedSha, HEAD);
+});
+
+test("no findings: no review at all, and the one summary comment is edited in place", async () => {
+  const s = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ flag: "nothing-here.js" }) });
+  await s.storage.put("summaryComment", 77);
+  await runAll(s);
+  assert.equal(s.github.posted.length, 0, "a clean review posts nothing new");
+  assert.equal(s.github.summaries.length, 1);
+  assert.equal(s.github.summaries[0].id, 77);
+  assert.match(s.github.summaries[0].body, /No actionable comments were generated in the latest review\. 🎉/);
+  assert.match(s.github.summaries[0].body, /<details><summary>About this review<\/summary>/);
+  // The gate still gets its answer.
+  assert.equal(s.github.statuses.at(-1).state, "success");
+  assert.equal(s.done[0].reviewedSha, HEAD);
+});
+
+test("earlier threads: fixed ones get CodeRabbit's note and are resolved; untouched or still-present ones stay open", async () => {
+  const threads = [
+    ownThread(),
+    // Its code did not change near line 120: no model is asked about it.
+    ownThread({ id: "PRRT_b", findingId: "bbbb2222", commentId: 72, line: 120, originalLine: 120, body: "**Minor (bug): b**\n<sub>Potential issue · finding `bbbb2222`</sub>\n\nb" }),
+    // Changed near its line, but the model says the problem is still there.
+    ownThread({ id: "PRRT_c", findingId: "cccc3333", commentId: 73, originalLine: 21, body: "**Minor (bug): c**\n<sub>Potential issue · finding `cccc3333`</sub>\n\nc" }),
+    // Its file was deleted: addressed, without asking a model.
+    ownThread({ id: "PRRT_d", findingId: "dddd4444", commentId: 74, path: "worker/src/gone.js", body: "**Minor (bug): d**\n<sub>Potential issue · finding `dddd4444`</sub>\n\nd" }),
+    // Already resolved, and one written at this very head: neither is looked at.
+    ownThread({ id: "PRRT_e", resolved: true }),
+    ownThread({ id: "PRRT_f", originalCommit: HEAD }),
+    // The model is unsure: open, never resolved on a guess.
+    ownThread({ id: "PRRT_g", findingId: "eeee5555", commentId: 75, body: "**Minor (bug): g**\n<sub>Potential issue · finding `eeee5555`</sub>\n\ng" }),
+  ];
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }, { filename: "worker/src/gone.js", status: "removed" }] });
+  const models = judging({ aaaa1111: "fixed", cccc3333: "present" });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads, since }), models, env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(s);
+  assert.deepEqual(models.judged.map((l) => l.map((x) => x.id)), [["aaaa1111", "cccc3333", "eeee5555"]]);
+  // This review's own thread is not compared with anything.
+  assert.equal(s.github.calls.some((c) => c.startsWith("compare:a")), false);
+  // The model saw the finding, the original code and the change near it, as data.
+  const item = models.judged[0][0];
+  assert.match(item.finding, /Off by one/);
+  assert.match(item.original, /n \+ 1/);
+  assert.match(item.since, /\+const bound = n;/);
+  assert.deepEqual(s.github.resolved.sort(), ["PRRT_a", "PRRT_d"]);
+  assert.deepEqual(s.github.edits.map((e) => e.id).sort(), [71, 74]);
+  assert.match(s.github.edits.find((e) => e.id === 71).body, /\n\n✅ Addressed in commit aaaaaaa$/);
+  // The note goes on before the thread is resolved.
+  assert.ok(s.github.calls.indexOf("edit:71") < s.github.calls.indexOf("resolve:PRRT_a"));
+  assert.ok(s.github.calls.includes("ownThreads:tankster-ai-review"));
+  assert.match(s.github.summaries[0].body, /Earlier findings: 2 earlier threads addressed and resolved; 4 still open\./);
+});
+
+test("threads after a force-push, or when no model can answer, stay open; the review still finishes", async () => {
+  const diverged = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => ({ status: "diverged", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] }) }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(diverged);
+  assert.deepEqual(diverged.github.resolved, []);
+  assert.equal(diverged.models.judged.length, 0);
+
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const none = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "workers-ai:@cf/openai/gpt-oss-120b" } });
+  await runAll(none);
+  assert.deepEqual(none.github.resolved, []);
+  assert.match(none.github.summaries[0].body, /Some open threads could not be checked this time \([^)]+\); they stay open\./);
+  assert.equal(none.github.statuses.at(-1).state, "success");
+  assert.equal(none.done[0].reviewedSha, HEAD);
+
+  // A finding whose commit is gone (404) stays open too.
+  const gone = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since: () => { throw Object.assign(new Error("nf"), { status: 404 }); } }), models: judging({ aaaa1111: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(gone);
+  assert.deepEqual(gone.github.resolved, []);
+});
+
+test("findings with no thread (outside the diff) are kept as open findings, and cleared once a later commit fixes them", async () => {
+  // A finding on a line the PR's diff no longer shows: listed in the body.
+  const s = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels(), job: { since: "e".repeat(40) } });
+  s.github.compare = async (_r, base, head) => ({ status: "ahead", files: SMALL });
+  await runAll(s);
+  assert.equal(s.github.posted[0].event, "REQUEST_CHANGES");
+  assert.equal(s.github.posted[0].comments.length, 0, "GitHub could not place it inline");
+  const open = await s.storage.get("openFindings");
+  assert.equal(open.length, 1);
+  assert.equal(open[0].path, "worker/src/m3.js");
+  assert.equal(open[0].sha, HEAD);
+
+  // The next review, at a new head: the change near it fixed it.
+  const NEXT = "f".repeat(40);
+  const later = setup({ github: threadsGithub({ files: SMALL, pr: { head: { sha: NEXT } } }), models: judging({ [open[0].id]: "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await later.storage.put("openFindings", open);
+  later.github.compare = async (_r, base, head) => (base === HEAD
+    ? { status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: `@@ -${open[0].line},1 +${open[0].line},1 @@\n-x\n+y` }] }
+    : { status: "diverged", merge_base_commit: { sha: MERGE_BASE }, files: [] });
+  await runAll(later);
+  assert.deepEqual(await later.storage.get("openFindings"), []);
+});
+
+test("findings GitHub would not place inline (its 422 fallback) are kept as open findings, with those off the diff", async () => {
+  const github = threadsGithub({ files: SMALL });
+  github.postReview = async (_r, _p, review) => { github.posted.push(review); return { inline: 0 }; };
+  const s = setup({ github, models: fakeModels() });
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  const open = await s.storage.get("openFindings");
+  assert.equal(open.length, 1);
+  assert.match(open[0].id, /^[0-9a-f]{8}$/);
+  assert.equal(open[0].path, "worker/src/m3.js");
 });

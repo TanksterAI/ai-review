@@ -9,10 +9,10 @@
 
 import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
 import { appConfig } from "./setup.js";
-import { createEffects } from "./effects.js";
+import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { MAX_RUN_LIFE_MS, RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
+import { MAX_RUN_LIFE_MS, OPEN_FINDINGS, RUN, RUN_META, activeRun, dropRun, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -30,7 +30,13 @@ const RECHECK_MS = 30_000;
 function seconds(v, fallback) {
   return /^\d+(\.\d+)?$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : fallback;
 }
-const COMMANDS = ["full review", "review", "pause", "resume", "help"];
+const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "help"];
+// As CodeRabbit's: these two work only as top-level comments, not in a
+// review thread's replies.
+const TOP_LEVEL_ONLY = new Set(["resolve", "approve"]);
+// Threads one alarm resolves at most (each is a subrequest; Workers Free
+// allows 50 an invocation). The rest are resolved by the next alarms.
+const RESOLVE_PER_STEP = 40;
 
 export function helpText(slug = DEFAULT_SLUG) {
   return [
@@ -42,9 +48,13 @@ export function helpText(slug = DEFAULT_SLUG) {
     "| `full review` | Review the whole pull request again |",
     "| `pause` | Stop automatic reviews on this pull request |",
     "| `resume` | Start automatic reviews again |",
+    "| `resolve` | Resolve all of its review threads, and approve if nothing else is open |",
+    "| `approve` | Approve now; it resolves its review threads first |",
     "| `help` | Show this list |",
     "",
     "Reviews of pull requests from forks or from authors without write access start only when someone with write access asks for one.",
+    "",
+    "It requests changes while it has findings, resolves its threads once a later commit addresses them, and approves once none is open and the latest commit is reviewed in full. Post `resolve` and `approve` as top-level comments.",
   ].join("\n");
 }
 
@@ -350,10 +360,16 @@ export class PrState {
       return this.save(st, { action: "job", jobId: job.id });
     }
 
+    if (ev.kind === "thread") {
+      if (st.closed) return { action: "closed" };
+      await this.queueDecide({ reopened: ev.action === "unresolved" });
+      return { action: "decide" };
+    }
+
     if (ev.kind === "command") {
       const cmd = parseCommand(ev.text, ev.slug);
       // P1 has no chat: anything that is not a command gets no reply.
-      if (!cmd) return { action: "not_a_command" };
+      if (!cmd || (TOP_LEVEL_ONLY.has(cmd) && ev.where === "thread")) return { action: "not_a_command" };
       if (cmd === "help") {
         if (await this.mayReply(ev.sender.login, "help")) {
           await this.outbox({ type: "comment", body: helpText(ev.slug), replyTo: { login: ev.sender.login, kind: "help" } });
@@ -553,6 +569,8 @@ export class PrState {
       return undefined;
     }
 
+    if (item.type === "decide") return this.decide(fx, item, slug);
+
     if (item.type === "status") {
       if (!key || !item.sha) return undefined;
       if (item.waiting) await this.waitingFor(fx, key.repo, item.sha, slug);
@@ -578,6 +596,7 @@ export class PrState {
         await this.ctx.storage.put("state", st);
         return fx.comment(item.repo.full, item.pr, `Automatic reviews are back on. I'll review the next push, or comment \`@${slug} review\` now.`);
       }
+      if (item.cmd === "resolve" || item.cmd === "approve") return this.resolveAll(fx, item, slug);
       // review / full review: now, and it covers any push still waiting.
       await this.ctx.storage.delete("debounce");
       await this.keepJobOnItem(item, st, { full: item.cmd === "full review", requestedBy: item.login });
@@ -623,7 +642,7 @@ export class PrState {
     const fx = this.effects ?? createEffects(this.env, { config: app });
     const slug = app?.slug ?? DEFAULT_SLUG;
     const ctx = {
-      storage: this.ctx.storage, env: this.env, cfg: config(this.env), fx,
+      storage: this.ctx.storage, env: this.env, cfg: config(this.env), fx, slug,
       deps: { now: this.now, sleep: this.sleep, fetch: this.fetchImpl, log: (e) => console.log(JSON.stringify({ svc: "ai-review", ...e })) },
       again: `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`,
       onDone: (r, out) => this.runDone(r, out),
@@ -634,13 +653,75 @@ export class PrState {
   // A run is over: its job completes (moving lastReviewed on) or is dropped,
   // and its stored state goes. One given up says so on the PR.
   async runDone(run, { reviewedSha, gaveUp, description }) {
-    if (reviewedSha) await this.complete({ jobId: run.id, runId: "worker", reviewedSha, fullCoverage: true });
-    else await this.ctx.storage.delete(`job:${run.id}`);
+    if (reviewedSha) {
+      await this.complete({ jobId: run.id, runId: "worker", reviewedSha, fullCoverage: true });
+      // The latest commit has a complete review: approve, if nothing is open.
+      await this.queueDecide({});
+    } else await this.ctx.storage.delete(`job:${run.id}`);
     await dropRun(this.ctx.storage, run.id);
     if (gaveUp) {
       const why = String(description ?? "the review kept failing").replace(/[`\n]/g, " ").slice(0, 200);
       await this.outbox({ type: "comment", template: "gave_up", reason: why, tries: 3, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
     }
+  }
+
+  // --- automatic approvals (CodeRabbit's Automatic Approvals) ---------------
+
+  // One decision waiting at a time of each kind: a burst of resolved threads
+  // is decided once.
+  async queueDecide({ reopened = false, force = false, login = null }) {
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    if (!force && box.some((x) => x.type === "decide" && Boolean(x.reopened) === reopened && !x.force)) return;
+    await this.outbox({ type: "decide", reopened, force, login });
+  }
+
+  // Approves the head when (as CodeRabbit's requirements) the latest commit has
+  // a complete review (unless a writer's command forces it), none of the App's
+  // own threads and no body-only finding is open, the App has not approved
+  // already, and the head is unchanged just before approving. A thread
+  // reopened after an approval asks for changes again.
+  async decide(fx, item, slug) {
+    if (typeof fx.ownThreads !== "function" || typeof fx.reviewDecision !== "function") return undefined;
+    const key = await this.ctx.storage.get("key");
+    const st = await this.state();
+    if (!key || st.closed) return undefined;
+    const pr = await fx.pullRequest(key.repo, key.pr);
+    const head = pr?.head?.sha;
+    if (pr?.state !== "open" || pr.draft || !/^[0-9a-f]{40}$/.test(String(head))) return undefined;
+    if (!item.force && st.lastCompleteReviewed !== head) return undefined;
+    const open = (await fx.ownThreads(key.repo, key.pr, slug)).filter((t) => !t.resolved);
+    const inBody = (await this.ctx.storage.get(OPEN_FINDINGS)) ?? [];
+    const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
+    if (open.length || inBody.length) {
+      if (item.reopened && decision?.state === "APPROVED") {
+        await fx.postReview(key.repo, key.pr, {
+          commitId: head, comments: [], event: "REQUEST_CHANGES",
+          body: `${MARKER}\nA review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.`,
+        });
+      }
+      return undefined;
+    }
+    if (decision?.state === "APPROVED") return undefined;
+    const now = await fx.pullRequest(key.repo, key.pr);
+    if (now?.head?.sha !== head || now?.state !== "open") return undefined;
+    const body = item.force && item.login
+      ? `Approved at @${item.login}'s request: its review threads are resolved.`
+      : `Approved: every finding is resolved, and commit \`${head.slice(0, 7)}\` was reviewed in full.`;
+    await fx.approve(key.repo, key.pr, { commitId: head, body });
+    console.log(JSON.stringify({ svc: "ai-review", ev: "approved", pr: key.pr, forced: Boolean(item.force) }));
+    return undefined;
+  }
+
+  // resolve / approve: every open thread of the App's own is resolved (a few
+  // dozen an alarm), its body-only findings are cleared, then it approves.
+  async resolveAll(fx, item, slug) {
+    const key = await this.ctx.storage.get("key");
+    if (!key || typeof fx.ownThreads !== "function") return undefined;
+    const open = (await fx.ownThreads(key.repo, key.pr, slug)).filter((t) => !t.resolved);
+    for (const t of open.slice(0, RESOLVE_PER_STEP)) await fx.resolveThread(key.repo, t.id);
+    if (open.length > RESOLVE_PER_STEP) return { holdUntil: this.now() + 1000 };
+    await this.ctx.storage.put(OPEN_FINDINGS, []);
+    return this.decide(fx, { force: true, login: item.login }, slug);
   }
 
   async capacityNow(chars, skip = []) {

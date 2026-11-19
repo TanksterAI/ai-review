@@ -460,7 +460,7 @@ test("draft, ground, verify and render: only confirmed findings are shown, and t
   assert.match(comments[0].body, /```suggestion\nconst y = x === 0 \? 0 : 1 \/ x;\n```/);
   assert.doesNotMatch(comments[0].body, /Prompt for AI agents/);
   // The summary is the Worker's; the drafter's and the verifiers' own words are nowhere.
-  assert.match(body, /### AI review \(advisory\)\n\nReviewed 1 file\. 1 finding confirmed: 1 major \(plus 1 nitpick\)\.\n/);
+  assert.match(body, /### Tankster AI Review\n\nReviewed 1 file\. 1 finding confirmed: 1 major \(plus 1 nitpick\)\.\n/);
   assert.match(body, /2 findings: 1 inline, 1 below\./);
   assert.match(body, /🧹 Nitpick comments \(1\)[\s\S]*Import style/);
   assert.match(body, /\n- Verified: 2 findings confirmed by `claude-haiku-5-5` \(1 also by `claude-sonnet-5-5`\); 5 not shown \(1 refuted, 1 unconfirmed, 2 failed the evidence check, 1 named something not in the change\)\.\n/);

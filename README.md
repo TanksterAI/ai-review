@@ -2,7 +2,7 @@
 
 Line-by-line AI review on every TanksterAI pull request: £0, and no secrets anywhere.
 
-It gives each pull request what CodeRabbit's Free plan does not: inline comments on real defects. CodeRabbit still posts its summary, and the Claude review in the merge gate is unchanged. This is a second, independent opinion from a different model. Its review is advisory: it never approves and never requests changes. Its commit status, **Tankster AI Review**, reports whether every reviewable file was covered, and the merge gate requires that to pass (see "Full coverage").
+It gives each pull request what CodeRabbit's Free plan does not: inline comments on real defects. CodeRabbit still posts its summary, and the Claude review in the merge gate is unchanged. This is a second, independent opinion from a different model. Its decision follows its findings, as CodeRabbit's Automatic Approvals do: it requests changes while it has findings, resolves its threads once later commits address them, and approves once none is open and the latest commit is reviewed in full (see "Posting, threads and approval"). With 0 required approvals neither decision blocks a merge. Its commit status, **Tankster AI Review**, reports whether every reviewable file was covered, and the merge gate requires that to pass (see "Full coverage").
 
 ## How it works
 
@@ -84,6 +84,27 @@ REVIEW_MODE=runner (the earlier path): the alarm starts runner.yml (hosted runne
 sends the diff to Worker /v1/runner/review in one request (one prompt, at most 90,000 characters).
 ```
 
+### Posting, threads and approval (as CodeRabbit)
+
+Checked on 19 Nov 2026 against CodeRabbit's docs (Automatic Approvals, the request-changes workflow) and against what it did on TanksterAI/ai-review#14.
+
+- **A review only when there is something to say.** A review with findings is filed as **Changes requested**, with its inline comments. A review with no findings posts no review at all; CodeRabbit does not either.
+- **One summary comment, edited in place.** The first review creates it, and every later one edits it (its id is kept in the PR's object; a deleted one is posted again). It names the commit reviewed, the commits since the last review, "Actionable comments posted: N" or "No actionable comments were generated in the latest review. 🎉", how many earlier threads were resolved, and the details (models, coverage, cost).
+- **Earlier threads, re-checked on every review** (`addressed.js`). For each of the App's own open threads written at an earlier commit:
+  - its file deleted since: addressed;
+  - no change within 40 lines of the finding since its commit: left open, with no model call;
+  - changed near it: one model (`ADDRESSED_CHAIN`, free models first, Claude Haiku last) reads the finding, the code it was about and the change, and answers fixed, present or uncertain. Only "fixed" counts.
+
+  An addressed thread gets CodeRabbit's note, "✅ Addressed in commit abc1234", then is resolved. Anything unclear stays open for a person: no model could answer (the summary says so), the finding's commit is gone, or a force-push means its commit is no longer behind the head. Findings a review could only list in its body (outside the diff, or GitHub would not place them) are kept in the PR's object and checked the same way.
+- **Approval** (`pr-state.js` `decide`), checked after every complete review, every thread resolved or reopened by hand, and the commands. It approves the head when:
+  - the latest commit has a complete review (100% coverage);
+  - none of the App's own threads, and none of its body-only findings, is open. Every finding blocks, whatever its severity (CodeRabbit's default). Other people's threads and the Claude review's are theirs to manage;
+  - it has not approved already;
+  - the head is unchanged when it checks again just before approving.
+
+  A thread of its own reopened after its approval files Changes requested again. Drafts and closed pull requests are never approved.
+- **`resolve` and `approve`** (top-level comments by people with write access) resolve all of its threads, clear its body-only findings, and approve without waiting for a complete review, as CodeRabbit's do. Up to 40 threads are resolved an alarm; the rest go in the next ones.
+
 ### Full coverage: every file, however big the pull request
 
 The review used to put the whole diff in one prompt of at most 90,000 characters (20,000 a file), and skip whatever did not fit as "over the size budget". On large pull requests that left out every test file and the README, and still said "No material problems found". Now (PR C, TAN-278) the PR's Durable Object reviews the pull request itself, in steps of its alarm, and nothing is left out for size:
@@ -91,7 +112,7 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
 - **Every file is read.** The Worker lists the pull request's files with a read-only App token (GitHub lists up to 3,000). For a file GitHub sends without a patch (its API leaves the patch out of very large diffs), it fetches the old text (at the merge base) and the new text and works the diff out itself (`linediff.js`). Those findings go in the review body, since GitHub may not accept comments on lines of a diff it did not make.
 - **Batches.** The whole diff is cut into batches of at most `BATCH_CHARS` (60,000) characters, one model call each (`coverage.js`): small prompts are more accurate. A file bigger than a batch is split at hunk boundaries, and a hunk bigger than a batch between lines, so every line is shown once, with its true line number. Code comes first, then tests, then docs, and each pass is told which other files are reviewed in the other passes.
 - **No waiting while anything can work.** Up to 4 batches are drafted at once. Each batch tries the whole chain of free models, rotated so that batches running together use different free quotas; each Gemini model has its own. A model out of quota hands the batch to the next at once. Claude Haiku, on the plan's credit (`ANTHROPIC_DAILY_USD_CAP`), is last. A batch waits only when every drafter (or every verifier) is out, and only until the first resets; the commit status says so meanwhile.
-- **Every finding is verified**, batch by batch, as in "Verified findings" below, and all of them go into one review.
+- **Every finding is verified**, batch by batch, as in "Verified findings" below, and all of them go into one review (only when there are any: see "Posting, threads and approval").
 - **What is never reviewed** is still named: deleted files, lockfiles and generated files (as CodeRabbit's default path filters skip them), binary files, and pure data files (`.csv`, `.tsv`, `.jsonl`, `.ndjson`, `.geojson`, `.topojson`, `.b64`, JSON under a `data/` or `fixtures/` folder, and text files other than dependency lists; manifests, config, SVG and XML count as code) whose added lines are over four batches long (240,000 characters: minified or generated data). Long lines are judged line by line, never the whole file by one line. An unchanged or removed line over 2,000 characters is context: it is cut to a marker so it cannot crowd out the change. An added line over 240,000 characters is cut to a marker too, and the file's other lines are still reviewed; in a data file it is named and passed over, but in any other file it is code no model read, so the file is **not covered** and the status fails (generated code belongs under `dist/` or in a `.min.js` file, which are skipped).
 - **Only full coverage counts as done.** A review at 100% marks its commit `donefull:` and becomes the starting point of the next incremental review (`lastCompleteReviewed`). The single-prompt paths' `done:` mark and `lastReviewed` are never trusted for that, so the first review after this change covers the whole pull request.
 - **Coverage is a gate.** The footer gives the coverage ("18 of 18 reviewable files (100%) … in 4 passes"), and the hidden findings block records it (`coverage: {reviewable, covered, complete}`). The commit status **Tankster AI Review** is `success` only when every reviewable file was covered, `failure` otherwise (an incomplete review also says so in its first line), and `pending` while the review runs or waits. The merge gate requires it.
@@ -128,11 +149,11 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
 - **Failures and retries.** The Durable Object performs one side effect per alarm. An item stays stored until its effect succeeds, and is retried up to five times.
 - **Rate limits.** Replies to people without write access, and `help`, go out at most once an hour per person. Text that is not a command gets no reply.
 - **What the App needs.** The manifest asks only for what it uses:
-  - repository permissions: Metadata read, Contents read, Pull requests read and write, Issues read (for `issue_comment` events), Actions read and write (to start `runner.yml`), and Commit statuses read and write (the coverage status);
-  - events: `pull_request`, `issue_comment`, `pull_request_review_comment`.
+  - repository permissions: Metadata read, Contents read, Pull requests read and write (reviews, approvals, resolving its threads, the summary comment), Issues read (for `issue_comment` events), Actions read and write (to start `runner.yml`), and Commit statuses read and write (the coverage status);
+  - events: `pull_request`, `issue_comment`, `pull_request_review_comment`, `pull_request_review_thread` (a thread resolved or reopened by hand decides the approval; added to the existing App on 19 Nov 2026).
 
   Later phases add permissions, and GitHub asks the owner to approve each addition. **Commit statuses** came with full coverage: the App created before it must be given it once (App settings → Permissions & events → Commit statuses: Read and write, then accept the request on the organisation's installation). Until then reviews are still posted, and the Worker logs `status_unavailable` instead of setting the status.
-- **Commands.** `review`, `full review`, `pause`, `resume` and `help`. Everything except `help` needs write access, checked through the API.
+- **Commands.** `review`, `full review`, `pause`, `resume`, `resolve`, `approve` and `help`. Everything except `help` needs write access, checked through the API. `resolve` and `approve` work only as top-level comments, as CodeRabbit's do.
 - **Secrets: nobody handles them.** The App is created once, from a manifest:
   - Open `https://tankster-ai-review.rishi-tank.workers.dev/v1/setup/github-app` and press the button. GitHub creates the App in TanksterAI.
   - GitHub hands its id, slug, private key and webhook secret straight to the Worker (`POST /app-manifests/{code}/conversions`). The Worker keeps them in the `AppSecrets` Durable Object, which no route exposes.

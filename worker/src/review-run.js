@@ -17,7 +17,15 @@
 //            chain of free models, rotated so batches running together use
 //            different free quotas; Claude on the plan's credit is last
 //   verify   ground and verify one batch a step (every finding, TAN-299)
-//   post     one review for the whole pull request, and the commit status
+//   post     one review for the whole pull request, only when it has
+//            findings: "Changes requested", as CodeRabbit's Automatic
+//            Approvals do. A clean review posts no review.
+//   threads  the App's own open threads (and findings it could only list in
+//            a review's body) from earlier commits: those the new commits
+//            addressed are marked "Addressed in commit …" and resolved
+//            (addressed.js)
+//   summary  the one summary comment, edited in place, and the commit status.
+//            The PR's object then decides whether to approve (pr-state.js).
 //
 // Nothing waits while any provider can work. A batch waits only when every
 // drafter (or every verifier) is out of quota, and then only until the first
@@ -35,6 +43,8 @@ import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
+import { addressedNote, findingIdOf, judgeAddressed, nearHunks } from "./addressed.js";
+import { DEFAULT_SLUG } from "./webhook.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
 // under runmeta:<id>, so finding the run in progress never loads its data.
@@ -75,6 +85,17 @@ const fileKey = (id, i) => `${RUN}${id}:file:${String(i).padStart(5, "0")}`;
 const pieceKey = (id, i, k) => `${fileKey(id, i)}:p${k}`;
 const batchKey = (id, i) => `${RUN}${id}:batch:${String(i).padStart(4, "0")}`;
 const planKey = (id) => `${RUN}${id}:plan`;
+// Kept by the PR's object across runs: the summary comment's id, and the
+// findings a review could only list in its body (they have no thread).
+export const SUMMARY_KEY = "summaryComment";
+export const OPEN_FINDINGS = "openFindings";
+const MAX_OPEN_FINDINGS = 50;
+const threadsKey = (id) => `${RUN}${id}:threads`;
+const summaryKey = (id) => `${RUN}${id}:summary`;
+// GitHub calls one threads step may make (each counts as a subrequest).
+const COMPARES_PER_STEP = 6;
+const APPLIES_PER_STEP = 10;
+const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
 export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}`;
 
@@ -192,6 +213,8 @@ export async function stepRun(ctx, id) {
     if (run.stage === "draft") return await stageDraft(counted, run, save);
     if (run.stage === "verify") return await stageVerify(counted, run, save);
     if (run.stage === "post") return await stagePost(counted, run, save);
+    if (run.stage === "threads") return await stageThreads(counted, run, save);
+    if (run.stage === "summary") return await stageSummary(counted, run, save);
   } catch (e) {
     if (e instanceof Gone) {
       await dropRun(storage, id);
@@ -638,30 +661,210 @@ async function stagePost(ctx, run, save) {
     const lines = await ctx.fx.prLines(run.repo.full, run.pr, comments.map((c) => c.path));
     const { kept, off } = placeComments(comments, review.singleLine, lines);
     comments = kept;
+    review.off = off;
     if (off.length) text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
     text += `\n\n_Incremental review: commits after \`${run.since.slice(0, 7)}\`._`;
   }
-  // Posted once: a step retried after the post (a failed write below) does
-  // not post the review again.
+  const shownCount = merged.shown.inline.length + merged.shown.general.length;
+  // Posted once, and only with findings: a step retried after the post (a
+  // failed write below) does not post the review again. A review with no
+  // findings posts nothing (CodeRabbit does not either); the summary comment
+  // and the commit status say how it went.
   let posted = run.posted ?? null;
-  if (!posted) {
-    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments });
+  if (!posted && shownCount > 0) {
+    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: "REQUEST_CHANGES" });
     run.posted = { inline: posted?.inline ?? 0 };
+    // Findings with no thread of their own (outside the diff, or GitHub would
+    // not place them) are kept, so they too must be addressed before approval.
+    const inBody = [
+      ...merged.shown.general.map((f) => ({ id: f.id, path: f.path ?? null, line: Number.isInteger(f.line) ? f.line : null, text: `${f.title}\n\n${f.body ?? ""}` })),
+      // GitHub's refusal (422) moves every inline comment to the body; those
+      // off the diff are in the body either way.
+      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])].map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, text: c.body })),
+    ];
+    if (inBody.length) await keepOpenFindings(ctx.storage, inBody.map((x) => ({ ...x, text: String(x.text).slice(0, 2500), sha: run.headSha })));
     await save(run);
   }
+  if (!posted) run.posted = { inline: 0, none: true };
   const complete = cov.complete;
   // Only a complete review marks the commit done and moves the PR's last
   // reviewed commit on: after an incomplete one, the next review starts from
   // the last complete one, so nothing it missed is passed over.
   if (complete) await ctx.env.LEDGER?.put(doneKeyOf(run), utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
-  const shownCount = merged.shown.inline.length + merged.shown.general.length;
-  ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: posted?.inline ?? 0, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
+  ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: run.posted.inline, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
+  // What the summary comment shows, once the threads are checked.
+  await ctx.storage.put(summaryKey(run.id), {
+    summary: review.summary, about: review.about, shown: shownCount, complete, since: run.since ?? null,
+    covered: cov.covered, reviewable: cov.reviewable,
+  });
+  run.result = { complete, shown: shownCount, covered: cov.covered, reviewable: cov.reviewable };
+  run.stage = "threads";
+  await save(run);
+  return ctx.deps.now();
+}
+
+// Adds findings to the PR's list of open body findings (one entry per id).
+async function keepOpenFindings(storage, items) {
+  const have = (await storage.get(OPEN_FINDINGS)) ?? [];
+  const ids = new Set(have.map((x) => x.id));
+  for (const x of items) if (x.id && !ids.has(x.id)) { have.push(x); ids.add(x.id); }
+  await storage.put(OPEN_FINDINGS, have.slice(-MAX_OPEN_FINDINGS));
+}
+
+// --- threads: earlier findings the new commits addressed ------------------------
+//
+// One record (threadsKey) carries the work across steps: the items to check,
+// then the diff near each, then the model's verdicts, then the resolving.
+// Each step makes only a few GitHub calls and at most one model call.
+
+async function stageThreads(ctx, run, save) {
+  const fx = ctx.fx;
+  const done = async (th) => {
+    if (th) await ctx.storage.put(threadsKey(run.id), th);
+    run.stage = "summary";
+    await save(run);
+    return ctx.deps.now();
+  };
+  if (typeof fx.ownThreads !== "function") return done(null);
+  let th = await ctx.storage.get(threadsKey(run.id));
+  if (!th) {
+    const login = ctx.slug ?? DEFAULT_SLUG;
+    const threads = await fx.ownThreads(run.repo.full, run.pr, login);
+    const items = [];
+    for (const t of threads) {
+      // This review's own threads were written at this head: nothing since.
+      if (t.resolved || !t.path || !t.originalCommit || t.originalCommit === run.headSha) continue;
+      items.push({ kind: "thread", id: t.findingId ?? t.id, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, state: "new" });
+    }
+    for (const f of (await ctx.storage.get(OPEN_FINDINGS)) ?? []) {
+      if (!f.sha || f.sha === run.headSha || !f.path) continue;
+      items.push({ kind: "body", id: f.id, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, state: "new" });
+    }
+    th = { items, open: threads.filter((t) => !t.resolved).length, resolved: 0, unchecked: null };
+    await ctx.storage.put(threadsKey(run.id), th);
+    if (!items.length) return done(th);
+    return ctx.deps.now();
+  }
+
+  // The diffs since each finding's commit, a few commits a step.
+  const pending = [...new Set(th.items.filter((x) => x.state === "new").map((x) => x.since))];
+  if (pending.length) {
+    for (const commit of pending.slice(0, COMPARES_PER_STEP)) {
+      let cmp = null;
+      try {
+        cmp = await fx.compare(run.repo.full, commit, run.headSha);
+      } catch (e) {
+        if (e.status !== 404) throw e;
+      }
+      const files = Array.isArray(cmp?.files) ? cmp.files : [];
+      // Only a straight line of commits says what changed since: after a
+      // force-push the finding's commit is not behind the head, and its diff
+      // would mix in what the rebase moved. Those are left to a person.
+      const straight = cmp?.status === "ahead" || cmp?.status === "identical";
+      for (const x of th.items) {
+        if (x.state !== "new" || x.since !== commit) continue;
+        if (!straight) { x.state = "open"; continue; }
+        const f = files.find((y) => y.filename === x.path || y.previous_filename === x.path);
+        if (!f) { x.state = files.length >= 300 ? "open" : "untouched"; continue; }
+        if (f.status === "removed") { x.state = "fixed"; continue; }
+        if (typeof f.patch !== "string") { x.state = "open"; continue; }
+        const near = nearHunks(f.patch, x.line);
+        if (!near.touched) { x.state = "untouched"; continue; }
+        x.near = near.text;
+        x.state = "judge";
+      }
+    }
+    await ctx.storage.put(threadsKey(run.id), th);
+    return ctx.deps.now();
+  }
+
+  // One model call a step, for as many items as fit.
+  const toJudge = th.items.filter((x) => x.state === "judge");
+  if (toJudge.length) {
+    const batch = [];
+    let chars = 0;
+    for (const x of toJudge) {
+      const size = String(x.body).length + String(x.original).length + String(x.near).length + 200;
+      if (batch.length && chars + size > JUDGE_CHARS) break;
+      batch.push(x);
+      chars += size;
+    }
+    const out = await judgeAddressed({
+      items: batch.map((x) => ({ id: x.id, path: x.path, finding: x.body, original: x.original, since: x.near })),
+      env: ctx.env, cfg: ctx.cfg, deps: ctx.deps,
+    });
+    run.spend.neurons += out.neurons ?? 0;
+    run.spend.usd += out.usd ?? 0;
+    if (out.outcome.kind !== "ok") {
+      // No model could answer: every item still to judge stays open.
+      th.unchecked = out.outcome.reason ?? "no model could check them";
+      for (const x of toJudge) x.state = "open";
+    } else {
+      for (const x of batch) x.state = out.results.get(x.id) === "fixed" ? "fixed" : "open";
+    }
+    for (const x of batch) delete x.near;
+    await ctx.storage.put(threadsKey(run.id), th);
+    await save(run);
+    return ctx.deps.now();
+  }
+
+  // Resolve what was fixed, a few a step: the note first, then the thread,
+  // so a thread is never resolved without saying why.
+  const fixed = th.items.filter((x) => x.state === "fixed");
+  for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
+    if (x.kind === "thread") {
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      await fx.resolveThread(run.repo.full, x.threadId);
+      th.resolved++;
+    } else {
+      const left = ((await ctx.storage.get(OPEN_FINDINGS)) ?? []).filter((f) => f.id !== x.id);
+      await ctx.storage.put(OPEN_FINDINGS, left);
+    }
+    x.state = "resolved";
+  }
+  if (fixed.length > APPLIES_PER_STEP) {
+    await ctx.storage.put(threadsKey(run.id), th);
+    return ctx.deps.now();
+  }
+  return done(th);
+}
+
+// --- summary: the one comment, edited in place ------------------------------
+
+export function summaryText({ headSha, summary, about, shown, complete, since, threads }) {
+  const lines = ["### Tankster AI Review", ""];
+  lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
+  if (!complete) lines.push(summary, "");
+  else if (shown) lines.push(`Actionable comments posted: ${shown}. ${summary}`, "");
+  else lines.push("No actionable comments were generated in the latest review. 🎉", "");
+  if (threads) {
+    const parts = [];
+    if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier thread")} addressed and resolved`);
+    const stillOpen = Math.max(0, threads.open - threads.resolved);
+    if (stillOpen) parts.push(`${stillOpen} still open`);
+    if (parts.length) lines.push(`Earlier findings: ${parts.join("; ")}.`, "");
+    if (threads.unchecked) lines.push(`Some open threads could not be checked this time (${threads.unchecked}); they stay open.`, "");
+  }
+  lines.push(about);
+  return lines.join("\n");
+}
+
+async function stageSummary(ctx, run, save) {
+  const s = (await ctx.storage.get(summaryKey(run.id))) ?? {};
+  const th = await ctx.storage.get(threadsKey(run.id));
+  if (!run.summaryPosted && typeof ctx.fx.upsertSummary === "function") {
+    const id = await ctx.fx.upsertSummary(run.repo.full, run.pr, (await ctx.storage.get(SUMMARY_KEY)) ?? null, summaryText({ headSha: run.headSha, ...s, threads: th }));
+    if (Number.isSafeInteger(id)) await ctx.storage.put(SUMMARY_KEY, id);
+    run.summaryPosted = true;
+    await save(run);
+  }
+  const r = run.result ?? { complete: false, shown: 0, covered: 0, reviewable: 0 };
   return finish(ctx, run, save, {
-    state: complete ? "success" : "failure",
-    description: complete
-      ? `Reviewed all ${plural(cov.reviewable, "file")} (100%): ${plural(shownCount, "confirmed finding")}.`
-      : `Incomplete: ${cov.covered} of ${cov.reviewable} files reviewed. Comment "review" to try again.`,
-    posted: true,
-    reviewedSha: complete ? run.headSha : null,
+    state: r.complete ? "success" : "failure",
+    description: r.complete
+      ? `Reviewed all ${plural(r.reviewable, "file")} (100%): ${plural(r.shown, "confirmed finding")}.`
+      : `Incomplete: ${r.covered} of ${r.reviewable} files reviewed. Comment "review" to try again.`,
+    posted: Boolean(run.posted && !run.posted.none),
+    reviewedSha: r.complete ? run.headSha : null,
   });
 }
