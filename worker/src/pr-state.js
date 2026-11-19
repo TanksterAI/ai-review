@@ -94,6 +94,15 @@ export function needsApproval(slug = DEFAULT_SLUG) {
   return `This pull request comes from a fork or from an author without write access, so it is not reviewed automatically. Someone with write access can comment \`@${slug} review\` to start one.`;
 }
 
+// The pending status a pull request shows while it waits for a writer to ask
+// for its review. The merge gate requires the status, so it must not be blank.
+// GitHub keeps 140 characters of a description.
+const ACTIONS_BOT = /^github-actions(\[bot\])?$/i;
+
+export function waitingStatus(slug = DEFAULT_SLUG) {
+  return `Waiting: someone with write access must comment @${slug} review`;
+}
+
 function randomId() {
   const r = new Uint8Array(8);
   crypto.getRandomValues(r);
@@ -308,20 +317,27 @@ export class PrState {
       }
       if (st.paused) return this.save(st, { action: "paused" });
       const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
-      // Bots wait for a writer, silently. Forks wait for a writer, with a note.
-      if (ev.author.bot) return this.save(st, { action: "needs_approval" });
+      // Forks wait for a writer, with a note and a pending status (the merge
+      // gate requires one), whoever opened them: a bot included.
       if (ev.fork) {
         await this.ctx.storage.put("state", st);
-        if (opening && (await this.mayReply(ev.author.login, "note"))) {
+        await this.outbox({ type: "status", sha: ev.head?.sha, state: "pending", waiting: true });
+        if (opening && !ev.author.bot && (await this.mayReply(ev.author.login, "note"))) {
           await this.outbox({ type: "comment", template: "needs_approval", replyTo: { login: ev.author.login, kind: "note" } });
         }
         return { action: "needs_approval" };
       }
+      // A bot (Renovate, Dependabot, an agent's App) can push a branch to this
+      // repository only with write access, so it is reviewed as a writer is.
+      // github-actions[bot] is the exception: workflows that an outsider can
+      // drive (pull_request_target, issue_comment) open PRs as it, so it is
+      // checked like anyone else (and has no write access of its own).
       // author_association can under-report (private org membership), so a
       // non-writer association is checked against the permission API first.
-      if (!WRITER_ASSOCIATIONS.has(ev.author.association)) {
+      const trustedBot = ev.author.bot && !ACTIONS_BOT.test(ev.author.login);
+      if (!trustedBot && !WRITER_ASSOCIATIONS.has(ev.author.association)) {
         await this.ctx.storage.put("state", st);
-        await this.outbox({ type: "author_check", login: ev.author.login, repo: ev.repo, pr: ev.pr, opening });
+        await this.outbox({ type: "author_check", login: ev.author.login, repo: ev.repo, pr: ev.pr, opening, sha: ev.head?.sha });
         return { action: "author_check" };
       }
       // Opened, reopened or marked ready: reviewed now. A push: reviewed
@@ -464,6 +480,18 @@ export class PrState {
     return undefined;
   }
 
+  // Marks a commit as waiting for a writer. A review run sets the status
+  // itself when it starts, so this never overwrites a real result.
+  // A commit already reviewed (a writer asked), or under review now, keeps the
+  // status its run set or will set.
+  async waitingFor(fx, repoFull, sha, slug) {
+    if (typeof fx.setStatus !== "function") return;
+    const st = await this.state();
+    if (sha === st.lastReviewed || sha === st.lastCompleteReviewed) return;
+    if ((await activeRun(this.ctx.storage))?.headSha === sha) return;
+    await fx.setStatus(repoFull, sha, "pending", waitingStatus(slug));
+  }
+
   async perform(item) {
     // No App configured yet: throw, so the item is kept and retried.
     const cfg = this.effects ? null : await appConfig(this.env);
@@ -500,10 +528,17 @@ export class PrState {
         await this.keepJobOnItem(item, st, {});
         return this.dispatchJob(fx, item.jobId);
       }
+      if (item.sha) await this.waitingFor(fx, item.repo.full, item.sha, slug);
       if (item.opening && (await this.mayReply(item.login, "note"))) {
         await fx.comment(item.repo.full, item.pr, needsApproval(slug));
         await this.replied(item.login, "note");
       }
+      return undefined;
+    }
+
+    if (item.type === "status") {
+      if (!key || !item.sha) return undefined;
+      if (item.waiting) await this.waitingFor(fx, key.repo, item.sha, slug);
       return undefined;
     }
 

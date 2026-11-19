@@ -121,7 +121,9 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
 - **Who posts.** The Worker runs the model and posts the review.
 - **Who gets reviewed automatically.**
   - An author whose association is not owner, member or collaborator is checked against the permission API first, because private org membership under-reports.
-  - PRs from forks, outside authors and bots wait until someone with write access comments `@tankster-ai-review review`.
+  - Bots (Renovate, Dependabot, an agent's App) are reviewed like writers when their branch is in the repository itself: pushing a branch there takes write access. `github-actions[bot]` is the exception, because workflows an outsider can drive open PRs as it, so its PRs wait like an outsider's.
+  - PRs from forks (a bot's included) and from outside authors wait until someone with write access comments `@tankster-ai-review review`. Meanwhile their commit carries a pending **Tankster AI Review** status that says so, because the merge gate requires that status on every pull request. A commit already reviewed, or under review, keeps its own result.
+  - A paused pull request gets no new status until a writer comments `@tankster-ai-review review` (which works while paused) or `resume`, so a required check waits for that.
 - **Failures and retries.** The Durable Object performs one side effect per alarm. An item stays stored until its effect succeeds, and is retried up to five times.
 - **Rate limits.** Replies to people without write access, and `help`, go out at most once an hour per person. Text that is not a command gets no reply.
 - **What the App needs.** The manifest asks only for what it uses:
