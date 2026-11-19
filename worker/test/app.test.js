@@ -17,13 +17,32 @@ const signer = await makeSigner();
 
 // clock.t: the PR objects' time, moved forward by tests that wait out a
 // push's quiet period.
+// Like Cloudflare's: an object's id prints as 64 hex characters and reveals
+// nothing of its name.
 function namespace(fx, clock) {
   const objects = new Map();
+  const names = new Map();
+  const ids = new Map();
+  const asId = (hex) => ({ hex, toString: () => hex });
   return {
     objects,
-    idFromName: (n) => n,
-    get(name) {
-      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage() }, RUNNER_MODE, { now: () => clock.t, effects: fx }));
+    idFromName(n) {
+      if (!ids.has(n)) {
+        const hex = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+        ids.set(n, hex);
+        names.set(hex, n);
+      }
+      return asId(ids.get(n));
+    },
+    // Cloudflare's ids carry a check: one it did not mint for this
+    // namespace is refused.
+    idFromString(s) {
+      if (!names.has(s)) throw new TypeError("Invalid Durable Object ID");
+      return asId(s);
+    },
+    get(id) {
+      const name = names.get(id.hex);
+      if (!objects.has(name)) objects.set(name, new PrState({ storage: memoryStorage(), id }, RUNNER_MODE, { now: () => clock.t, effects: fx }));
       const obj = objects.get(name);
       return { fetch: (url, init) => obj.fetch(new Request(url, init)) };
     },
@@ -97,6 +116,31 @@ async function openPr(e) {
   await obj.alarm();
   return e.fx.calls.find((c) => c[0] === "dispatch")[1];
 }
+
+test("runner: job ids say nothing of the PR, and unroutable ones are refused, not crashed on", async () => {
+  const e = env();
+  const jobId = await openPr(e);
+  assert.match(jobId, /^[0-9a-f]{64}\.[0-9a-f]{32}$/);
+  const b64 = btoa("TanksterAI/browser-relay").replace(/=+$/, "");
+  assert.ok(!jobId.includes(b64.slice(0, 12)));
+  const [oid, rand] = jobId.split(".");
+  const flip = (h) => h.slice(0, -1) + (h.at(-1) === "0" ? "1" : "0");
+  for (const job of [
+    `${flip(oid)}.${rand}`, // an id Cloudflare never minted
+    `${oid}.${flip(rand)}`, // the right object, an unknown job
+    `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${rand}`, // the old, readable form
+    `${"g".repeat(64)}.${rand}`,
+    "",
+    [jobId], // not a string: refused rather than coerced
+  ]) {
+    const res = await handleRunnerSession(await runnerReq("/v1/runner/session", { job }), e, deps(e));
+    assert.equal(res.status, 403, job);
+    assert.equal((await res.json()).status, "refused");
+  }
+  assert.ok(!e.fx.calls.some((c) => c[0] === "cloneToken"), "no token for a job nobody holds");
+  const ok = await handleRunnerSession(await runnerReq("/v1/runner/session", { job: jobId }), e, deps(e));
+  assert.equal(ok.status, 200);
+});
 
 test("webhook: unsigned or wrongly signed deliveries are refused; no secret, no service", async () => {
   const e = env();

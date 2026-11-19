@@ -96,13 +96,24 @@ export const GROUNDED_PATCH = [
 ].join("\n");
 
 // A Durable Object storage stand-in with the calls PrState uses.
+// A Durable Object's ctx: its storage and its id, which (like Cloudflare's)
+// prints as 64 hex characters.
+export function doCtx(storage = memoryStorage(), id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("")) {
+  return { storage, id: { toString: () => id } };
+}
+
 export function memoryStorage() {
   const m = new Map();
   const s = {
     map: m,
     alarm: null,
     async get(k) { return m.has(k) ? structuredClone(m.get(k)) : undefined; },
-    async put(k, v) { m.set(k, structuredClone(v)); },
+    // put(key, value), or put({key: value, ...}): several keys at once,
+    // atomically, as on Cloudflare.
+    async put(k, v) {
+      if (k && typeof k === "object") { for (const [kk, vv] of Object.entries(structuredClone(k))) m.set(kk, vv); return; }
+      m.set(k, structuredClone(v));
+    },
     async delete(k) {
       if (Array.isArray(k)) { let n = 0; for (const x of k) n += m.delete(x) ? 1 : 0; return n; }
       return m.delete(k);

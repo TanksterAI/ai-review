@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PrState } from "../src/pr-state.js";
-import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
+import { askedFindings, memoryKv, memoryStorage, testSleep, doCtx } from "./helpers.js";
 
 const NOW = Date.UTC(2026, 10, 14, 21, 0, 0);
 const repo = { full: "TanksterAI/browser-relay", name: "browser-relay", ownerId: "259206056" };
@@ -45,7 +45,7 @@ function make(w = world()) {
   let t = NOW;
   const storage = memoryStorage();
   const env = { LEDGER: memoryKv(), GEMINI_API_KEY: "g", ANTHROPIC_API_KEY: "sk", VERIFY: "", DRAFT_CHAIN: "gemini:gemini-3.5-flash-lite,gemini:gemma-4-31b-it", BATCH_CHARS: "30000" };
-  const obj = new PrState({ storage }, env, { now: () => t, effects: w.fx, fetch: models, sleep: testSleep });
+  const obj = new PrState(doCtx(storage), env, { now: () => t, effects: w.fx, fetch: models, sleep: testSleep });
   return { obj, storage, env, ...w, now: () => t, set: (x) => { t = x; } };
 }
 
@@ -112,7 +112,7 @@ test("closing the PR stops the review in progress: nothing is posted", async () 
 test("REVIEW_MODE=runner keeps the runner path", async () => {
   const w = world();
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, { REVIEW_MODE: "runner" }, { now: () => NOW, effects: w.fx });
+  const obj = new PrState(doCtx(storage), { REVIEW_MODE: "runner" }, { now: () => NOW, effects: w.fx });
   const out = await obj.onEvent({ delivery: "d1", ev: ev() });
   storage.alarm = null;
   await obj.alarm();

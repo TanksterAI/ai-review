@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { AppSecrets, manifest, handleSetupStart, handleSetupCallback, appConfig, resetConfigCache } from "../src/setup.js";
 import { normalise } from "../src/webhook.js";
 import { PrState, parseCommand, helpText } from "../src/pr-state.js";
-import { memoryStorage } from "./helpers.js";
+import { memoryStorage, doCtx } from "./helpers.js";
 
 // These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
 // and the worker-mode tests below cover the Worker's own review.
@@ -206,7 +206,7 @@ test("another App slug changes the mention, the bot login and the help text", ()
 
 test("before setup, the outbox keeps its work and retries", async () => {
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, { ...RUNNER, OWNER_ID: "259206056" }, { now: () => NOW });
+  const obj = new PrState(doCtx(storage), { ...RUNNER, OWNER_ID: "259206056" }, { now: () => NOW });
   await obj.onEvent({
     delivery: "1",
     ev: {
@@ -227,7 +227,7 @@ test("replies name the App by its configured slug", async () => {
     async dispatch() {},
   };
   const storage = memoryStorage();
-  const obj = new PrState({ storage }, RUNNER, { now: () => NOW, effects: fx });
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => NOW, effects: fx });
   const repo = { full: "TanksterAI/x", name: "x" };
   await obj.onEvent({ delivery: "1", ev: { kind: "command", slug: "tankster-ai-reviewer", repo, pr: 3, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-reviewer pause" } });
   await obj.alarm();
