@@ -33,7 +33,7 @@ import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { config } from "./config.js";
 import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
-import { prKeyOfJob } from "./pr-state.js";
+import { objectOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
 
@@ -282,9 +282,25 @@ function prStub(env, key) {
   return env.PR_STATE.get(env.PR_STATE.idFromName(key));
 }
 
-async function askPr(env, key, msg) {
-  const res = await prStub(env, key).fetch("https://pr-state/", { method: "POST", body: JSON.stringify(msg) });
+async function ask(stub, msg) {
+  const res = await stub.fetch("https://pr-state/", { method: "POST", body: JSON.stringify(msg) });
   return res.json();
+}
+
+async function askPr(env, key, msg) {
+  return ask(prStub(env, key), msg);
+}
+
+// The PR object a runner's job id names, or null. The id says which object,
+// not which PR: Cloudflare refuses ids it did not mint for this namespace.
+function jobStub(env, jobId) {
+  const oid = objectOfJob(jobId);
+  if (!oid) return null;
+  try {
+    return env.PR_STATE.get(env.PR_STATE.idFromString(oid));
+  } catch {
+    return null;
+  }
 }
 
 // POST /v1/github/webhook: verify, describe, hand to the PR's Durable Object,
@@ -331,12 +347,12 @@ async function runnerJob(request, env, deps) {
   } catch {
     return json(400, { status: "rejected", reason: "body is not JSON" });
   }
-  const key = prKeyOfJob(body?.job);
   // Only the App's own dispatch starts a job run.
-  if (!key || !claims.run_id || claims.event_name !== "workflow_dispatch") return json(403, { status: "refused", reason: "no such job" });
-  const out = await askPr(env, key, { op: "claim", jobId: body.job, runId: String(claims.run_id) });
+  const stub = claims.run_id && claims.event_name === "workflow_dispatch" ? jobStub(env, body?.job) : null;
+  if (!stub) return json(403, { status: "refused", reason: "no such job" });
+  const out = await ask(stub, { op: "claim", jobId: body.job, runId: String(claims.run_id) });
   if (!out.job) return json(403, { status: "refused", reason: out.error ?? "no such job" });
-  return { claims, body, job: out.job, key };
+  return { claims, body, job: out.job, stub };
 }
 
 // POST /v1/runner/session -> {job, token}: the job and a read-only token for
@@ -356,7 +372,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
   const sleep = deps.sleep ?? ((ms) => new Promise((res) => setTimeout(res, ms)));
   const r = await runnerJob(request, env, deps);
   if (r instanceof Response) return r;
-  const { body, job, key, claims } = r;
+  const { body, job, stub, claims } = r;
   const headSha = String(body.head_sha ?? "");
   if (!/^[0-9a-f]{40}$/.test(headSha)) return json(400, { status: "rejected", reason: "head_sha must be a 40-character commit id" });
   if (!Array.isArray(body.files) || body.files.length > MAX_FILES) {
@@ -370,7 +386,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
   const again = `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`;
   const input = { title: body.title, body: body.body, files: body.files, force };
   const out = await runReview({ cfg: config(env), env, repository: job.repo.full, pr: job.pr, headSha, input, now, sleep, again, fetchImpl: deps.fetch, skip: Array.isArray(job.skip) ? job.skip : [] });
-  const finish = () => askPr(env, key, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
+  const finish = () => ask(stub, { op: "complete", jobId: job.id, runId: String(claims.run_id), reviewedSha: headSha });
 
   if (out.status === 200 && out.body.status === "reviewed") {
     const fx = deps.effects ?? createEffects(env, { config: await appConfig(env) });
@@ -402,7 +418,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
     const at = Date.parse(out.body.resets_at);
     const retryAt = out.status === 429 ? (Number.isFinite(at) ? at : now() + 3600_000) : now() + (out.status === 503 ? 5 : 15) * 60_000;
     const why = out.status === 429 ? "quota" : out.status === 503 ? "busy" : "failed";
-    await askPr(env, key, { op: "defer", jobId: job.id, runId: String(claims.run_id), retryAt, why, chars: out.body.chars, reason: out.body.reason, failed: out.body.failed });
+    await ask(stub, { op: "defer", jobId: job.id, runId: String(claims.run_id), retryAt, why, chars: out.body.chars, reason: out.body.reason, failed: out.body.failed });
   }
   return json(out.status, out.body);
 }

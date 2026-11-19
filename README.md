@@ -114,7 +114,8 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
   - **On request:** `@tankster-ai-review review` (the commits since the last review) or `full review` (the whole PR), at once. Either one covers a push that is still waiting.
   - **Not while** the PR is paused (`pause`) or closed. Closing drops the PR's jobs and their waiting dispatches.
 - **Who decides what.**
-  - The PR's Durable Object decides what happens. Each job it mints is single-use and names its own repository, PR and commits.
+  - The PR's Durable Object decides what happens. Each job it mints is single-use, and its record (kept in the object) names its repository, PR and commits.
+  - The job's id names none of them: it is the object's Cloudflare id and a random part. This repository is public, and so are its runs' inputs and logs, so the runner's log lines say what happened but never which repository, PR, commit or model, nor the cost. The Worker's own logs keep those.
   - The runner proves who it is with its OIDC token. Only `runner.yml` on `main` is accepted.
   - It gets a read-only token for the one repository in the job, and revokes it at the end.
 - **What the runner never gets.** It never holds the App's key, a write token or a model key. It also never runs code from the reviewed repository: it reads the diff through the API.

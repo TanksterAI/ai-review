@@ -54,25 +54,24 @@ export function parseCommand(text, slug = DEFAULT_SLUG) {
   return COMMANDS.find((c) => line === c || line.startsWith(`${c} `) || line.startsWith(`${c}.`)) ?? null;
 }
 
-function b64url(s) {
-  return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
+// A job id is the PR object's own id (64 hex characters, which Cloudflare
+// derives from the PR's name and does not let anyone reverse) and 32 random
+// hex characters. The runner's repository is public, and so is every
+// workflow_dispatch input: the id must not say which repository or PR it is.
+const OBJECT_ID = /^[0-9a-f]{64}$/;
+const JOB_ID = /^([0-9a-f]{64})\.[0-9a-f]{32}$/;
 
-export function jobIdFor(prKey) {
+export function jobIdFor(objectId) {
+  const oid = String(objectId ?? "");
+  if (!OBJECT_ID.test(oid)) throw new Error("a job needs its PR object's id (64 hex characters)");
   const r = new Uint8Array(16);
   crypto.getRandomValues(r);
-  return `${b64url(prKey)}.${Array.from(r, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+  return `${oid}.${Array.from(r, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
-export function prKeyOfJob(jobId) {
-  const m = /^([A-Za-z0-9_-]{4,400})\.[0-9a-f]{32}$/.exec(String(jobId ?? ""));
-  if (!m) return null;
-  try {
-    const pad = m[1].replace(/-/g, "+").replace(/_/g, "/");
-    return decodeURIComponent(escape(atob(pad + "=".repeat((4 - (pad.length % 4)) % 4))));
-  } catch {
-    return null;
-  }
+// The PR object a job id belongs to, or null if it is no job id.
+export function objectOfJob(jobId) {
+  return JOB_ID.exec(String(jobId ?? ""))?.[1] ?? null;
 }
 
 const WRITER_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
@@ -271,7 +270,7 @@ export class PrState {
     // Never the job of the review in progress: it may wait hours for a provider.
     const running = (await activeRun(this.ctx.storage))?.id;
     await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running).map(([k]) => k));
-    const id = jobIdFor(`${ev.repo.full}#${ev.pr}`);
+    const id = jobIdFor(this.ctx.id?.toString());
     const job = {
       id,
       repo: { full: ev.repo.full, name: ev.repo.name },

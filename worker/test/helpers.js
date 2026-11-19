@@ -96,6 +96,12 @@ export const GROUNDED_PATCH = [
 ].join("\n");
 
 // A Durable Object storage stand-in with the calls PrState uses.
+// A Durable Object's ctx: its storage and its id, which (like Cloudflare's)
+// prints as 64 hex characters.
+export function doCtx(storage = memoryStorage(), id = Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("")) {
+  return { storage, id: { toString: () => id } };
+}
+
 export function memoryStorage() {
   const m = new Map();
   const s = {

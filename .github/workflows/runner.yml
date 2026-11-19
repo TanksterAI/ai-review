@@ -51,7 +51,7 @@ jobs:
             const AUDIENCE = "tankster-ai-review";
             const ENDPOINT = "https://tankster-ai-review.rishi-tank.workers.dev";
             const job = String(process.env.JOB || "");
-            if (!/^[A-Za-z0-9_-]{4,400}\.[0-9a-f]{32}$/.test(job)) {
+            if (!/^[0-9a-f]{64}\.[0-9a-f]{32}$/.test(job)) {
               core.setFailed("This run carries no valid job id.");
               return;
             }
@@ -87,7 +87,7 @@ jobs:
             try {
               const { data: pr } = await gh.rest.pulls.get({ owner, repo, pull_number: j.pr });
               if (pr.state !== "open") {
-                core.notice(`${j.repo.full}#${j.pr} is ${pr.state}; nothing to review.`);
+                core.notice(`The pull request is ${pr.state}; nothing to review.`);
                 return;
               }
 
@@ -129,17 +129,16 @@ jobs:
               };
 
               const { res, out } = await call("/v1/runner/review", payload);
-              const where = `${j.repo.full}#${j.pr} at ${pr.head.sha.slice(0, 7)}`;
-              if (res.status === 409) core.notice(`${where} was already reviewed.`);
+              // This repository is public, and so are its runs' logs: they say
+              // what happened, never which repository, PR, commit or model, nor
+              // what it cost. The Worker's own logs hold those.
+              if (res.status === 409) core.notice("This commit was already reviewed.");
               else if (res.status === 429) core.warning(`Review deferred: ${out.reason}. It is queued and runs again after ${out.resets_at}.`);
               else if (res.status === 503) core.warning(`Review not run yet: ${out.reason ?? "the review service is unavailable"}. It is queued and tried again in about 5 minutes.`);
               else if (res.status === 502) core.warning(`Review failed: ${out.reason ?? "no reason given"}. It is queued and tried again in about 15 minutes (3 tries in all).`);
-              else if (res.ok && out.status === "skipped") core.notice(`Nothing to review in ${where}: ${out.reason}.`);
-              else if (res.ok && out.status === "reviewed") {
-                const u = out.usage ?? {};
-                const cost = u.provider && u.provider !== "workers-ai" ? `${u.model}, $${Number(u.usd ?? 0).toFixed(4)}` : `${Math.round(u.neurons ?? 0)} neurons`;
-                core.notice(`Reviewed ${where}: ${out.inline ?? 0} inline comment(s), ${cost}.`);
-              } else core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
+              else if (res.ok && out.status === "skipped") core.notice(`Nothing to review: ${out.reason}.`);
+              else if (res.ok && out.status === "reviewed") core.notice(`Reviewed: ${out.inline ?? 0} inline comment(s).`);
+              else core.setFailed(`Review failed (HTTP ${res.status}): ${out.reason ?? "no reason given"}`);
             } finally {
               // The token dies with the run, whatever happened.
               await gh.request("DELETE /installation/token").catch(() => {});

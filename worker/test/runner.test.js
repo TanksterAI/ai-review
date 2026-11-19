@@ -22,7 +22,9 @@ function extractScript(text) {
 
 const SCRIPT = extractScript(yml);
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
-const JOB = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"a".repeat(32)}`;
+const JOB = `${"0123456789abcdef".repeat(4)}.${"a".repeat(32)}`;
+// The old form: base64url of "TanksterAI/browser-relay#39".
+const OLD_JOB = `VGFua3N0ZXJBSS9icm93c2VyLXJlbGF5IzM5.${"a".repeat(32)}`;
 const HEAD = "c".repeat(40);
 const SINCE = "b".repeat(40);
 
@@ -79,7 +81,7 @@ test("the workflow keeps its guard rails", () => {
 });
 
 test("a run without a valid job id does nothing", async () => {
-  for (const job of ["", "x", `${JOB}; rm -rf /`, "a.b"]) {
+  for (const job of ["", "x", `${JOB}; rm -rf /`, "a.b", OLD_JOB]) {
     const log = await run({ job });
     assert.match(log.failed, /no valid job id/);
     assert.equal(log.fetches.length, 0);
@@ -137,4 +139,25 @@ test("big patches are cut and the total is bounded", async () => {
   assert.ok(sent.every((f) => !f.patch || f.patch.length <= 20_000));
   assert.ok(sent.reduce((n, f) => n + (f.patch?.length ?? 0), 0) <= 120_000);
   assert.ok(sent.some((f) => f.patch_omitted));
+});
+
+test("public log lines name no repository, pull request, commit or cost", async () => {
+  // This repository is public, so its runs' logs are too.
+  const logs = [
+    await run(),
+    await run({ review: { status: 200, json: { status: "reviewed", inline: 1, usage: { provider: "anthropic", model: "claude-haiku-5-5", usd: 0.0123 } } } }),
+    await run({ review: { status: 200, json: { status: "skipped", reason: "nothing changed" } } }),
+    await run({ review: { status: 409, json: { status: "duplicate" } } }),
+    await run({ pr: { state: "closed" } }),
+  ];
+  for (const log of logs) {
+    const lines = [...log.notices, ...log.warnings, log.failed ?? ""].join("\n");
+    assert.ok(log.notices.length + log.warnings.length > 0, "each run still says what happened");
+    for (const secret of ["TanksterAI", "browser-relay", "#39", HEAD.slice(0, 7), "neurons", "$", "claude", "haiku"]) {
+      assert.ok(!lines.includes(secret), `"${secret}" in: ${lines}`);
+    }
+  }
+  assert.match(logs[0].notices[0], /^Reviewed: 2 inline comment\(s\)\.$/);
+  assert.match(logs[2].notices[0], /nothing changed/);
+  assert.match(logs[3].notices[0], /already reviewed/);
 });
