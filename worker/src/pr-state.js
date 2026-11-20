@@ -40,7 +40,9 @@ const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "help"])
 const ALIASES = { ignore: "pause" };
 // As CodeRabbit's: `approve` works only as a top-level comment. `resolve` in
 // a reply in one of the App's threads resolves only that thread.
-const TOP_LEVEL_ONLY = new Set(["approve"]);
+// As CodeRabbit's: only resolve works as a reply in a review thread (it
+// resolves that thread); every other command goes in a PR comment.
+const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "help", "approve"]);
 // Threads one alarm resolves at most (each is a subrequest; Workers Free
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
@@ -71,26 +73,52 @@ export function helpText(slug = DEFAULT_SLUG) {
   ].join("\n");
 }
 
-// CodeRabbit's command rules: the handle starts a line, outside any code; one
-// command per comment (the first such line); case does not matter. Other
-// text on the command's line stops it being a command, and the whole-comment
-// commands must be all there is. Anything else is chat, which gets no reply
-// here (yet).
+// CodeRabbit's command rules: the handle starts a line, as plain text (not in
+// a code block or an HTML comment); one command per comment (the first such
+// line); case does not matter. Other text on the command's line stops it
+// being a command, and the whole-comment commands must be all there is,
+// code blocks included. Anything else is chat, which gets no reply here (yet).
+// Lines are read one by one (no backtracking pattern), as GitHub's Markdown
+// reads them: a fence of three or more backticks or tildes, closed by a fence
+// of the same kind at least as long. A line indented four spaces or more
+// (code, in Markdown) neither opens a fence nor holds a command.
 export function parseCommand(text, slug = DEFAULT_SLUG) {
   mentionOf(slug); // throws on a malformed slug before it reaches a pattern
-  const plain = String(text ?? "")
-    .replace(/\r\n?/g, "\n")
-    // Fenced code blocks (``` or ~~~, closed or running to the end). A
-    // command in inline code never starts its line, so it is never one.
-    .replace(/^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]*\1[ \t]*$|(?![\s\S]))/gm, "");
-  const handle = new RegExp(`^\\s*@${slug}(?![\\w-])(.*)$`, "i");
-  const lines = plain.split("\n");
-  const at = lines.findIndex((l) => handle.test(l));
+  const raw = String(text ?? "").replace(/\r\n?/g, "\n");
+  // HTML comments, which GitHub does not show.
+  let shown = "";
+  for (let at = 0; at < raw.length;) {
+    const open = raw.indexOf("<!--", at);
+    if (open < 0) { shown += raw.slice(at); break; }
+    shown += raw.slice(at, open);
+    const close = raw.indexOf("-->", open + 4);
+    if (close < 0) break;
+    // Keep the line breaks, so lines stay lines.
+    shown += raw.slice(open, close + 3).replace(/[^\n]/g, "");
+    at = close + 3;
+  }
+  const lines = shown.split("\n");
+  const handle = new RegExp(`^ {0,3}@${slug}(?![\\w-])(.*)$`, "i");
+  let fence = null;
+  let at = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(l);
+    if (fence) {
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+      continue;
+    }
+    // A backtick fence's info string may not hold a backtick.
+    if (f && !(f[1][0] === "`" && f[2].includes("`"))) { fence = f[1]; continue; }
+    if (handle.test(l)) { at = i; break; }
+  }
   if (at < 0) return null;
   const said = handle.exec(lines[at])[1].trim().toLowerCase().replace(/\s+/g, " ");
   const cmd = ALIASES[said] ?? (COMMANDS.includes(said) ? said : null);
   if (!cmd) return null;
-  if (WHOLE_COMMENT.has(cmd) && lines.some((l, i) => i !== at && l.trim())) return null;
+  // Whole comment: nothing else at all, hidden or shown, before or after.
+  const all = raw.split("\n");
+  if (WHOLE_COMMENT.has(cmd) && all.filter((l) => l.trim()).length !== 1) return null;
   return cmd;
 }
 
@@ -314,7 +342,9 @@ export class PrState {
     const old = await this.ctx.storage.list({ prefix: "job:" });
     // Never the job of the review in progress: it may wait hours for a provider.
     const running = (await activeRun(this.ctx.storage))?.id;
-    await this.deleteAll([...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running).map(([k]) => k));
+    const stale = [...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running);
+    for (const [, j] of stale) await this.ackEnded(j, "The review expired before it could run.");
+    await this.deleteAll(stale.map(([k]) => k));
     const id = jobIdFor(this.ctx.id?.toString());
     const job = {
       id,
@@ -349,7 +379,11 @@ export class PrState {
         await clearOpenFindings(this.ctx.storage);
       }
       await this.ctx.storage.delete(["debounce", "runFailures", "runRetryAt"]);
-      await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
+      const jobs = await this.ctx.storage.list({ prefix: "job:" });
+      // A review asked for and not done says why, in its own comment (an edit:
+      // nothing new is posted on a closed PR).
+      for (const j of jobs.values()) await this.ackEnded(j, "The pull request was closed before the review finished.");
+      await this.deleteAll([...jobs.keys()]);
       // A review in progress stops: nothing is posted on a closed PR.
       for (const prefix of [RUN_META, RUN]) await this.deleteAll([...(await this.ctx.storage.list({ prefix })).keys()]);
       // Their dispatches would only start runners the Worker then refuses.
@@ -493,6 +527,7 @@ export class PrState {
       const run = await activeRun(this.ctx.storage);
       if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
         await dropRun(this.ctx.storage, run.id);
+        await this.ackEnded(await this.ctx.storage.get(`job:${run.id}`), "The review could not finish.");
         await this.ctx.storage.delete(`job:${run.id}`);
         await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
         await this.outbox({ type: "comment", template: "gave_up", reason: "the review could not run (the App may not be set up)", tries: n, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
@@ -514,7 +549,10 @@ export class PrState {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
         await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
         // Its job would never get a runner: it must not stand in for later pushes.
-        if (item.jobId) await this.ctx.storage.delete(`job:${item.jobId}`);
+        if (item.jobId) {
+          if (item.type !== "ack") await this.ackEnded(await this.ctx.storage.get(`job:${item.jobId}`), "The review could not start.");
+          await this.ctx.storage.delete(`job:${item.jobId}`);
+        }
       } else {
         item.attempts += 1;
         await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
@@ -685,9 +723,14 @@ export class PrState {
         st.paused = false;
         await this.ctx.storage.put("state", st);
         // As CodeRabbit's: the commits pushed while paused are reviewed now.
-        const head = typeof fx.pullRequest === "function" ? (await fx.pullRequest(item.repo.full, item.pr))?.head?.sha : null;
-        if (!head || head === st.lastReviewed || head === st.lastCompleteReviewed) {
-          if (!item.acked) await fx.comment(item.repo.full, item.pr, "Automatic reviews are back on.");
+        // Not a draft's, nor a closed PR's: those wait to be ready or reopened.
+        const pr = typeof fx.pullRequest === "function" ? await fx.pullRequest(item.repo.full, item.pr) : null;
+        const head = pr?.head?.sha ?? null;
+        const draft = Boolean(pr?.draft) || Boolean(st.draft);
+        const shut = (pr && pr.state !== "open") || st.closed;
+        if (!head || draft || shut || head === st.lastReviewed || head === st.lastCompleteReviewed) {
+          const note = shut ? " This pull request is closed: it is reviewed if it is reopened." : draft ? " This pull request is a draft: it is reviewed once it is marked ready." : "";
+          if (!item.acked) await fx.comment(item.repo.full, item.pr, `Automatic reviews are back on.${note}`);
           return undefined;
         }
         return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
@@ -730,6 +773,12 @@ export class PrState {
     return this.dispatchJob(fx, item.jobId);
   }
 
+  // A job ends without completing (given up, dropped, its PR closed): its
+  // acknowledgement, if any, says so rather than "Review triggered." for ever.
+  async ackEnded(job, why) {
+    if (Number.isSafeInteger(job?.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionNotCompleted(why) });
+  }
+
   async keepItem(item) {
     const box = (await this.ctx.storage.get("outbox")) ?? [];
     await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
@@ -748,7 +797,12 @@ export class PrState {
     const active = await activeRun(this.ctx.storage);
     // Held until the running review can next move (no sooner than RECHECK_MS):
     // a review waiting hours for a provider must not wake this every 30 s.
-    if (active && active.id !== job.id) return { holdUntil: Math.max(this.now() + RECHECK_MS, active.waitUntil || 0) };
+    if (active && active.id !== job.id) {
+      // Kept fresh while it waits, or newJob would prune it (JOB_TTL_MS) and
+      // its acknowledgement would say it expired.
+      await this.ctx.storage.put(`job:${job.id}`, { ...job, createdAt: this.now() });
+      return { holdUntil: Math.max(this.now() + RECHECK_MS, active.waitUntil || 0) };
+    }
     // Only a full-coverage review's commit is a starting point: the runner and
     // v1 move lastReviewed too, but read at most 90,000 characters.
     const since = job.full ? null : (st.lastCompleteReviewed ?? null);
@@ -790,7 +844,12 @@ export class PrState {
     } else {
       const job = await this.ctx.storage.get(`job:${run.id}`);
       await this.ctx.storage.delete(`job:${run.id}`);
-      if (Number.isSafeInteger(job?.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionNotCompleted("The review could not finish.") });
+      // A review that ran but could not cover every file did finish: it says
+      // how far it got. One given up, or stopped by the PR closing, did not.
+      const said = String(description ?? "").replace(/[`\n]/g, " ").slice(0, 200);
+      if (Number.isSafeInteger(job?.ackId)) {
+        await this.outbox({ type: "ack", commentId: job.ackId, text: !gaveUp && said ? actionPerformed(`Review finished. ${said}`) : actionNotCompleted(gaveUp ? "The review could not finish." : "The pull request is no longer open.") });
+      }
     }
     await dropRun(this.ctx.storage, run.id);
     if (gaveUp) {
@@ -863,6 +922,8 @@ export class PrState {
           ? await fx.dismissReview(key.repo, key.pr, decision.id, why) : false;
         if (!dismissed) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
       }
+      // The summary's notice must not still say approved: it lists what is open.
+      if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
       return undefined;
     }
     if (open.length || inBody.length) {
@@ -978,6 +1039,7 @@ export class PrState {
     const old = this.now() - (job.firstRunAt ?? job.firstAt ?? job.createdAt) > MAX_JOB_LIFE_MS;
     if (st.closed || retries >= MAX_RETRIES || old) {
       await this.ctx.storage.delete(`job:${jobId}`);
+      await this.ackEnded(job, st.closed ? "The pull request was closed before the review finished." : "The review could not finish.");
       if (!st.closed) {
         // Never silently: say so on the PR, at most once an hour.
         console.log(JSON.stringify({ svc: "ai-review", ev: "review_given_up", retries }));
@@ -1013,6 +1075,7 @@ export class PrState {
     const job = await this.ctx.storage.get(`job:${jobId}`);
     if (!job) return { error: "unknown or finished job" };
     if (this.now() - job.createdAt > JOB_TTL_MS) {
+      await this.ackEnded(job, "The review expired before it could run.");
       await this.ctx.storage.delete(`job:${jobId}`);
       return { error: "job expired" };
     }

@@ -607,3 +607,16 @@ test("the notice says approval is pending while the head has no complete review;
   await decide(m);
   assert.match(summaries[0], /\*\*Automatic approval pending\*\*: commit `[0-9a-f]{12}` has no complete review yet\./);
 });
+
+test("a reopen after the approval turns the summary's notice back to withheld, with the open thread", async () => {
+  const m = await make({ threads: [{ ...thread("t1", false), commentId: 501 }], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
+  const summaries = [];
+  m.fx.upsertSummary = async (_r, _p, _id, body) => { summaries.push(body); return 9; };
+  m.fx.dismissReview = async () => true;
+  await m.storage.put("summaryBase", "### Tankster AI Review");
+  await m.storage.put("summaryNotice", `**Automatic approval**: approved at commit \`${HEAD.slice(0, 12)}\`.`);
+  await decide(m, { reopened: true });
+  assert.equal(summaries.length, 1);
+  assert.match(summaries[0], /\*\*Automatic approval withheld\*\*[\s\S]*#discussion_r501/);
+  assert.doesNotMatch(summaries[0], /approved at commit/);
+});

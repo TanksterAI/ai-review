@@ -67,12 +67,30 @@ test("commands are parsed from the text after the mention", () => {
     ["```\n@tankster-ai-review review\n```", null],
     ["`@tankster-ai-review review`", null],
     ["`x` @tankster-ai-review review", null],
+    ["    @tankster-ai-review review", null],
+    ["\t@tankster-ai-review review", null],
+    ["<!-- @tankster-ai-review review -->", null],
+    ["<!--\n@tankster-ai-review review\n-->\n@tankster-ai-review full review", "full review"],
+    ["```\nx\n````\n@tankster-ai-review review", "review"],
+    ["```js```\n@tankster-ai-review review", "review"],
+    ["````\n```\n@tankster-ai-review review\n````", null],
+    ["@tankster-ai-review resolve\n```\nwhy\n```", null],
+    ["@tankster-ai-review resolve\r\n", "resolve"],
+    ["@tankster-ai-review resolve\n<!-- hidden -->", null],
+    ["    ```\n@tankster-ai-review review", "review"],
     ["@tankster-ai-review reviewing", null],
     ["@tankster-ai-reviewer review", null],
     ["@tankster-ai-review delete everything", null],
   ];
   for (const [text, want] of cases) assert.equal(parseCommand(text), want, JSON.stringify(text));
   assert.throws(() => parseCommand("@x review", "bad slug!"));
+  // No backtracking blow-up on a long line of backticks or tildes.
+  for (const ch of ["`", "~"]) {
+    const t0 = Date.now();
+    assert.equal(parseCommand(ch.repeat(8000)), null);
+    assert.equal(parseCommand(`${ch.repeat(3)}\n${ch.repeat(7990)}x`), null);
+    assert.ok(Date.now() - t0 < 20, `${ch}: ${Date.now() - t0} ms`);
+  }
 });
 
 test("job ids carry the PR object's id, never the repository or PR", () => {
@@ -1244,4 +1262,122 @@ test("a retried command acknowledges once: the acknowledgement is kept on its it
   for (let i = 0; i < 5; i++) { obj.ctx.storage.alarm = null; try { await obj.alarm(); } catch {} }
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "dispatched on the retry");
   assert.equal(comments(fx).filter((c) => /Review triggered/.test(c)).length, 1);
+});
+
+// Every way a requested review can end edits its acknowledgement: none is left
+// saying "Review triggered." for ever.
+async function acked(over = {}) {
+  const t = { now: NOW };
+  const { obj, fx, storage } = make({ now: () => t.now });
+  withPr(fx, "d".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("job:j1", { id: "j1", ackId: 1234, createdAt: NOW, ...over });
+  return { obj, fx, storage, t };
+}
+const lastEdit = (fx) => { const e = edits(fx); assert.equal(e.length, 1, JSON.stringify(e)); assert.equal(e[0][0], 1234); return e[0][1]; };
+
+test("ack: a run that covered only part of the PR says it finished, and how far it got", async () => {
+  const { obj, fx } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false, description: "Incomplete: 2 of 5 files reviewed. Comment \"review\" to try again." });
+  await drain(obj);
+  assert.match(lastEdit(fx), /<summary>Action performed<\/summary>[\s\S]*Review finished\. Incomplete: 2 of 5 files reviewed\./);
+});
+
+test("ack: a run stopped because the PR is no longer open says so", async () => {
+  const { obj, fx } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false });
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*no longer open/);
+});
+
+test("ack: closing the PR edits the acknowledgement of a review not done (and posts nothing)", async () => {
+  const { obj, fx, storage } = await acked();
+  await obj.onEvent({ delivery: "c1", ev: { ...review(), kind: "closed" } });
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*closed before the review finished/);
+  assert.equal(comments(fx).length, 0);
+  assert.equal(await storage.get("job:j1"), undefined);
+});
+
+test("ack: a deferral that gives the review up edits it", async () => {
+  const { obj, fx } = await acked({ claimedBy: "7", retries: 2 });
+  assert.equal((await obj.defer({ jobId: "j1", runId: "7", why: "error" })).dropped, true);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*could not finish/);
+});
+
+test("ack: a job that expired before its claim edits it", async () => {
+  const { obj, fx, t } = await acked();
+  t.now = NOW + 3 * 3600_000;
+  assert.equal((await obj.claim({ jobId: "j1", runId: "7" })).error, "job expired");
+  await drain(obj);
+  assert.match(lastEdit(fx), /expired before it could run/);
+});
+
+test("ack: a stale job pruned by a new one edits it; a fresh one is left alone", async () => {
+  const { obj, fx, storage, t } = await acked();
+  await storage.put("job:j2", { id: "j2", ackId: 99, createdAt: NOW + 3 * 3600_000 - 1000 });
+  t.now = NOW + 3 * 3600_000;
+  await obj.newJob({ repo, pr: 39 }, await obj.state(), { queue: false });
+  assert.equal(await storage.get("job:j1"), undefined);
+  assert.ok(await storage.get("job:j2"));
+  const box = (await storage.get("outbox")) ?? [];
+  assert.deepEqual(box.filter((x) => x.type === "ack").map((x) => x.commentId), [1234]);
+});
+
+test("ack: a dispatch dropped after its retries edits it", async () => {
+  const { obj, fx, storage } = await acked();
+  await storage.put("outbox", [{ id: "o1", type: "dispatch", jobId: "j1", attempts: 5 }]);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*could not start/);
+  assert.equal(await storage.get("job:j1"), undefined);
+});
+
+test("ack: a run given up by the alarm (after MAX_RUN_LIFE) edits it", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun, activeRun } = await import("../src/review-run.js");
+  await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  assert.ok(await activeRun(storage));
+  t.now = NOW + 4 * 24 * 3600_000;
+  await fire(obj);
+  await drain(obj);
+  assert.match(lastEdit(fx), /could not finish/);
+});
+
+test("resume turns reviews back on but does not review a draft or a closed PR", async () => {
+  for (const [pr, said] of [[{ state: "open", draft: true }, /draft: it is reviewed once it is marked ready/], [{ state: "closed", draft: false }, /closed: it is reviewed if it is reopened/]]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "c".repeat(40));
+    fx.pullRequest = async () => ({ ...pr, head: { sha: "e".repeat(40) } });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: true });
+    await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review resume") });
+    await drain(obj);
+    assert.equal((await storage.get("state")).paused, false);
+    assert.match(comments(fx).at(-1), said);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  }
+});
+
+test("only resolve works as a reply in a review thread; every other command is top-level", async () => {
+  for (const text of ["review", "full review", "pause", "resume", "help", "approve", "ignore"]) {
+    const { obj } = make();
+    const out = await obj.onEvent({ delivery: "1", ev: { ...command(`@tankster-ai-review ${text}`), where: "thread", commentId: 9, inReplyTo: 5 } });
+    assert.equal(out.action, "not_a_command", text);
+  }
+  const { obj } = make();
+  const out = await obj.onEvent({ delivery: "1", ev: { ...command("@tankster-ai-review resolve"), where: "thread", commentId: 9, inReplyTo: 5 } });
+  assert.notEqual(out.action, "not_a_command");
+});
+
+test("a job waiting behind the review in progress is kept fresh, so it is not pruned as stale", async () => {
+  const t = { now: NOW };
+  const { obj, storage } = make({ now: () => t.now });
+  const { startRun } = await import("../src/review-run.js");
+  await startRun(storage, { id: "busy", repo, pr: 39 }, NOW);
+  await storage.put("job:j1", { id: "j1", repo, pr: 39, createdAt: NOW });
+  t.now = NOW + 3600_000;
+  const out = await obj.startWorkerRun(await storage.get("job:j1"), await obj.state());
+  assert.ok(out.holdUntil > t.now);
+  assert.equal((await storage.get("job:j1")).createdAt, t.now);
 });

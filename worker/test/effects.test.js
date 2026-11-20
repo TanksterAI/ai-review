@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createEffects, MARKER } from "../src/effects.js";
+import { commentIdOf, createEffects, MARKER } from "../src/effects.js";
 
 function fakeApp(respond = () => ({})) {
   const log = { tokens: [], calls: [] };
@@ -229,13 +229,13 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
 
 const thread = (over = {}) => ({
   id: "PRRT_1", isResolved: false, isOutdated: false, path: "a.js", line: 5, originalLine: 4,
-  comments: { nodes: [{ databaseId: 11, author: { login: "tankster-ai-review" }, body: "**Minor (bug): x**\n<sub>Potential issue · finding `fd6a7c0b`</sub>\n\nfix", diffHunk: "@@ -1 +1 @@\n+y", originalCommit: { oid: "1".repeat(40) } }] },
+  comments: { nodes: [{ fullDatabaseId: "4637412430", author: { login: "tankster-ai-review" }, body: "**Minor (bug): x**\n<sub>Potential issue · finding `fd6a7c0b`</sub>\n\nfix", diffHunk: "@@ -1 +1 @@\n+y", originalCommit: { oid: "1".repeat(40) } }] },
   ...over,
 });
 
 test("ownThreads: the App's own threads across pages, read through GraphQL with the finding id", async () => {
   const pages = [
-    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [thread(), thread({ id: "PRRT_2", comments: { nodes: [{ databaseId: 12, author: { login: "coderabbitai" }, body: "x", diffHunk: "", originalCommit: { oid: "1".repeat(40) } }] } })] } } } } },
+    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [thread(), thread({ id: "PRRT_2", comments: { nodes: [{ fullDatabaseId: "12", author: { login: "coderabbitai" }, body: "x", diffHunk: "", originalCommit: { oid: "1".repeat(40) } }] } })] } } } } },
     { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [thread({ id: "PRRT_3", isResolved: true, line: null, resolvedBy: { login: "rishitank" } })] } } } } },
   ];
   const app = fakeApp(() => pages.shift());
@@ -249,9 +249,17 @@ test("ownThreads: the App's own threads across pages, read through GraphQL with 
   assert.deepEqual(app.log.calls[0].body.variables, { owner: "TanksterAI", name: "x", pr: 3, after: null });
   assert.equal(app.log.calls[1].body.variables.after, "c1");
   assert.deepEqual(list.map((t) => [t.id, t.resolved, t.findingId, t.commentId, t.line, t.originalLine, t.originalCommit]), [
-    ["PRRT_1", false, "fd6a7c0b", 11, 5, 4, "1".repeat(40)],
-    ["PRRT_3", true, "fd6a7c0b", 11, null, 4, "1".repeat(40)],
+    ["PRRT_1", false, "fd6a7c0b", 4637412430, 5, 4, "1".repeat(40)],
+    ["PRRT_3", true, "fd6a7c0b", 4637412430, null, 4, "1".repeat(40)],
   ]);
+  // Ids past 2^31 come as fullDatabaseId, a string: read as a safe integer.
+  assert.match(app.log.calls[0].body.query, /fullDatabaseId/);
+});
+
+test("commentIdOf: fullDatabaseId strings and old Ints; nothing else", () => {
+  assert.equal(commentIdOf("4637412430"), 4637412430);
+  assert.equal(commentIdOf(11), 11);
+  for (const bad of [null, undefined, "", "12a", "-3", 0, -1, 1.5, "99999999999999999"]) assert.equal(commentIdOf(bad), null, String(bad));
 });
 
 test("GraphQL errors are errors, not empty answers", async () => {

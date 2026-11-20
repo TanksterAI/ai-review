@@ -102,7 +102,7 @@ Checked on 19 Nov 2026 against CodeRabbit's docs (Automatic Approvals, the reque
   - it has not approved already;
   - the head is unchanged when it checks again just before approving.
 
-  The approval has no text, as CodeRabbit's: the summary comment says why. Its **approval notice**, just under the heading, is rewritten whenever the decision changes. It reads "**Automatic approval withheld**" with a link to each open thread (up to 20) and the count of open body findings, or "**Automatic approval pending**" while the head has no complete review, or that it is approved at a commit. A thread of its own reopened after its approval **withdraws** the approval: the review is dismissed, as CodeRabbit withdraws its own. Only if GitHub refuses the dismissal is Changes requested filed instead. Drafts and closed pull requests are never approved.
+  The approval has no text, as CodeRabbit's: the summary comment says why. Its **approval notice**, just under the heading, is rewritten whenever the decision changes. It reads "**Automatic approval withheld**" with a link to each open thread (up to 20) and the count of open body findings, or "**Automatic approval pending**" while the head has no complete review, or that it is approved at a commit. A thread of its own reopened after its approval **withdraws** the approval: the review is dismissed, as CodeRabbit withdraws its own, and the notice goes back to withheld. Only if GitHub refuses the dismissal is Changes requested filed instead. Drafts and closed pull requests are never approved.
 - **`resolve` as a reply in one of its threads** (CodeRabbit's reference) resolves that thread only. The writer vouches for it, unless it is reopened after the command was posted, and an ordinary decision follows. In any other thread it does nothing. `approve` is never a command in a thread.
 - **`resolve` and `approve`** (top-level comments by people with write access) do the same, as CodeRabbit's do: they resolve all of its threads, clear its body-only findings, and approve without waiting for a complete review of the latest commit. Up to 20 threads are resolved an alarm; the rest go in the next ones, and the decision is its own outbox item. A decision or one of these commands gets its alarm to itself: a review in progress takes its next step at the next alarm.
 
@@ -156,15 +156,15 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
   Later phases add permissions, and GitHub asks the owner to approve each addition. **Commit statuses** came with full coverage: the App created before it must be given it once (App settings → Permissions & events → Commit statuses: Read and write, then accept the request on the organisation's installation). Until then reviews are still posted, and the Worker logs `status_unavailable` instead of setting the status.
 - **Commands.** `review`, `full review`, `pause` (or `ignore`), `resume`, `resolve`, `approve` and `help`. Everything except `help` needs write access, checked through the API.
   - **Syntax, as CodeRabbit's:**
-    - The handle starts a line, written as plain text: not in a code block, and not after other text on the line. Case does not matter.
+    - The handle starts a line, written as plain text: not in a fenced or indented code block, not in an HTML comment, and not after other text on the line. Case does not matter. Comments are read line by line, as GitHub's Markdown reads them, so no comment can make the parser slow.
     - One command per comment: the first such line counts.
     - `review` and `full review` must be alone on their line, so `review please` is not a command.
-    - `pause`, `resume`, `resolve`, `approve` and `help` must be the whole comment.
+    - `pause`, `resume`, `resolve`, `approve` and `help` must be the whole comment (nothing else, hidden text and code blocks included).
   - **Replies:**
-    - `review` and `full review` answer "Action performed: Review triggered.", edited to "Review finished." when the review completes. If it could not finish, the answer is edited to "Action not completed".
+    - `review` and `full review` answer "Action performed: Review triggered.", edited to "Review finished." when the review completes. A review that could cover only part of the files is edited to "Review finished." with how far it got. Every other end is "Action not completed" with the reason: the review gave up, could not start (its dispatch failed five times), expired before it could run, or the pull request was closed. No answer is left saying "Review triggered." for ever.
     - `review` on a head already reviewed in full answers "Action not completed: Already reviewed the last commit", and `full review` reviews it again.
-    - `resume` also reviews, at once, the commits pushed while reviews were paused.
-  - `approve` works only as a top-level comment. `resolve` also works as a reply in one of the App's threads, for that thread.
+    - `resume` also reviews, at once, the commits pushed while reviews were paused, unless the pull request is a draft or closed (it says so; those are reviewed once ready or reopened).
+  - Every command works as a top-level comment. Only `resolve` also works as a reply in one of the App's threads, for that thread; in a thread, the others are not commands.
 - **Secrets: nobody handles them.** The App is created once, from a manifest:
   - Open `https://tankster-ai-review.rishi-tank.workers.dev/v1/setup/github-app` and press the button. GitHub creates the App in TanksterAI.
   - GitHub hands its id, slug, private key and webhook secret straight to the Worker (`POST /app-manifests/{code}/conversions`). The Worker keeps them in the `AppSecrets` Durable Object, which no route exposes.

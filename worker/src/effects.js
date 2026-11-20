@@ -7,6 +7,12 @@ import { createGithubApp } from "./github-app.js";
 import { annotatePatch, codeSpan } from "./review.js";
 import { findingIdOf } from "./addressed.js";
 
+// A REST comment id from GraphQL's fullDatabaseId (a string) or an old Int.
+export function commentIdOf(v) {
+  const n = typeof v === "string" && /^\d+$/.test(v) ? Number(v) : v;
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
 export const ORG = "TanksterAI";
 export const RUNNER_REPO = "ai-review";
 const WRITE_LEVELS = new Set(["admin", "maintain", "write"]);
@@ -296,7 +302,9 @@ export function createEffects(env, deps = {}) {
           out.push({
             id: t.id, resolved: Boolean(t.isResolved), outdated: Boolean(t.isOutdated), path: t.path ?? null,
             line: Number.isInteger(t.line) ? t.line : null, originalLine: Number.isInteger(t.originalLine) ? t.originalLine : null,
-            commentId: c.databaseId, body: String(c.body ?? ""), diffHunk: String(c.diffHunk ?? ""),
+            // fullDatabaseId (a BigInt, sent as a string): review comment ids
+            // are past 2^31 now, where the old Int databaseId fails.
+            commentId: commentIdOf(c.fullDatabaseId ?? c.databaseId), body: String(c.body ?? ""), diffHunk: String(c.diffHunk ?? ""),
             originalCommit: c.originalCommit?.oid ?? null, findingId: findingIdOf(c.body),
             resolvedBy: t.resolvedBy?.login ?? null,
           });
@@ -364,7 +372,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after:
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved isOutdated path line originalLine resolvedBy { login }
-          comments(first: 1) { nodes { databaseId author { login } body diffHunk originalCommit { oid } } }
+          comments(first: 1) { nodes { fullDatabaseId author { login } body diffHunk originalCommit { oid } } }
         }
       }
     }
