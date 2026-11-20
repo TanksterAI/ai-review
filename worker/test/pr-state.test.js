@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PrState, parseCommand, jobIdFor, objectOfJob } from "../src/pr-state.js";
+import { PrState, parseCommand, jobIdFor, objectOfJob, actionPerformed } from "../src/pr-state.js";
 import { memoryStorage, fakeEffects, doCtx } from "./helpers.js";
 
 // These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
@@ -1392,9 +1392,40 @@ test("a run that ends without a complete review asks for a decision, so the noti
   assert.equal(box.filter((x) => x.type === "decide").length, 1);
 });
 
-test("a retried resume whose review is under way goes on with it, not the shortcut", async () => {
-  const { obj, fx, storage } = make();
+test("a retried resume whose head was reviewed meanwhile finishes its job: no second review, the acknowledgement says finished", async () => {
+  // Worker mode (the default): a requested run is forced, so dispatching it
+  // would review the head again.
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), {}, { now: () => NOW, effects: fx });
   withPr(fx, "c".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, full: false, createdAt: NOW, ackId: 55 });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  const { activeRun } = await import("../src/review-run.js");
+  assert.equal(await activeRun(storage), null, "no run started");
+  assert.equal(await storage.get("job:j9"), undefined);
+  assert.deepEqual(edits(fx), [[55, actionPerformed("Review finished.")]]);
+  assert.equal(comments(fx).length, 0);
+});
+
+test("a retried resume whose job is already running leaves it to finish", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW, ackId: 55, claimedBy: "worker" });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  assert.ok(await storage.get("job:j9"));
+  assert.equal(comments(fx).length + edits(fx).length, 0);
+});
+
+test("a retried resume whose review is still to start goes on with it, not the shortcut", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
   await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: false });
   await storage.put("job:j9", { id: "j9", repo, pr: 39, full: false, createdAt: NOW, ackId: 55 });
   await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);

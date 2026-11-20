@@ -731,7 +731,17 @@ export class PrState {
         const shut = (pr && pr.state !== "open") || st.closed;
         // A retried resume whose review is already under way (its job kept on
         // the item) goes on with it: the shortcut is only for a fresh one.
-        if (item.jobId && (await this.ctx.storage.get(`job:${item.jobId}`))) {
+        const kept = item.jobId ? await this.ctx.storage.get(`job:${item.jobId}`) : null;
+        if (kept) {
+          // Already running: its own end edits the acknowledgement.
+          if (kept.claimedBy) return undefined;
+          // The head was reviewed meanwhile: the job is done without a second
+          // review (a requested run is forced, so it would review it again).
+          if (head && (head === st.lastReviewed || head === st.lastCompleteReviewed)) {
+            await this.ctx.storage.delete(`job:${item.jobId}`);
+            if (Number.isSafeInteger(kept.ackId)) await this.outbox({ type: "ack", commentId: kept.ackId, text: actionPerformed("Review finished.") });
+            return undefined;
+          }
           return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
         }
         if (!head || draft || shut || head === st.lastReviewed || head === st.lastCompleteReviewed) {
