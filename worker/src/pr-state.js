@@ -443,12 +443,9 @@ export class PrState {
     try {
       // A run that is backing off keeps its backoff: a heavy item is no
       // reason to try it early.
-      const backoff = async () => {
-        const n = (await this.ctx.storage.get("runFailures")) ?? 0;
-        return n ? this.now() + runBackoffMs(n) : this.now();
-      };
+      const backoff = async () => Math.max(this.now(), (await this.ctx.storage.get("runRetryAt")) ?? 0);
       runNext = heavy ? ((await activeRun(this.ctx.storage)) ? await backoff() : null) : await this.stepActiveRun();
-      if (!heavy) await this.ctx.storage.delete("runFailures");
+      if (!heavy) await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
     } catch (e) {
       const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
       console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
@@ -458,12 +455,14 @@ export class PrState {
       if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
         await dropRun(this.ctx.storage, run.id);
         await this.ctx.storage.delete(`job:${run.id}`);
-        await this.ctx.storage.delete("runFailures");
+        await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
         await this.outbox({ type: "comment", template: "gave_up", reason: "the review could not run (the App may not be set up)", tries: n, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
         runNext = null;
       } else {
-        await this.ctx.storage.put("runFailures", n);
         runNext = run ? this.now() + runBackoffMs(n) : null;
+        // The deadline itself is kept: a heavy item before it neither moves
+        // it earlier nor pushes it back.
+        await this.ctx.storage.put({ runFailures: n, runRetryAt: runNext ?? 0 });
       }
     }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
@@ -749,13 +748,16 @@ export class PrState {
       return writers.get(login);
     };
     // A thread resolved by someone without write access counts as open,
-    // unless a review since found it fixed (ACCEPTED) or a writer's command
-    // vouches for every thread (force).
+    // unless a review since found it fixed, or a writer's resolve/approve
+    // vouched for it (both recorded in ACCEPTED).
     const accepted = await acceptedSet(this.ctx.storage);
     const open = [];
     for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
       if (!t.resolved) open.push(t);
-      else if (!item.force && t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
+      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
+      // only for the threads in its own view: one reopened since and then
+      // resolved by an outsider is open, forced or not.
+      else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
     }
     const inBody = await listOpenFindings(this.ctx.storage);
     const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);

@@ -405,15 +405,52 @@ test("a thread reopened while resolve is running is not vouched for", async () =
   assert.equal(accepted.has("t2"), false, "the reopen keeps its acceptance removed");
 });
 
-test("a heavy item does not cut short a backing-off review's wait", async () => {
+test("a heavy item keeps a backing-off review's deadline: neither earlier nor later", async () => {
   const m = await make();
   await m.storage.put("runmeta:j1", { id: "j1", stage: "draft" });
-  await m.storage.put("runFailures", 3);
+  await m.storage.put({ runFailures: 3, runRetryAt: NOW + 120_000 });
   m.obj.stepActiveRun = async () => { throw new Error("must not step"); };
+  // The decision arrives 119 s into the wait.
+  m.setNow(NOW + 119_000);
   await m.obj.outbox({ type: "decide" });
   m.storage.alarm = null;
   await m.obj.alarm();
   assert.equal(approvals(m.calls).length, 1);
-  assert.ok(m.storage.alarm > NOW, "the review waits out its backoff");
+  assert.equal(m.storage.alarm, NOW + 120_000, "the original deadline");
   assert.equal(await m.storage.get("runFailures"), 3, "its failure count is kept");
+});
+
+test("a failed step stores its retry deadline; a good step clears it", async () => {
+  const m = await make();
+  await m.storage.put("runmeta:j1", { id: "j1", stage: "draft", createdAt: NOW });
+  let fail = true;
+  m.obj.stepActiveRun = async () => { if (fail) throw new Error("boom"); return null; };
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  const at = await m.storage.get("runRetryAt");
+  assert.ok(at > NOW);
+  assert.equal(m.storage.alarm, at);
+  fail = false;
+  m.setNow(at);
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(await m.storage.get("runRetryAt"), undefined);
+});
+
+test("a forced decision does not approve over a thread reopened during resolve and then resolved by an outsider", async () => {
+  const threads = [thread("t1", false), { id: "t2", resolved: true, resolvedBy: "stranger" }];
+  const m = await make({ threads, writers: ["rishitank"] });
+  const resolve = m.fx.resolveThread;
+  let n = 0;
+  m.fx.resolveThread = async (r, id) => {
+    if (n++ === 0) await m.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t2" } });
+    return resolve(r, id);
+  };
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  // Then an outsider resolves t2, before the forced decision runs.
+  await m.obj.onEvent({ delivery: "r2", ev: { kind: "thread", action: "resolved", repo, pr: 39, sender: { login: "stranger", bot: false }, threadId: "t2" } });
+  await drain(m.obj);
+  assert.equal(approvals(m.calls).length, 0);
 });
