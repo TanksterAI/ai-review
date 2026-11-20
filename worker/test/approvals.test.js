@@ -512,3 +512,14 @@ test("closing a pull request clears a backing-off run's retry state", async () =
   assert.equal(await m.storage.get("runFailures"), undefined);
   assert.equal(await m.storage.get("runRetryAt"), undefined);
 });
+
+test("a kept finding that is a nitpick does not hold back approval; an actionable one does", async () => {
+  const nit = await make();
+  await keepOpenFindings(nit.storage, [{ id: "aaaaaaaa", path: "a.js", line: 1, text: "**Trivial (maintainability): Name it**\n<sub>Nitpick · finding `aaaaaaaa`</sub>", sha: HEAD }]);
+  await decide(nit);
+  assert.equal(approvals(nit.calls).length, 1);
+  const issue = await make();
+  await keepOpenFindings(issue.storage, [{ id: "bbbbbbbb", path: "a.js", line: 1, text: "**Critical (security): Leak**\n<sub>Nitpick · finding `bbbbbbbb`</sub>", sha: HEAD }]);
+  await decide(issue);
+  assert.equal(approvals(issue.calls).length, 0);
+});

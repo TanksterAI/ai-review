@@ -216,3 +216,10 @@ test("nitpickFinding: typed nitpick, or trivial or info severity", () => {
   assert.equal(nitpickFinding("**Major (bug): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), false);
   assert.equal(nitpickFinding("**Minor (security): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), false);
 });
+
+test("findingIdOf reads ids with any number of collision suffixes", () => {
+  for (const id of ["aaaaaaaa", "aaaaaaaa-2", "aaaaaaaa-2-2", "aaaaaaaa-3-2-4"]) {
+    assert.equal(findingIdOf(`**Minor (bug): x**\n<sub>Potential issue · finding \`${id}\`</sub>`), id);
+  }
+  assert.equal(findingIdOf("**Minor (bug): x**\n<sub>Potential issue · finding `aaaaaaaa--2`</sub>"), null);
+});

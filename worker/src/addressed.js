@@ -48,7 +48,9 @@ export const RESULT_SCHEMA = {
 // (review.js commentBody). Only that line counts.
 export function findingIdOf(body) {
   const second = String(body ?? "").split("\n")[1] ?? "";
-  return /^<sub>[^<]*· finding `([0-9a-f]{8}(?:-\d+)?)`<\/sub>$/.exec(second)?.[1] ?? null;
+  // Any number of collision suffixes: mergeResults can add one to an id
+  // that already has one (aaaaaaaa-2-2).
+  return /^<sub>[^<]*· finding `([0-9a-f]{8}(?:-\d+)*)`<\/sub>$/.exec(second)?.[1] ?? null;
 }
 
 /**

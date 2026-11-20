@@ -768,7 +768,9 @@ export class PrState {
       // resolved by an outsider is open, forced or not.
       else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
     }
-    const inBody = await listOpenFindings(this.ctx.storage);
+    // A kept finding that is a nitpick never blocks either (kept text that
+    // carries the comment header, as from the 422 fallback).
+    const inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !nitpickFinding(f.text));
     const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {
