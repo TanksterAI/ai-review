@@ -135,3 +135,14 @@ test("list_review_threads passes the filter on; unknown tools and methods are JS
   const g = await handleMcp(new Request("https://w/mcp", { method: "GET", headers: { authorization: "Bearer ghu_good" } }), {}, { fetch: github().fetchImpl, ...stub() });
   assert.equal(g.status, 405);
 });
+
+test("a GitHub 401, 403 or 5xx is told apart from a PR that is not found, and nothing is asked of the reviewer", async () => {
+  for (const [status, re] of [[401, /did not accept your token/], [403, /refused the request/], [502, /could not answer/]]) {
+    const s = stub();
+    const fetchImpl = async () => new Response("{}", { status });
+    const body = await (await handleMcp(post(call("get_review_status", { repository: "TanksterAI/ai-review", pull_number: 3 })), {}, { fetch: fetchImpl, ...s })).json();
+    assert.equal(body.result.isError, true);
+    assert.match(body.result.content[0].text, re);
+    assert.equal(s.asked.length, 0);
+  }
+});

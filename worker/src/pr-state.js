@@ -369,7 +369,7 @@ export class PrState {
     // Never the job of the review in progress: it may wait hours for a provider.
     const running = (await activeRun(this.ctx.storage))?.id;
     const stale = [...old].filter(([, j]) => this.now() - j.createdAt > JOB_TTL_MS && j.id !== running);
-    for (const [, j] of stale) await this.ackEnded(j, "The review expired before it could run.");
+    for (const [, j] of stale) { await this.ackEnded(j, "The review expired before it could run."); await this.releaseHeld(j); }
     await this.deleteAll(stale.map(([k]) => k));
     const id = jobIdFor(this.ctx.id?.toString());
     const job = {
@@ -628,6 +628,7 @@ export class PrState {
     // whose PR was paused or made a draft meanwhile is dropped.
     const st = await this.state();
     if (!held.requestedBy && (st.paused || st.draft)) {
+      await this.releaseHeld(held);
       await this.ctx.storage.delete(`job:${jobId}`);
       return undefined;
     }
@@ -645,16 +646,18 @@ export class PrState {
       // the required status passes while no model can take the review, and
       // says why; the review's own result replaces it. Once per job.
       let heldStatus = held.heldStatus;
+      let heldSha = held.heldSha;
       if (!heldStatus && typeof fx.pullRequest === "function" && typeof fx.setStatus === "function") {
         const head = (await fx.pullRequest(held.repo.full, held.pr))?.head?.sha;
         const st = await this.state();
         if (head && head !== st.lastCompleteReviewed) {
           const when = Number.isFinite(cap.retryAt) ? ` at ${new Date(cap.retryAt).toISOString().slice(11, 16)} UTC` : "";
           await fx.setStatus(held.repo.full, head, "success", `Review delayed: no model has capacity now; it is reviewed when one resets${when}.`);
+          heldSha = head;
         }
         heldStatus = true;
       }
-      await this.ctx.storage.put(`job:${jobId}`, { ...held, heldStatus, createdAt: this.now() });
+      await this.ctx.storage.put(`job:${jobId}`, { ...held, heldStatus, heldSha, createdAt: this.now() });
       console.log(JSON.stringify({ svc: "ai-review", ev: "dispatch_held", retry_at: new Date(cap.retryAt).toISOString() }));
       return { holdUntil: Math.max(this.now() + MIN_DEFER_MS, Math.min(cap.retryAt, this.now() + HOLD_RECHECK_MS)) };
     }
@@ -677,6 +680,14 @@ export class PrState {
     });
     await this.ctx.storage.delete(`job:${jobId}`);
     return id;
+  }
+
+  // A job that set the neutral "Review delayed" status and then ends without
+  // a review (given up, dropped, swept) must not leave the gate passing: the
+  // commit goes back to waiting, as before the neutral status existed.
+  async releaseHeld(job) {
+    if (!job?.heldSha) return;
+    await this.outbox({ type: "status", sha: job.heldSha, waiting: true });
   }
 
   // Marks a commit as waiting for a writer. A review run sets the status
@@ -827,7 +838,7 @@ export class PrState {
       // a head already under review is not queued twice. A retried item
       // (its job already kept) skips these checks.
       if ((item.cmd === "review" || item.cmd === "full review") && !item.jobId && typeof fx.pullRequest === "function") {
-        const why = (await this.advise(fx, st, { cmd: item.cmd, slug, repo: item.repo, pr: item.pr })).why;
+        const why = (await this.advise(fx, st, { cmd: item.cmd, slug, repo: item.repo, pr: item.pr, ignore: item.id })).why;
         if (why) {
           await fx.comment(item.repo.full, item.pr, actionNotCompleted(why));
           return undefined;
@@ -851,21 +862,27 @@ export class PrState {
   // nothing is refused with its reason, and `next_action` says what to do
   // instead. Decided here, from the PR as GitHub reports it and the state the
   // reviewer keeps, never from what the caller remembers.
-  async advise(fx, st, { cmd = "review", slug = DEFAULT_SLUG, repo, pr }) {
+  async advise(fx, st, { cmd = "review", slug = DEFAULT_SLUG, repo, pr, ignore = null }) {
     const info = typeof fx.pullRequest === "function" ? await fx.pullRequest(repo.full, pr) : null;
     const head = info?.head?.sha ?? null;
-    const shut = (info && info.state !== "open") || Boolean(st.closed);
-    const draft = Boolean(info?.draft) || Boolean(st.draft);
+    // GitHub's own answer wins over the stored flags, which a missed webhook
+    // could leave stale; the flags are only for when GitHub cannot be asked.
+    const shut = info ? info.state !== "open" : Boolean(st.closed);
+    const draft = info ? Boolean(info.draft) : Boolean(st.draft);
     const running = await activeRun(this.ctx.storage);
+    // Work already queued (a command, or a dispatch held for capacity) that
+    // has not started: a request now would queue a second review.
+    const queued = ((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.id !== ignore && (x.type === "dispatch" || (x.type === "command" && /review$/.test(String(x.cmd)))));
     const reviewed = Boolean(head) && head === st.lastCompleteReviewed;
     const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
       : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
       : head && running?.headSha === head ? "A review of the last commit is already under way."
+      : queued && /review$/.test(cmd) ? "A review is already queued."
       : cmd === "review" && reviewed && !running ? `Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`
       : null;
     const next = shut ? "none"
       : draft ? "mark_ready_for_review"
-      : running ? "wait"
+      : running || queued ? "wait"
       : st.paused ? "resume"
       : reviewed ? "read_threads"
       : "wait";
@@ -1265,6 +1282,7 @@ export class PrState {
     if (st.closed || retries >= MAX_RETRIES || old) {
       // The edit is queued before the job goes: a failed queue keeps its ackId.
       await this.ackEnded(job, st.closed ? "The pull request was closed before the review finished." : "The review could not finish.");
+      if (!st.closed) await this.releaseHeld(job);
       await this.ctx.storage.delete(`job:${jobId}`);
       if (!st.closed) {
         // Never silently: say so on the PR, at most once an hour.

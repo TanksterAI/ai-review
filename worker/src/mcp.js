@@ -59,7 +59,8 @@ async function gh(fetchImpl, token, path) {
   const res = await fetchImpl(`https://api.github.com${path}`, {
     headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "tankster-ai-review-mcp", "x-github-api-version": "2022-11-28" },
   });
-  if (!res.ok) return null;
+  if (res.status === 404) return null;
+  if (!res.ok) throw Object.assign(new Error("github"), { status: res.status });
   return res.json();
 }
 
@@ -115,8 +116,11 @@ export async function handleMcp(request, env, deps) {
       if (!TOOLS.some((t) => t.name === name)) return fail(msg.id, -32602, `Unknown tool: ${String(name).slice(0, 60)}`);
       try {
         return reply(msg.id, await run(name, msg.params?.arguments ?? {}, auth[1], deps));
-      } catch {
-        return reply(msg.id, content("The reviewer could not answer just now; try again shortly.", true));
+      } catch (e) {
+        const g = e?.status;
+        return reply(msg.id, content(g === 401 ? "GitHub did not accept your token."
+          : g === 403 ? "GitHub refused the request (your token's permissions or a rate limit); try again later."
+          : "The reviewer could not answer just now; try again shortly.", true));
       }
     }
     default: return fail(msg.id, -32601, "Method not found");

@@ -586,9 +586,12 @@ async function next(ctx, run, save, batches, at, nextStage) {
   const plan = await ctx.storage.get(planKey(run.id));
   const done = new Set(batches.map((b, i) => (b.status === "verified" ? i : -1)).filter((i) => i >= 0));
   const cov = coverageOf(plan, done);
-  // Neutral, as CodeRabbit's rate-limited run is: the merge gate passes while
-  // no model can go on, and the finished review replaces this status.
-  await status(ctx, run, "success", `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`);
+  // Neutral, as CodeRabbit's rate-limited run is, while nothing has been
+  // reviewed yet: the gate passes and the finished review replaces this status.
+  // Once some files are reviewed it stays pending, so a PR is never merged
+  // with files unreviewed because the providers ran out.
+  const delayed = `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`;
+  await status(ctx, run, cov.covered > 0 ? "pending" : "success", delayed);
   await save(run);
   return run.waitUntil;
 }

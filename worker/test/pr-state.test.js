@@ -1761,6 +1761,12 @@ test("request on a head not yet reviewed queues the same command a comment would
   assert.equal(box[0].type, "command");
   assert.equal(box[0].cmd, "review");
   assert.equal(box[0].login, "rishitank");
+  // A second request while the first is still queued is refused, not queued twice.
+  const again = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(again.accepted, false);
+  assert.match(again.reason, /already queued/);
+  assert.equal((await storage.get("outbox")).length, 1);
+  await storage.put("outbox", []);
   // A full review of a reviewed head is allowed (it is the one way to review again).
   await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: false, closed: false });
   const full = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: true });
@@ -1809,4 +1815,28 @@ test("`rate limit` says whether a review can run now, or when one can; it needs 
   await obj.onEvent({ delivery: "d2", ev: { ...command("@tankster-ai-review rate limit"), sender: { login: "stranger", bot: false } } });
   await fire(obj);
   assert.ok(!comments(fx).some((b) => /capacity/.test(b)), "a non-writer learns nothing about capacity");
+});
+
+test("review fixes: GitHub's own draft and closed answer wins over stale stored flags", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("state", { draft: true, closed: true, paused: false });
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true, out.reason);
+});
+
+test("review fixes: a held job that sets the neutral status puts the commit back to pending when it is given up or dropped", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("job:j1", { id: "j1", repo, pr: 39, createdAt: NOW, heldStatus: true, heldSha: "a".repeat(40) });
+  await obj.releaseHeld(await storage.get("job:j1"));
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].type, "status");
+  assert.equal(box[0].sha, "a".repeat(40));
+  assert.equal(box[0].waiting, true);
+  // A job that never set the neutral status queues nothing.
+  await storage.put("outbox", []);
+  await obj.releaseHeld({ id: "j2", repo, pr: 39 });
+  assert.equal((await storage.get("outbox")).length, 0);
 });
