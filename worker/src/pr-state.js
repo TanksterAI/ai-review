@@ -12,6 +12,7 @@ import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
+import { nitpickFinding } from "./addressed.js";
 import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
@@ -759,6 +760,8 @@ export class PrState {
     const accepted = await acceptedSet(this.ctx.storage);
     const open = [];
     for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
+      // A nitpick never holds back approval (CodeRabbit's rule), open or not.
+      if (nitpickFinding(t.body)) continue;
       if (!t.resolved) open.push(t);
       // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
       // only for the threads in its own view: one reopened since and then

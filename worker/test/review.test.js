@@ -949,3 +949,18 @@ test("one pass of several tells the model the other files exist and are reviewed
   assert.match(input, /<<<BEGIN OTHER FILES IN THIS PULL REQUEST t1>>>\n"src\/b\.js"\n"README\.md"\n<<<END OTHER FILES IN THIS PULL REQUEST t1>>>/);
   assert.doesNotMatch(input, /All changed files are shown/);
 });
+
+test("renderReview: nitpicks are shown but neither block nor are kept; actionable ones do", () => {
+  const prepared = prepareFiles([{ filename: "src/a.js", patch: PATCH }]);
+  const answer = { summary: "s", findings: [
+    { path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." },
+    { path: "src/a.js", line: 3, severity: "trivial", type: "nitpick", category: "maintainability", title: "Name it better", body: "b" },
+    { path: "src/nope.js", line: 1, severity: "minor", category: "tests", title: "Outside", body: "b" },
+    { path: "src/nope.js", line: 2, severity: "info", category: "tests", title: "Outside nit", body: "b" },
+  ] };
+  const classified = classifyFindings(answer, prepared.commentable);
+  const r = renderReview({ answer, classified, prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "chill" } });
+  assert.equal(r.shown, 4);
+  assert.equal(r.blocking, 2, "the major inline one and the minor outside one");
+  assert.deepEqual(r.listed.map((x) => x.title ?? x.text.split("\n")[0]), ["Outside"]);
+});

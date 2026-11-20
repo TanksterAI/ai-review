@@ -492,3 +492,15 @@ test("no outbox item steps a review before its retry deadline", async () => {
   assert.equal(stepped, 1);
   assert.equal(await m.storage.get("runRetryAt"), undefined);
 });
+
+test("an open nitpick thread does not hold back approval; an open issue thread does", async () => {
+  const nit = { id: "n1", resolved: false, body: "**Trivial (maintainability): Name it better**\n<sub>Nitpick · finding `aaaaaaaa`</sub>\n\nx" };
+  const typed = { id: "n2", resolved: false, body: "**Minor (maintainability): Tidy**\n<sub>Nitpick · finding `bbbbbbbb`</sub>\n\nx" };
+  const ok = await make({ threads: [nit, typed] });
+  await decide(ok);
+  assert.equal(approvals(ok.calls).length, 1);
+  const issue = { id: "i1", resolved: false, body: "**Minor (bug): Off by one**\n<sub>Potential issue · finding `cccccccc`</sub>\n\nx" };
+  const blocked = await make({ threads: [nit, issue] });
+  await decide(blocked);
+  assert.equal(approvals(blocked.calls).length, 0);
+});

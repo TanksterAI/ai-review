@@ -131,6 +131,16 @@ export function severeFinding(body) {
   return /^\*\*(Critical|Major) \(/.test(first) || /^\*\*\w+ \(security\):/.test(first);
 }
 
+/**
+ * A nitpick (CodeRabbit's "optional polish"): typed nitpick, or trivial or
+ * info severity, as review.js minorish. Like CodeRabbit's, it never holds
+ * back approval.
+ */
+export function nitpickFinding(body) {
+  const [first = "", second = ""] = String(body ?? "").split("\n");
+  return /^\*\*(Trivial|Info) \(/.test(first) || /^<sub>Nitpick · finding `/.test(second);
+}
+
 /** The comment's body with CodeRabbit's note, added once. */
 export function addressedNote(body, sha) {
   const note = `${ADDRESSED_MARK} Addressed in commit ${String(sha).slice(0, 7)}`;

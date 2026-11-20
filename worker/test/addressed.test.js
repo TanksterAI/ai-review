@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  ADDRESSED_MARK, ADDRESSED_WINDOW, DEFAULT_ADDRESSED_CHAIN, addressedNote, addressedPrompt, findingIdOf, judgeAddressed, nearHunks, readResults, severeFinding,
+  ADDRESSED_MARK, ADDRESSED_WINDOW, DEFAULT_ADDRESSED_CHAIN, addressedNote, addressedPrompt, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, readResults, severeFinding,
 } from "../src/addressed.js";
 import { config } from "../src/config.js";
 import { memoryKv, testSleep } from "./helpers.js";
@@ -202,4 +202,13 @@ test("the second opinion on a severe finding is another kind of provider, never 
   const out = await judgeAddressed({ items: [{ id: "s1", severe: true, path: "a.js", finding: "x", original: "o", since: SINCE }], env: e, cfg: config(e), deps: deps(fetch) });
   assert.deepEqual(asked, ["gemini-3.5-flash-lite"]);
   assert.equal(out.results.get("s1"), "uncertain");
+});
+
+test("nitpickFinding: typed nitpick, or trivial or info severity", () => {
+  assert.equal(nitpickFinding("**Trivial (bug): x**\n<sub>Potential issue · finding `aaaaaaaa`</sub>"), true);
+  assert.equal(nitpickFinding("**Info (tests): x**\n<sub>Refactor suggestion · finding `aaaaaaaa`</sub>"), true);
+  assert.equal(nitpickFinding("**Minor (bug): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), true);
+  assert.equal(nitpickFinding("**Minor (bug): x**\n<sub>Potential issue · finding `aaaaaaaa`</sub>"), false);
+  assert.equal(nitpickFinding("**Major (security): x**\n<sub>Potential issue · finding `aaaaaaaa`</sub>"), false);
+  assert.equal(nitpickFinding("a person's comment saying Trivial"), false);
 });

@@ -782,11 +782,13 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   // A last bound: what is cut is the end of the text, never the block.
   if (body.length > MAX_BODY_CHARS) body = `${body.slice(0, MAX_BODY_CHARS - 40)}\n\n…(cut to GitHub's size limit)`;
   // For the summary comment: the Worker's own summary line and the details.
-  // blocking: every finding the review shows (inline, nitpicks, outside the
-  // diff); those the quiet profile left out are not shown, so they never
-  // block. listed: the ones shown only in the body, which have no thread.
-  const inBody = [...nitpicks, ...outside].map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
-  return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n"), blocking: total, listed: inBody };
+  // blocking: the actionable findings the review shows (inline or outside
+  // the diff); nitpicks are shown but, as CodeRabbit's, never block, and
+  // those the quiet profile left out are not shown at all. listed: the
+  // actionable ones shown only in the body, which have no thread.
+  const actionable = [...inline, ...outside].filter((f) => !minorish(f));
+  const inBody = outside.filter((f) => !minorish(f)).map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
+  return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n"), shown: total, blocking: actionable.length, listed: inBody };
 }
 
 // A comment's first line (its labels and title), for lists where the whole

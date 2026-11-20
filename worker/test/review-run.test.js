@@ -759,17 +759,15 @@ test("a review that checks threads from many commits still finishes: every threa
   assert.equal(s.github.statuses.at(-1).state, "success");
 });
 
-test("nitpicks block approval too: listed in the body, kept as open findings; the quiet profile's left-out ones do not", async () => {
+test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment, nothing is kept; the quiet profile shows none", async () => {
   const nit = { severity: "trivial", type: "nitpick", title: "Name it better" };
   const chill = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }) });
   await runAll(chill);
-  assert.equal(chill.github.posted.length, 1);
-  assert.equal(chill.github.posted[0].event, "REQUEST_CHANGES");
+  assert.equal(chill.github.posted.length, 1, "the nitpick is still shown");
+  assert.equal(chill.github.posted[0].event, "COMMENT");
   assert.equal(chill.github.posted[0].comments.length, 0, "a nitpick goes in the body under the chill profile");
-  const open = await listOpenFindings(chill.storage);
-  assert.equal(open.length, 1);
-  assert.equal(open[0].severe, false);
-  assert.match(chill.github.summaries[0].body, /Actionable comments posted: 1\./);
+  assert.deepEqual(await listOpenFindings(chill.storage), [], "nothing to hold back approval");
+  assert.match(chill.github.summaries[0].body, /No actionable comments were generated in the latest review; 1 nitpick noted/);
 
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
@@ -811,7 +809,9 @@ test("kept findings are never dropped for space, and a retried post step keeps t
   // The post succeeds, then the step fails before anything is kept: the retry
   // posts nothing more and still keeps the findings.
   const github = threadsGithub({ files: SMALL });
-  const s = setup({ github, models: fakeModels({ finding: { severity: "trivial", type: "nitpick" } }) });
+  // GitHub would not place the comment (422): the finding is in the body.
+  github.postReview = async (_r, _p, review) => { github.posted.push(review); return { inline: 0 }; };
+  const s = setup({ github, models: fakeModels() });
   const real = s.storage.put.bind(s.storage);
   let failOnce = true;
   s.storage.put = async (k, v) => {
@@ -888,4 +888,28 @@ test("a later thread reopened while an earlier thread's GitHub call is pending i
   await runAll(s);
   assert.deepEqual(s.github.resolved, [], "neither is resolved");
   assert.deepEqual(s.github.edits.map((e) => e.id), [71], "the second is not even noted");
+});
+
+test("a nitpick GitHub would not place (422) is not kept; an actionable one is", async () => {
+  const base = fakeModels();
+  // The drafter returns the usual issue and a nitpick on the same line.
+  const models = async (url, init) => {
+    const r = await base(url, init);
+    if (!url.includes("generativelanguage")) return r;
+    const out = await r.json();
+    const parsed = JSON.parse(out.candidates[0].content.parts[0].text);
+    for (const f of [...parsed.findings]) parsed.findings.push({ ...f, severity: "trivial", type: "nitpick", title: "Name it better" });
+    out.candidates[0].content.parts[0].text = JSON.stringify(parsed);
+    return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  models.calls = base.calls;
+  const github = threadsGithub({ files: SMALL });
+  github.postReview = async (_r, _p, review) => { github.posted.push(review); return { inline: 0 }; };
+  const s = setup({ github, models, env: { REVIEW_PROFILE: "assertive" } });
+  await runAll(s);
+  assert.equal(github.posted[0].event, "REQUEST_CHANGES");
+  assert.equal(github.posted[0].comments.length, 2, "both inline under the assertive profile");
+  const kept = await listOpenFindings(s.storage);
+  assert.equal(kept.length, 1);
+  assert.match(kept[0].text, /Off by one/);
 });

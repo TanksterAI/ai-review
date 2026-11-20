@@ -43,7 +43,7 @@ import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
-import { addressedNote, findingIdOf, judgeAddressed, nearHunks, severeFinding } from "./addressed.js";
+import { addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
 import { DEFAULT_SLUG } from "./webhook.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
@@ -698,32 +698,36 @@ async function stagePost(ctx, run, save) {
     if (off.length) text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
     text += `\n\n_Incremental review: commits after \`${run.since.slice(0, 7)}\`._`;
   }
-  // Every finding the review shows blocks approval, whatever its severity
-  // (CodeRabbit's default); those the quiet profile leaves out are not shown.
-  const shownCount = review.blocking;
+  // Actionable findings request changes and hold back approval; a review
+  // with only nitpicks is a comment, and they never block (as CodeRabbit's).
+  const shownCount = review.shown ?? review.blocking;
+  const blocking = review.blocking;
   // Posted once, and only with findings: a step retried after the post (a
   // failed write below) does not post the review again. A review with no
   // findings posts nothing (CodeRabbit does not either); the summary comment
   // and the commit status say how it went.
   let posted = run.posted ?? null;
   if (!posted && shownCount > 0) {
-    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: "REQUEST_CHANGES" });
+    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: blocking > 0 ? "REQUEST_CHANGES" : "COMMENT" });
     run.posted = { inline: posted?.inline ?? 0 };
     await save(run);
   }
   // Outside the post's guard: a step retried after the post still keeps them
   // (keeping one twice changes nothing).
-  if (shownCount > 0 && run.posted && !run.posted.none) {
-    // Findings with no thread of their own (nitpicks and findings outside the
-    // diff, listed in the body; or GitHub would not place them) are kept, so
-    // they too must be addressed before approval. One that names no file
+  if (blocking > 0 && run.posted && !run.posted.none) {
+    // Actionable findings with no thread of their own (outside the diff,
+    // listed in the body; or GitHub would not place them) are kept, so they
+    // too must be addressed before approval. One that names no file
     // cannot be checked against later changes, so it is not kept: it would
     // block approval with nothing to resolve.
     const inBody = [
       ...review.listed,
       // GitHub's refusal (422) moves every inline comment to the body; those
       // off the diff are in the body either way.
-      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])].map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, severe: severeFinding(c.body), text: c.body })),
+      // (Nitpicks among them never block.)
+      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])]
+        .filter((c) => !nitpickFinding(c.body))
+        .map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, severe: severeFinding(c.body), text: c.body })),
     ].filter((x) => x.id && x.path);
     if (inBody.length) {
       await keepOpenFindings(ctx.storage, inBody.map((x) => ({
@@ -741,7 +745,7 @@ async function stagePost(ctx, run, save) {
   ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: run.posted.inline, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
   // What the summary comment shows, once the threads are checked.
   await ctx.storage.put(summaryKey(run.id), {
-    summary: review.summary, about: review.about, shown: shownCount, complete, since: run.since ?? null,
+    summary: review.summary, about: review.about, shown: shownCount, actionable: blocking, complete, since: run.since ?? null,
     covered: cov.covered, reviewable: cov.reviewable,
   });
   run.result = { complete, shown: shownCount, covered: cov.covered, reviewable: cov.reviewable };
@@ -925,11 +929,13 @@ async function stageThreads(ctx, run, save) {
 
 // --- summary: the one comment, edited in place ------------------------------
 
-export function summaryText({ headSha, summary, about, shown, complete, since, threads, none = false }) {
+export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, threads, none = false }) {
   const lines = ["### Tankster AI Review", ""];
   lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
   if (!complete || none) lines.push(summary, "");
-  else if (shown) lines.push(`Actionable comments posted: ${shown}. ${summary}`, "");
+  else if (actionable) lines.push(`Actionable comments posted: ${actionable}. ${summary}`, "");
+  // Nitpicks alone: shown in the review, never blocking (as CodeRabbit's).
+  else if (shown) lines.push(`No actionable comments were generated in the latest review; ${plural(shown, "nitpick")} noted in the review, none of them blocking. ${summary}`, "");
   else lines.push("No actionable comments were generated in the latest review. 🎉", "");
   if (threads) {
     const parts = [];
