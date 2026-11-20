@@ -96,7 +96,8 @@ export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
       where: event === "issue_comment" ? "conversation" : "thread",
       commentId: c.id,
       inReplyTo: c.in_reply_to_id ?? null,
-      text: String(c.body).slice(0, 8000),
+      // A body cut at 8,000 characters keeps a visible mark, so it is never "the whole comment".
+      text: String(c.body).length > 8000 ? `${String(c.body).slice(0, 8000)}\n…` : String(c.body),
       association: String(c.author_association ?? "NONE"),
       // The association is a hint only: write commands re-check the commenter's
       // permission through the API before doing anything.

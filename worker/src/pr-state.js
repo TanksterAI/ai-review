@@ -130,7 +130,7 @@ export function parseCommand(text, slug = DEFAULT_SLUG) {
   const cmd = Object.hasOwn(ALIASES, said) ? ALIASES[said] : COMMANDS.includes(said) ? said : null;
   if (!cmd) return null;
   // Whole comment: nothing else at all, hidden or shown, before or after.
-  if (WHOLE_COMMENT.has(cmd) && lines.filter((l) => l.trim()).length !== 1) return null;
+  if (WHOLE_COMMENT.has(cmd) && (lines.filter((l) => l.trim()).length !== 1 || shown.trim() !== lines[at].trim())) return null;
   return cmd;
 }
 
@@ -809,7 +809,14 @@ export class PrState {
     await this.ctx.storage.delete("debounce");
     await this.keepJobOnItem(item, st, { full, requestedBy: item.login });
     if (!item.acked) {
-      const commentId = await fx.comment(item.repo.full, item.pr, actionPerformed(text));
+      // Best effort: a comment that cannot be posted (a locked conversation, a
+      // rate limit) must not stop the review that was asked for.
+      let commentId = null;
+      try {
+        commentId = await fx.comment(item.repo.full, item.pr, actionPerformed(text));
+      } catch (e) {
+        console.log(JSON.stringify({ svc: "ai-review", ev: "ack_failed", pr: item.pr, message: String(e?.message ?? e).slice(0, 120) }));
+      }
       item.acked = true;
       if (Number.isSafeInteger(commentId)) item.ackId = commentId;
       // The flag, the id and the job's copy of it in one write (a multi-key
@@ -859,7 +866,8 @@ export class PrState {
       // Kept fresh while it waits, or newJob would prune it (JOB_TTL_MS) and
       // its acknowledgement would say it expired.
       await this.ctx.storage.put(`job:${job.id}`, { ...job, createdAt: this.now() });
-      return { holdUntil: Math.max(this.now() + RECHECK_MS, active.waitUntil || 0) };
+      // At most half the job's lifetime: looked at again (and kept fresh) well before it could expire.
+      return { holdUntil: Math.min(Math.max(this.now() + RECHECK_MS, active.waitUntil || 0), this.now() + JOB_TTL_MS / 2) };
     }
     // Only a full-coverage review's commit is a starting point: the runner and
     // v1 move lastReviewed too, but read at most 90,000 characters.
