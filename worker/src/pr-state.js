@@ -12,7 +12,7 @@ import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
-import { nitpickFinding } from "./addressed.js";
+import { findingIdOf, nitpickFinding } from "./addressed.js";
 import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
@@ -768,9 +768,12 @@ export class PrState {
       // resolved by an outsider is open, forced or not.
       else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
     }
-    // A kept finding that is a nitpick never blocks either (kept text that
-    // carries the comment header, as from the 422 fallback).
-    const inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !nitpickFinding(f.text));
+    // A kept finding that is a nitpick never blocks either. Only text that
+    // carries the Worker's own comment header (its id line, as from the 422
+    // fallback) is judged: a body-listed finding's text starts with the
+    // model's title, which could imitate a label. Never one kept as severe.
+    const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
+    const inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
     const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {

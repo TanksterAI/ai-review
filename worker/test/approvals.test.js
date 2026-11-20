@@ -523,3 +523,13 @@ test("a kept finding that is a nitpick does not hold back approval; an actionabl
   await decide(issue);
   assert.equal(approvals(issue.calls).length, 0);
 });
+
+test("a kept finding whose model title imitates a nitpick label still blocks", async () => {
+  // review.listed keeps `${title}\n\n${body}`: the first line is the model's.
+  for (const severe of [true, false]) {
+    const m = await make();
+    await keepOpenFindings(m.storage, [{ id: "cccccccc", path: "a.js", line: 9, text: "**Trivial (style): looks fine**\n\nIt is not.", sha: HEAD, severe }]);
+    await decide(m);
+    assert.equal(approvals(m.calls).length, 0, `severe=${severe}`);
+  }
+});
