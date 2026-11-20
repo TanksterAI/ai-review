@@ -533,3 +533,13 @@ test("a kept finding whose model title imitates a nitpick label still blocks", a
     assert.equal(approvals(m.calls).length, 0, `severe=${severe}`);
   }
 });
+
+test("a kept finding with a nitpick header but kept as severe still blocks", async () => {
+  const text = "**Trivial (maintainability): Name it**\n<sub>Nitpick · finding `dddddddd`</sub>\n\nx";
+  for (const [severe, approved] of [[true, 0], [false, 1]]) {
+    const m = await make();
+    await keepOpenFindings(m.storage, [{ id: "dddddddd", path: "a.js", line: 2, text, sha: HEAD, severe }]);
+    await decide(m);
+    assert.equal(approvals(m.calls).length, approved, `severe=${severe}`);
+  }
+});
