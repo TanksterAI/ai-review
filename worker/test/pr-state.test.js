@@ -170,7 +170,9 @@ test("drafts wait; forks need a writer to ask; outsiders are checked first", asy
   assert.equal((await obj.onEvent({ delivery: "5", ev: review({ author: { login: "someone", association: "CONTRIBUTOR", bot: false } }) })).action, "author_check");
   await drain(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 2, "the bot's and the private member's PRs");
-  const notes = fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+  const all = fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+  assert.match(all[0] ?? "", /Review skipped: this pull request is a draft/, "the draft's note (the event's default action is opened)");
+  const notes = all.slice(1);
   assert.equal(notes.length, 2, "one for the fork, one for the outsider; none for the bot");
   assert.ok(notes.every((n) => /write access can comment/.test(n)));
 });
@@ -863,6 +865,27 @@ test("no provider has capacity: the dispatch is held, its job kept fresh, then s
   assert.deepEqual(box, []);
 });
 
+test("no model capacity: the required status is neutral (success, saying why), as CodeRabbit's rate-limited run is, and only once", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const head = "9".repeat(40);
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: head } });
+  fx.setStatus = async (...a) => { fx.calls.push(["setStatus", ...a]); return true; };
+  const cap = { ok: false, retryAt: NOW + 5 * 3600_000 };
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
+  await obj.onEvent({ delivery: "d1", ev: review() });
+  await fire(obj);
+  const statuses = () => fx.calls.filter((c) => c[0] === "setStatus");
+  assert.equal(statuses().length, 1);
+  assert.deepEqual(statuses()[0].slice(2, 4), [head, "success"]);
+  assert.match(statuses()[0][4], /^Review delayed: no model has capacity now; it is reviewed when one resets at \d\d:\d\d UTC\.$/);
+  assert.ok(statuses()[0][4].length <= 140);
+  // Looked at again: no second status for the same job.
+  await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+  assert.equal(statuses().length, 1);
+});
+
 test("a held dispatch does not block other side effects behind it", async () => {
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
@@ -1229,6 +1252,73 @@ test("review of a commit already reviewed in full is not run again; full review 
   await drain(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
   assert.match(comments(fx)[1], /Review triggered\./);
+});
+
+test("a draft PR gets one note, as CodeRabbit's: reviews are skipped until it is marked ready; pushes to it add none", async () => {
+  const { obj, fx } = make();
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review({ action: "opened", draft: true }) })).action, "draft");
+  await drain(obj);
+  assert.equal(comments(fx).length, 1);
+  assert.match(comments(fx)[0], /Review skipped: this pull request is a draft\. It is reviewed once it is marked ready for review\./);
+  await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", draft: true }) });
+  await obj.onEvent({ delivery: "3", ev: review({ action: "converted_to_draft", draft: true }) });
+  await drain(obj);
+  assert.equal(comments(fx).length, 1, "once");
+  // A push to a draft that was never noted (the App was installed later) is not noted either: no spam.
+  const other = make();
+  await other.obj.onEvent({ delivery: "1", ev: review({ action: "synchronize", draft: true }) });
+  await drain(other.obj);
+  assert.equal(comments(other.fx).length, 0);
+});
+
+test("review and full review on a draft or closed PR are declined with the reason, and run nothing", async () => {
+  for (const [state, shape, note] of [["draft", { state: "open", draft: true }, /draft: it is reviewed once it is marked ready/], ["closed", { state: "closed", draft: false }, /closed: it is reviewed if it is reopened/]]) {
+    for (const cmd of ["review", "full review"]) {
+      const { obj, fx } = make();
+      withPr(fx, "d".repeat(40));
+      fx.pullRequest = async () => ({ ...shape, head: { sha: "d".repeat(40) } });
+      await obj.onEvent({ delivery: "1", ev: command(`@tankster-ai-review ${cmd}`) });
+      await drain(obj);
+      assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>/, `${state} ${cmd}`);
+      assert.match(comments(fx)[0], note, `${state} ${cmd}`);
+      assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0, `${state} ${cmd}`);
+    }
+  }
+});
+
+test("review while a review of the head is already under way is declined, not queued twice", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await storage.put("runmeta:r1", { id: "r1", stage: "draft", headSha: "d".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>[\s\S]*already under way/);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+});
+
+test("pause names the last reviewed commit and the latest one not reviewed, as CodeRabbit's does", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  const text = comments(fx)[0];
+  assert.match(text, /are paused on this pull request\. Comment `@tankster-ai-review resume`/);
+  assert.match(text, /- Last reviewed commit: `ccccccc`/);
+  assert.match(text, /- Latest commit, not reviewed: `eeeeeee`/);
+  // Nothing was reviewed yet, or the head is the reviewed one: only what is true is said.
+  const two = make();
+  withPr(two.fx, "c".repeat(40));
+  await two.storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await two.obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(two.obj);
+  assert.doesNotMatch(comments(two.fx)[0], /not reviewed/);
+  const none = make();
+  withPr(none.fx, "e".repeat(40));
+  await none.obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(none.obj);
+  assert.doesNotMatch(comments(none.fx)[0], /Last reviewed commit/);
+  assert.match(comments(none.fx)[0], /- Latest commit, not reviewed: `eeeeeee`/);
 });
 
 test("resume reviews the commits pushed while paused, as CodeRabbit's; with none, it only says so", async () => {
@@ -1600,4 +1690,292 @@ test("review fixes: an acknowledgement that cannot be posted does not stop the r
   await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review review") });
   await fire(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "the review is still dispatched");
+});
+
+// --- the agent interface: status and request, refused when redundant ---------
+
+test("status tells an agent what to do next, from the server's own state", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const ask = (over) => obj.status({ slug: "tankster-ai-review", ...over });
+  // Nothing reviewed yet: the automatic review will run; do not ask for one.
+  let s = await ask();
+  assert.equal(s.next_action, "wait");
+  assert.equal(s.head, "a".repeat(40));
+  assert.equal(s.reviewed_head, null);
+  assert.equal(s.can_request_review, true);
+  // A draft: wait for it to be made ready; a request would be refused.
+  fx.pullRequest = async () => ({ state: "open", draft: true, head: { sha: "a".repeat(40) } });
+  s = await ask();
+  assert.equal(s.next_action, "mark_ready_for_review");
+  assert.equal(s.can_request_review, false);
+  assert.match(s.reason, /draft/);
+  // Reviewed head: read the threads.
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "a".repeat(40) } });
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: false, closed: false });
+  s = await ask();
+  assert.equal(s.next_action, "read_threads");
+  assert.equal(s.can_request_review, false);
+  // A new head, not yet reviewed: the push is reviewed on its own.
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "b".repeat(40) } });
+  s = await ask();
+  assert.equal(s.next_action, "wait");
+  // Closed.
+  fx.pullRequest = async () => ({ state: "closed", draft: false, head: { sha: "b".repeat(40) } });
+  assert.equal((await ask()).next_action, "none");
+});
+
+test("status of a paused PR says resume, and a request for a review is refused with the reason", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: true, closed: false });
+  const s = await obj.status({ slug: "tankster-ai-review" });
+  assert.equal(s.paused, true);
+  assert.equal(s.next_action, "resume");
+});
+
+test("request refuses what would change nothing, with a reason, and queues nothing", async () => {
+  for (const [pr, state, why] of [
+    [{ state: "open", draft: true, head: { sha: "a".repeat(40) } }, {}, /draft/],
+    [{ state: "closed", draft: false, head: { sha: "a".repeat(40) } }, {}, /closed/],
+    [{ state: "open", draft: false, head: { sha: "a".repeat(40) } }, { lastCompleteReviewed: "a".repeat(40), lastReviewed: "a".repeat(40) }, /Already reviewed/],
+  ]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "a".repeat(40));
+    fx.pullRequest = async () => pr;
+    await storage.put("state", { lastReviewed: null, paused: false, closed: false, ...state });
+    const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+    assert.equal(out.accepted, false);
+    assert.match(out.reason, why);
+    assert.deepEqual((await storage.get("outbox")) ?? [], []);
+  }
+});
+
+test("request on a head not yet reviewed queues the same command a comment would, once", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true);
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].type, "command");
+  assert.equal(box[0].cmd, "review");
+  assert.equal(box[0].login, "rishitank");
+  // A second request while the first is still queued is refused, not queued twice.
+  const again = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(again.accepted, false);
+  assert.match(again.reason, /already queued/);
+  assert.equal((await storage.get("outbox")).length, 1);
+  await storage.put("outbox", []);
+  // A full review of a reviewed head is allowed (it is the one way to review again).
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: false, closed: false });
+  const full = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: true });
+  assert.equal(full.accepted, true);
+});
+
+test("threads lists the reviewer's own threads for an agent: open ones by default, compact, with severity and the finding id", async () => {
+  const { obj, fx } = make();
+  const body = "**🟠 Major** · **Security & Privacy**\n<sub>Bug · finding `abc123`</sub>\n\n**Token logged**\n\nThe token is written to the log.";
+  fx.ownThreads = async () => [
+    { id: "T1", resolved: false, outdated: false, path: "src/a.js", line: 12, commentId: 5, body, findingId: "abc123" },
+    { id: "T2", resolved: true, outdated: false, path: "src/b.js", line: 3, commentId: 6, body: "**🟡 Minor** · **Performance & Scalability**\n\n**Slow**", findingId: null },
+  ];
+  const open = await obj.threads({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.deepEqual(open.threads.map((t) => t.id), ["T1"]);
+  assert.equal(open.threads[0].severity, "major");
+  assert.equal(open.threads[0].category, "security");
+  assert.equal(open.threads[0].finding_id, "abc123");
+  assert.equal(open.threads[0].path, "src/a.js");
+  assert.ok(open.threads[0].body.length <= 600);
+  const all = await obj.threads({ slug: "tankster-ai-review", repo, pr: 39, include_resolved: true });
+  assert.equal(all.threads.length, 2);
+});
+
+test("`rate limit` says whether a review can run now, or when one can; it needs write access and runs nothing", async () => {
+  expect_parse: {
+    assert.equal(parseCommand("@tankster-ai-review rate limit", "tankster-ai-review"), "rate limit");
+    assert.equal(parseCommand("@tankster-ai-review rate limit please", "tankster-ai-review"), null);
+  }
+  for (const [cap, want] of [
+    [{ ok: true }, /A review can run now/],
+    [{ ok: false, retryAt: NOW + 3600_000 }, /No model has capacity now[\s\S]*\d\d:\d\d UTC/],
+  ]) {
+    const storage = memoryStorage();
+    const fx = fakeEffects({ writers: ["rishitank"] });
+    withPr(fx, "a".repeat(40));
+    const obj = new PrState(doCtx(storage), RUNNER, { now: () => NOW, effects: fx, capacity: async () => cap });
+    await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review rate limit") });
+    await fire(obj);
+    assert.equal(comments(fx).length, 1);
+    assert.match(comments(fx)[0], want);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  }
+  const { obj, fx } = make({ writers: [] });
+  withPr(fx, "a".repeat(40));
+  await obj.onEvent({ delivery: "d2", ev: { ...command("@tankster-ai-review rate limit"), sender: { login: "stranger", bot: false } } });
+  await fire(obj);
+  assert.ok(!comments(fx).some((b) => /capacity/.test(b)), "a non-writer learns nothing about capacity");
+});
+
+test("review fixes: GitHub's own draft and closed answer wins over stale stored flags", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("state", { draft: true, closed: true, paused: false });
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true, out.reason);
+});
+
+test("review fixes: a held job that sets the neutral status puts the commit back to pending when it is given up or dropped", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("job:j1", { id: "j1", repo, pr: 39, createdAt: NOW, heldStatus: true, heldSha: "a".repeat(40) });
+  await obj.releaseHeld(await storage.get("job:j1"));
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].type, "status");
+  assert.equal(box[0].sha, "a".repeat(40));
+  assert.equal(box[0].waiting, true);
+  // A job that never set the neutral status queues nothing.
+  await storage.put("outbox", []);
+  await obj.releaseHeld({ id: "j2", repo, pr: 39 });
+  assert.equal((await storage.get("outbox")).length, 0);
+});
+
+test("review fixes 2: a live runner job counts as a review under way; an expired one does not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("job:r1", { id: "r1", repo, pr: 39, claimedBy: "worker", claimedAt: NOW - 60_000, dispatchedAt: NOW - 60_000 });
+  const st = await obj.status({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.equal(st.reviewing, true);
+  assert.equal(st.next_action, "wait");
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, false);
+  assert.match(out.reason, /under way/);
+  await storage.put("job:r1", { id: "r1", repo, pr: 39, claimedBy: "worker", claimedAt: NOW - 3 * 3600_000, dispatchedAt: NOW - 3 * 3600_000 });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).reviewing, false);
+});
+
+test("review fixes 2: only an authorised queued command blocks a request; an unchecked comment command does not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("outbox", [{ id: "c1", attempts: 0, type: "command", cmd: "review", slug: "tankster-ai-review", login: "stranger", repo, pr: 39 }]);
+  const ok = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(ok.accepted, true, ok.reason);
+  assert.equal((await storage.get("outbox")).at(-1).authorised, true);
+  // The queued command is judged without itself and without unchecked ones.
+  const a = await obj.advise(fx, await obj.state(), { cmd: "review", slug: "tankster-ai-review", repo, pr: 39, ignore: (await storage.get("outbox")).at(-1).id });
+  assert.equal(a.why, null);
+});
+
+test("review fixes 2: a fork PR no one has asked a writer about says so, not just wait", async () => {
+  const { obj, fx } = make();
+  withPr(fx, "a".repeat(40));
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "a".repeat(40), repo: { full_name: "outsider/ai-review" } }, base: { repo: { full_name: "TanksterAI/ai-review" } } });
+  const st = await obj.status({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.equal(st.next_action, "ask_a_writer_to_request_review");
+  assert.equal(st.can_request_review, true);
+});
+
+test("review fixes 2: GitHub's open and ready answer is written back over stale closed and draft flags when a review is accepted", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("state", { draft: true, closed: true, paused: false });
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true, out.reason);
+  const st = await storage.get("state");
+  assert.equal(st.closed, false);
+  assert.equal(st.draft, false);
+});
+
+test("review fixes 3: an author without write access, not yet reviewed, is pointed to a writer too; a bot or an already reviewed one is not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const shape = { state: "open", draft: false, head: { sha: "a".repeat(40) }, author_association: "CONTRIBUTOR", user: { type: "User" } };
+  fx.pullRequest = async () => shape;
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
+  fx.pullRequest = async () => ({ ...shape, user: { type: "Bot" } });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+  // github-actions[bot] is checked like anyone else, so it is pointed to a writer too.
+  fx.pullRequest = async () => ({ ...shape, user: { type: "Bot", login: "github-actions[bot]" } });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
+  fx.pullRequest = async () => shape;
+  // An earlier review of another head is no evidence the current head is coming.
+  await storage.put("state", { lastReviewed: "b".repeat(40), lastCompleteReviewed: "b".repeat(40) });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
+  // The current head already reviewed (even partly): nothing to ask for.
+  await storage.put("state", { lastReviewed: "a".repeat(40) });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+});
+
+test("review fixes 5: an interrupted alarm give-up keeps the run until the reset is queued", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun, activeRun } = await import("../src/review-run.js");
+  const run = await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  await storage.put("runmeta:j1", { ...run, headSha: "a".repeat(40), heldSuccess: true });
+  t.now = NOW + 4 * 24 * 3600_000;
+  const real = obj.outbox.bind(obj);
+  let fail = true;
+  obj.outbox = async (item) => { if (fail && item.type === "status") { fail = false; throw new Error("interrupted"); } return real(item); };
+  await fire(obj).catch(() => {});
+  assert.ok(await activeRun(storage), "the run is still there to retry from");
+  await fire(obj);
+  await drain(obj);
+  assert.ok(fx.calls.some((c) => c[0] === "setStatus" && c[2] === "a".repeat(40) && c[3] === "pending"));
+});
+
+test("review fixes 3: a run that held the neutral success and whose closing status did not land puts the commit back to pending", async () => {
+  const { obj, storage } = make();
+  const run = { id: "w1", repo, pr: 39, headSha: "a".repeat(40), heldSuccess: true, lastStatusOk: false };
+  await obj.releaseRun(run, { reviewedSha: null });
+  assert.ok((await storage.get("outbox")).some((x) => x.type === "status" && x.sha === "a".repeat(40) && x.waiting === true && x.gate === true));
+  await storage.put("outbox", []);
+  await obj.releaseRun({ ...run, lastStatusOk: true }, { reviewedSha: null });
+  assert.ok(!(await storage.get("outbox")).some((x) => x.type === "status"));
+});
+
+test("review fixes 4: a run given up by the alarm while it held the neutral success puts the commit back to pending", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun } = await import("../src/review-run.js");
+  const run = await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  await storage.put("runmeta:j1", { ...run, headSha: "a".repeat(40), heldSuccess: true });
+  t.now = NOW + 4 * 24 * 3600_000;
+  await fire(obj);
+  await drain(obj);
+  assert.ok(fx.calls.some((c) => c[0] === "setStatus" && c[2] === "a".repeat(40) && c[3] === "pending"), JSON.stringify(fx.calls.map((c) => c.slice(0, 4))));
+});
+
+
+test("review fixes 6: a gate reset is never dropped after five failed attempts; it is kept and retried later", async () => {
+  const { obj, fx, storage, t } = await acked();
+  fx.setStatus = async () => { throw new Error("github down"); };
+  await storage.put("outbox", [{ id: "s1", attempts: 5, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
+  await fire(obj);
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1, "still queued");
+  assert.equal(box[0].attempts, 0);
+  assert.ok(box[0].notBefore > t.now, "retried later, not at once");
+});
+
+
+test("review fixes 7: a gate reset that setStatus reports as not written stays queued, and after the last round the PR is told", async () => {
+  const { obj, fx, storage, t } = await acked();
+  fx.setStatus = async () => false;
+  await storage.put("outbox", [{ id: "g1", attempts: 0, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
+  await fire(obj).catch(() => {});
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1, "kept for a retry, not dropped as done");
+  assert.equal(box[0].type, "status");
+  assert.equal(box[0].attempts, 1);
+  // An ordinary waiting status that cannot be written is not retried for a day.
+  await storage.put("outbox", [{ id: "w1", attempts: 0, type: "status", sha: "a".repeat(40), waiting: true }]);
+  await fire(obj).catch(() => {});
+  assert.equal((await storage.get("outbox")).length, 0);
+  // The last round gives up with a visible note, not silently.
+  await storage.put("outbox", [{ id: "g2", attempts: 5, rounds: 144, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
+  await fire(obj);
+  const left = await storage.get("outbox");
+  assert.ok(!left.some((x) => x.type === "status"));
+  assert.ok(left.some((x) => x.type === "comment" && x.template === "gave_up" && /not reviewed/.test(x.reason)), JSON.stringify(left));
 });

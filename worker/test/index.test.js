@@ -639,3 +639,9 @@ test("a drafting call that never answers: the deadline's timer ends it, 503, not
   assert.equal(ai.calls, 1);
   assert.ok(![...e.LEDGER.map.keys()].some((k) => k.startsWith("done:")));
 });
+
+test("/mcp is routed to the MCP handler: no token is a 401, and nothing else on the path is public", async () => {
+  const worker = (await import("../src/index.js")).default;
+  const res = await worker.fetch(new Request("https://w/mcp", { method: "POST", body: "{}" }), { SETUP: { get: async () => null } });
+  assert.equal(res.status, 401);
+});

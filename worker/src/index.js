@@ -35,6 +35,7 @@ import { config } from "./config.js";
 import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { objectOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
+import { handleMcp } from "./mcp.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
 
 export { PrState } from "./pr-state.js";
@@ -445,6 +446,10 @@ export default {
     if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
     if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
     if (url.pathname === "/v1/setup/github-app/callback" && request.method === "GET") return handleSetupCallback(request, env);
+    if (url.pathname === "/mcp") {
+      const app = await appConfig(env);
+      return handleMcp(request, env, { fetch: (...a) => fetch(...a), slug: app?.slug, ask: (repo, pr, msg) => askPr(env, prKey(repo, pr), msg) });
+    }
     if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
     if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
     if (url.pathname === "/v1/review") {

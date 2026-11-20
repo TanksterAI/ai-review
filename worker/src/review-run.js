@@ -131,6 +131,7 @@ const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
 // GitHub calls one threads step may make (each counts as a subrequest).
 const COMPARES_PER_STEP = 6;
+const COMMITS_SHOWN = 20;
 const APPLIES_PER_STEP = 10;
 const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
@@ -287,20 +288,27 @@ function countSubrequests(ctx, budget) {
 }
 
 async function status(ctx, run, state, description) {
-  if (!run.headSha || run.statusOk === false) return;
+  // lastStatusOk: whether the latest write landed, so a run that ends after
+  // holding the neutral "delayed" success can put the commit back to pending.
+  if (!run.headSha || run.statusOk === false) { run.lastStatusOk = false; return; }
   try {
     const ok = await ctx.fx.setStatus(run.repo.full, run.headSha, state, description);
+    run.lastStatusOk = ok !== false;
     if (ok === false && run.statusOk !== false) {
       run.statusOk = false;
       ctx.deps.log?.({ ev: "status_unavailable", reason: "the App lacks statuses:write" });
     } else if (ok) run.statusOk = true;
   } catch (e) {
+    run.lastStatusOk = false;
     ctx.deps.log?.({ ev: "status_failed", error: String(e?.message ?? e).slice(0, 120) });
   }
 }
 
 async function finish(ctx, run, save, { state, description, posted = false, gaveUp = false, reviewedSha = null }) {
   if (state) await status(ctx, run, state, description);
+  // Before the run is marked done (a done run is not picked up again): any
+  // follow-up the gate needs, such as resetting a held success, is handed over.
+  await ctx.beforeDone?.(run, { reviewedSha, state });
   run.stage = "done";
   run.outcome = { state, posted, gaveUp };
   await save(run);
@@ -336,6 +344,10 @@ async function stagePr(ctx, run, save) {
         for (const [i, f] of files.entries()) await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars);
         run.files = files.length;
         run.mergeBase = run.since;
+        // The commits this review covers, shown in its summary (the last 20).
+        const cs = Array.isArray(cmp.commits) ? cmp.commits : [];
+        run.commitCount = Number.isSafeInteger(cmp.total_commits) ? cmp.total_commits : cs.length;
+        run.commits = cs.slice(-COMMITS_SHOWN).map((c) => ({ sha: String(c?.sha ?? ""), subject: String(c?.commit?.message ?? "").split("\n")[0] }));
         run.stage = "content";
         await save(run);
         return ctx.deps.now();
@@ -581,7 +593,15 @@ async function next(ctx, run, save, batches, at, nextStage) {
   const plan = await ctx.storage.get(planKey(run.id));
   const done = new Set(batches.map((b, i) => (b.status === "verified" ? i : -1)).filter((i) => i >= 0));
   const cov = coverageOf(plan, done);
-  await status(ctx, run, "pending", `Waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`);
+  // Neutral, as CodeRabbit's rate-limited run is, while nothing has been
+  // reviewed yet: the gate passes and the finished review replaces this status.
+  // Once some files are reviewed it stays pending, so a PR is never merged
+  // with files unreviewed because the providers ran out.
+  const delayed = `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`;
+  // Held until a non-success write lands, so a failed write cannot clear it.
+  if (done.size === 0) run.heldSuccess = true;
+  await status(ctx, run, done.size > 0 ? "pending" : "success", delayed);
+  if (done.size > 0 && run.lastStatusOk) run.heldSuccess = false;
   await save(run);
   return run.waitUntil;
 }
@@ -696,7 +716,7 @@ async function stagePost(ctx, run, save) {
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, again: ctx.again, headSha: run.headSha, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
@@ -757,6 +777,7 @@ async function stagePost(ctx, run, save) {
   // What the summary comment shows, once the threads are checked.
   await ctx.storage.put(summaryKey(run.id), {
     summary: review.summary, about: review.about, shown: shownCount, actionable: blocking, complete, since: run.since ?? null,
+    commits: run.since ? run.commits ?? [] : [], commitCount: run.since ? run.commitCount ?? 0 : 0,
     covered: cov.covered, reviewable: cov.reviewable,
   });
   run.result = { complete, shown: shownCount, covered: cov.covered, reviewable: cov.reviewable };
@@ -943,7 +964,12 @@ async function stageThreads(ctx, run, save) {
 
 // --- summary: the one comment, edited in place ------------------------------
 
-export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, threads, none = false }) {
+// A commit subject is untrusted: it is shown inside a code span, stripped of
+// anything that could close the span or open markup, so it cannot ping anyone
+// or inject HTML, and cut short.
+const subjectText = (t) => String(t ?? "").replace(/[`<>|\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 72);
+
+export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, commits = [], commitCount = 0, threads, none = false }) {
   const lines = ["### Tankster AI Review", ""];
   lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
   if (!complete || none) lines.push(summary, "");
@@ -952,6 +978,14 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   else if (shown) lines.push(`No actionable comments were generated in the recent review. ${summary} Nitpicks do not block approval.`, "");
   // CodeRabbit's own words for a review with no findings.
   else lines.push("No actionable comments were generated in the recent review. 🎉", "");
+  if (since && commits.length) {
+    const shownCommits = commits.slice(-COMMITS_SHOWN);
+    const total = Math.max(commitCount, commits.length);
+    lines.push(`<details><summary>Commits reviewed (${total})</summary>`, "");
+    if (total > shownCommits.length) lines.push(`Showing the ${shownCommits.length} latest.`, "");
+    for (const c of shownCommits) lines.push(`- \`${String(c.sha).slice(0, 7)}\` \`${codeSpan(subjectText(c.subject))}\``);
+    lines.push("", "</details>", "");
+  }
   if (threads) {
     const parts = [];
     if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);

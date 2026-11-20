@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DRAFT_PARALLEL, STEP_SUBREQUESTS, activeRun, keepOpenFindings, listOpenFindings, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
+import { DRAFT_PARALLEL, STEP_SUBREQUESTS, summaryText, activeRun, keepOpenFindings, listOpenFindings, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
 import { config } from "../src/config.js";
 import { parseFindingsBlock } from "../src/review.js";
 import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
@@ -187,8 +187,8 @@ test("only when every drafter is out does a batch wait, and the status says so; 
     if (at > s.getNow()) break;
   }
   assert.ok(at > s.getNow(), "the run waits");
-  assert.match(s.github.statuses.at(-1).description, /^Waiting for a model provider to reset at \d\d:\d\d UTC; 0 of 18 files reviewed so far\.$/);
-  assert.equal(s.github.statuses.at(-1).state, "pending");
+  assert.match(s.github.statuses.at(-1).description, /^Review delayed: waiting for a model provider to reset at \d\d:\d\d UTC; 0 of 18 files reviewed so far\.$/);
+  assert.equal(s.github.statuses.at(-1).state, "success", "neutral, as CodeRabbit's rate-limited run");
   assert.equal(s.github.posted.length, 0);
   // The providers reset; the review carries on from where it was.
   out = false;
@@ -290,7 +290,34 @@ test("an incremental review reads only the commits since the last review, and sa
   const { body, comments } = github.posted[0];
   assert.equal(comments.length, 1);
   assert.match(body, /_Incremental review: commits after `ddddddd`\._/);
+  assert.match(body, /Reviewing the commits after `ddddddd`, up to `/);
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+});
+
+test("an incremental review's summary lists the commits it covered, safely", async () => {
+  const since = "d".repeat(40);
+  const commits = [
+    { sha: "1".repeat(40), commit: { message: "Fix the thing @everyone <b>now</b> `x`\n\nbody" } },
+    { sha: "2".repeat(40), commit: { message: "Second | commit" } },
+  ];
+  const github = fakeGithub({ compare: (base) => (base === since ? { status: "ahead", total_commits: 2, commits, files: [file("worker/src/m3.js", added(4, "inc_"))] } : null) });
+  github.prLinesMap = new Map([["worker/src/m3.js", new Set([1, 2, 3, 4])]]);
+  const s = setup({ github, job: { since } });
+  await runAll(s);
+  const text = github.summaries[0].body;
+  assert.match(text, /<summary>Commits reviewed \(2\)<\/summary>/);
+  assert.match(text, /- `1111111` `Fix the thing @\u200Beveryone b now \/b x`/, "the subject sits in a code span, so @everyone pings no one");
+  assert.doesNotMatch(text, /<b>|\|/);
+});
+
+test("summaryText: a full review names no commits; a long list is cut to the last 20 with the count", () => {
+  const base = { headSha: "a".repeat(40), summary: "s", about: "", shown: 0, complete: true };
+  assert.doesNotMatch(summaryText(base), /Commits reviewed/);
+  const many = Array.from({ length: 25 }, (_, i) => ({ sha: String(i % 10).repeat(40), subject: `c${i}` }));
+  const t = summaryText({ ...base, since: "d".repeat(40), commits: many, commitCount: 25 });
+  assert.match(t, /Commits reviewed \(25\)/);
+  assert.equal((t.match(/^- `/gm) ?? []).length, 20);
+  assert.match(t, /the 20 latest/);
 });
 
 test("without the statuses permission the review is still posted, and the status is not asked for again", async () => {
@@ -759,7 +786,7 @@ test("a review that checks threads from many commits still finishes: every threa
   assert.equal(s.github.statuses.at(-1).state, "success");
 });
 
-test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment, nothing is kept; the quiet profile shows none", async () => {
+test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment, nothing is kept; the quiet profile collapses it too", async () => {
   const nit = { severity: "trivial", type: "nitpick", title: "Name it better" };
   const chill = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }) });
   await runAll(chill);
@@ -771,7 +798,8 @@ test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment,
 
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
-  assert.equal(quiet.github.posted.length, 0, "nothing shown, nothing to resolve: no review");
+  assert.equal(quiet.github.posted.length, 1, "quiet collapses a nitpick, as CodeRabbit's, and does not hide it");
+  assert.equal(quiet.github.posted[0].comments.length, 0);
   assert.deepEqual(await listOpenFindings(quiet.storage), []);
   assert.match(quiet.github.summaries[0].body, /No actionable comments were generated/);
 });
@@ -928,4 +956,27 @@ test("the summary text a review writes is kept for the approval notice, and an o
   await runAll(s);
   assert.equal(await s.storage.get("summaryBase"), s.github.summaries[0].body);
   assert.equal(await s.storage.get("summaryNotice"), undefined);
+});
+
+
+test("a held neutral success: when the closing status write fails too, the reset is handed over before the run is marked done", async () => {
+  const models = fakeModels({
+    gemini: { "gemini-3.5-flash-lite": () => geminiDay, "gemma-4-31b-it": () => geminiDay },
+    anthropic: () => reply(402, { error: { type: "billing_error", message: "Your credit balance is too low" } }),
+  });
+  const s = setup({ models });
+  const handed = [];
+  s.ctx.beforeDone = async (run) => { handed.push({ stage: run.stage, heldSuccess: run.heldSuccess, lastStatusOk: run.lastStatusOk }); };
+  await startRun(s.storage, s.job, s.getNow());
+  let at = null;
+  for (let i = 0; i < 20; i++) { at = await stepRun(s.ctx, s.job.id); if (at > s.getNow()) break; }
+  assert.ok(at > s.getNow(), "the run waits holding the neutral success");
+  // Every status write now fails, and the run is given up after three days.
+  s.github.setStatus = async () => { throw new Error("github down"); };
+  s.setNow(s.getNow() + 4 * 24 * 3600_000);
+  await stepRun(s.ctx, s.job.id);
+  assert.equal(handed.length, 1);
+  assert.equal(handed[0].heldSuccess, true);
+  assert.equal(handed[0].lastStatusOk, false);
+  assert.notEqual(handed[0].stage, "done", "handed over before the run is marked done");
 });
