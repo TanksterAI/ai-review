@@ -85,41 +85,52 @@ export function helpText(slug = DEFAULT_SLUG) {
 export function parseCommand(text, slug = DEFAULT_SLUG) {
   mentionOf(slug); // throws on a malformed slug before it reaches a pattern
   const raw = String(text ?? "").replace(/\r\n?/g, "\n");
-  // HTML comments, which GitHub does not show.
-  let shown = "";
-  for (let at = 0; at < raw.length;) {
-    const open = raw.indexOf("<!--", at);
-    if (open < 0) { shown += raw.slice(at); break; }
-    shown += raw.slice(at, open);
-    const close = raw.indexOf("-->", open + 4);
-    if (close < 0) break;
-    // Keep the line breaks, so lines stay lines.
-    shown += raw.slice(open, close + 3).replace(/[^\n]/g, "");
-    at = close + 3;
-  }
-  const lines = shown.split("\n");
+  const lines = raw.split("\n");
   const handle = new RegExp(`^ {0,3}@${slug}(?![\\w-])(.*)$`, "i");
+  // One pass, as Markdown reads it: inside a fence everything is literal,
+  // HTML comments included (a fence closes on its own raw line); outside
+  // one, HTML comments are hidden, across lines too.
   let fence = null;
+  let comment = false;
   let at = -1;
+  let shown = "";
   for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(l);
+    const raw_ = lines[i];
     if (fence) {
+      const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(raw_);
       if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
       continue;
     }
-    // A backtick fence's info string may not hold a backtick.
-    if (f && !(f[1][0] === "`" && f[2].includes("`"))) { fence = f[1]; continue; }
-    if (handle.test(l)) { at = i; break; }
+    // The line as shown: what is outside HTML comments.
+    let l = "";
+    for (let k = 0; k < raw_.length;) {
+      if (comment) {
+        const close = raw_.indexOf("-->", k);
+        if (close < 0) break;
+        comment = false;
+        k = close + 3;
+      } else {
+        const open = raw_.indexOf("<!--", k);
+        if (open < 0) { l += raw_.slice(k); break; }
+        l += raw_.slice(k, open);
+        comment = true;
+        k = open + 4;
+      }
+    }
+    // A fence starts the line as written (never text after a comment), and a
+    // backtick fence's info string may not hold a backtick.
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(l);
+    if (f && raw_.startsWith(l.slice(0, f[0].length - f[2].length)) && !(f[1][0] === "`" && f[2].includes("`"))) { fence = f[1]; continue; }
+    // The handle starts the line as written too: not text after a comment.
+    if (handle.test(l) && handle.test(raw_)) { at = i; shown = l; break; }
   }
   if (at < 0) return null;
-  const said = handle.exec(lines[at])[1].trim().toLowerCase().replace(/\s+/g, " ");
+  const said = handle.exec(shown)[1].trim().toLowerCase().replace(/\s+/g, " ");
   // Own keys only: "constructor" or "__proto__" is no alias.
   const cmd = Object.hasOwn(ALIASES, said) ? ALIASES[said] : COMMANDS.includes(said) ? said : null;
   if (!cmd) return null;
   // Whole comment: nothing else at all, hidden or shown, before or after.
-  const all = raw.split("\n");
-  if (WHOLE_COMMENT.has(cmd) && all.filter((l) => l.trim()).length !== 1) return null;
+  if (WHOLE_COMMENT.has(cmd) && lines.filter((l) => l.trim()).length !== 1) return null;
   return cmd;
 }
 
@@ -245,6 +256,15 @@ export class PrState {
     const all = await this.ctx.storage.list({ prefix: "reply:" });
     const stale = [...all].filter(([, t]) => this.now() - t > REPLY_WINDOW_MS).map(([k]) => k);
     await this.deleteAll(stale);
+  }
+
+  // An edit to an acknowledgement, queued once: a step retried after queueing
+  // it (before its job was deleted) does not queue it again.
+  async queueAck(commentId, text) {
+    if (!Number.isSafeInteger(commentId)) return;
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    if (box.some((x) => x.type === "ack" && x.commentId === commentId && x.text === text)) return;
+    await this.outbox({ type: "ack", commentId, text });
   }
 
   async outbox(item) {
@@ -738,8 +758,14 @@ export class PrState {
           // The head was reviewed meanwhile: the job is done without a second
           // review (a requested run is forced, so it would review it again).
           if (head && (head === st.lastReviewed || head === st.lastCompleteReviewed)) {
+            await this.queueAck(kept.ackId, actionPerformed("Review finished."));
             await this.ctx.storage.delete(`job:${item.jobId}`);
-            if (Number.isSafeInteger(kept.ackId)) await this.outbox({ type: "ack", commentId: kept.ackId, text: actionPerformed("Review finished.") });
+            return undefined;
+          }
+          // It became a draft, or closed, meanwhile: no review now.
+          if (draft || shut) {
+            await this.ackEnded(kept, shut ? "This pull request is closed: it is reviewed if it is reopened." : "This pull request is a draft: it is reviewed once it is marked ready.");
+            await this.ctx.storage.delete(`job:${item.jobId}`);
             return undefined;
           }
           return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
@@ -782,17 +808,20 @@ export class PrState {
     if (!item.acked) {
       const commentId = await fx.comment(item.repo.full, item.pr, actionPerformed(text));
       item.acked = true;
+      if (Number.isSafeInteger(commentId)) item.ackId = commentId;
       await this.keepItem(item);
-      const job = await this.ctx.storage.get(`job:${item.jobId}`);
-      if (job && Number.isSafeInteger(commentId)) await this.ctx.storage.put(`job:${item.jobId}`, { ...job, ackId: commentId });
     }
+    // The comment id is kept on the item with the flag, so a retry after the
+    // job write failed still gives the job its acknowledgement.
+    const job = await this.ctx.storage.get(`job:${item.jobId}`);
+    if (job && Number.isSafeInteger(item.ackId) && job.ackId !== item.ackId) await this.ctx.storage.put(`job:${item.jobId}`, { ...job, ackId: item.ackId });
     return this.dispatchJob(fx, item.jobId);
   }
 
   // A job ends without completing (given up, dropped, its PR closed): its
   // acknowledgement, if any, says so rather than "Review triggered." for ever.
   async ackEnded(job, why) {
-    if (Number.isSafeInteger(job?.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionNotCompleted(why) });
+    await this.queueAck(job?.ackId, actionNotCompleted(why));
   }
 
   async keepItem(item) {
@@ -864,7 +893,7 @@ export class PrState {
       // how far it got. One given up, or stopped by the PR closing, did not.
       const said = String(description ?? "").replace(/[`\n]/g, " ").slice(0, 200);
       if (Number.isSafeInteger(job?.ackId)) {
-        await this.outbox({ type: "ack", commentId: job.ackId, text: !gaveUp && said ? actionPerformed(`Review finished. ${said}`) : actionNotCompleted(gaveUp ? "The review could not finish." : "The pull request is no longer open.") });
+        await this.queueAck(job.ackId, !gaveUp && said ? actionPerformed(`Review finished. ${said}`) : actionNotCompleted(gaveUp ? "The review could not finish." : "The pull request is no longer open."));
       }
       // The summary was written again without its notice: decide puts back
       // the right one (pending, as the head has no complete review).
@@ -1002,8 +1031,13 @@ export class PrState {
     const t = (await fx.ownThreads(key.repo, key.pr, slug)).find((x) => x.commentId === item.inThreadOf);
     // Not one of the App's own threads: nothing to do, as CodeRabbit.
     if (!t) return undefined;
-    if (!t.resolved && !(await fx.resolveThread(key.repo, t.id))) throw new Error("the thread could not be resolved");
-    if (!((await reopenMark(this.ctx.storage, t.id)) > (Number.isInteger(item.seq) ? item.seq : Infinity))) await acceptThreads(this.ctx.storage, [t.id]);
+    // Reopened after the command was posted: newer than it, so it stays open
+    // (resolved by the App, decide would count it as resolved).
+    const newer = (await reopenMark(this.ctx.storage, t.id)) > (Number.isInteger(item.seq) ? item.seq : Infinity);
+    if (!newer) {
+      if (!t.resolved && !(await fx.resolveThread(key.repo, t.id))) throw new Error("the thread could not be resolved");
+      await acceptThreads(this.ctx.storage, [t.id]);
+    }
     await this.queueDecide({});
     return undefined;
   }
@@ -1019,7 +1053,11 @@ export class PrState {
     // none and uses the number now).
     const seq = Number.isInteger(item.seq) ? item.seq : (await this.ctx.storage.get("reopenSeq")) ?? 0;
     const threads = await fx.ownThreads(key.repo, key.pr, slug);
-    const open = threads.filter((t) => !t.resolved);
+    // A thread reopened after the command was posted is newer than its view:
+    // left open, never resolved by the App on the command's behalf.
+    const marks = new Map();
+    for (const t of threads) marks.set(t.id, (await reopenMark(this.ctx.storage, t.id)) > seq);
+    const open = threads.filter((t) => !t.resolved && !marks.get(t.id));
     let done = 0;
     for (const t of open.slice(0, RESOLVE_PER_STEP)) if (await fx.resolveThread(key.repo, t.id)) done++;
     // Nothing moved: an attempt that counts, so it cannot spin for ever.
@@ -1030,6 +1068,7 @@ export class PrState {
     // The writer vouched for every thread, those resolved by people without
     // write access included: later decisions count them as resolved too.
     const vouched = [];
+    // Read again: a reopen can land while GitHub's calls are pending.
     for (const t of threads) if (!((await reopenMark(this.ctx.storage, t.id)) > seq)) vouched.push(t.id);
     await acceptThreads(this.ctx.storage, vouched);
     await clearOpenFindings(this.ctx.storage);
@@ -1131,8 +1170,10 @@ export class PrState {
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
     await this.ctx.storage.put("state", st);
+    // The edit is queued before the job goes: a retry after a failure in
+    // between finds the job and queues nothing twice (queueAck).
+    await this.queueAck(job.ackId, actionPerformed("Review finished."));
     await this.ctx.storage.delete(`job:${jobId}`);
-    if (Number.isSafeInteger(job.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionPerformed("Review finished.") });
     return { ok: true };
   }
 }

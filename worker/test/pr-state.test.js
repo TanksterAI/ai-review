@@ -78,6 +78,16 @@ test("commands are parsed from the text after the mention", () => {
     ["@tankster-ai-review resolve\r\n", "resolve"],
     ["@tankster-ai-review resolve\n<!-- hidden -->", null],
     ["@tankster-ai-review constructor", null],
+    ["```\n```<!-- literal -->\n@tankster-ai-review review\n```", null],
+    ["```\n<!--\n```\n@tankster-ai-review review", "review"],
+    ["<!-- a\nb --> @tankster-ai-review review", null],
+    ["<!-- a\nb -->\n@tankster-ai-review full review", "full review"],
+    ["<!--\n```\n-->\n@tankster-ai-review review", "review"],
+    // Stricter than Markdown where they differ: a comment reopened on the line
+    // that closed one hides what follows.
+    ["<!--\n--> <!--\n@tankster-ai-review review\n-->", null],
+    // A line that starts with a comment is HTML, never a fence (as Markdown).
+    ["<!-- x -->```\n@tankster-ai-review review", "review"],
     ["@tankster-ai-review __proto__", null],
     ["@tankster-ai-review hasOwnProperty", null],
     ["    ```\n@tankster-ai-review review", "review"],
@@ -1434,4 +1444,54 @@ test("a retried resume whose review is still to start goes on with it, not the s
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
   assert.equal(await storage.get("job:j9"), undefined);
   assert.equal(comments(fx).length, 0, "no second acknowledgement");
+});
+
+test("ack: a retry after the job write failed still gives the job its acknowledgement (no second comment)", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  // The first try: comment posted, item kept, then the job read fails.
+  const real = storage.get.bind(storage);
+  let fail = true;
+  storage.get = async (k) => { if (fail && typeof k === "string" && k.startsWith("job:") && (await real("outbox"))?.some((x) => x.acked)) { fail = false; throw new Error("storage blip"); } return real(k); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  for (let i = 0; i < 5; i++) { obj.ctx.storage.alarm = null; try { await obj.alarm(); } catch {} }
+  storage.get = real;
+  assert.equal(fail, false, "the job read did fail once");
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.ok(jobId, "dispatched on the retry");
+  assert.equal((await storage.get(`job:${jobId}`)).ackId, 1000);
+  assert.equal(comments(fx).length, 1);
+});
+
+test("ack: complete queues its edit once, even when retried before the job is deleted", async () => {
+  const { obj, fx, storage } = await acked({ claimedBy: "7", claimedAt: NOW });
+  const del = storage.delete.bind(storage);
+  let fail = true;
+  storage.delete = async (k) => { if (fail && k === "job:j1") { fail = false; throw new Error("storage blip"); } return del(k); };
+  await assert.rejects(obj.complete({ jobId: "j1", runId: "7", reviewedSha: "d".repeat(40) }));
+  storage.delete = del;
+  await obj.complete({ jobId: "j1", runId: "7", reviewedSha: "d".repeat(40) });
+  const acks = ((await storage.get("outbox")) ?? []).filter((x) => x.type === "ack");
+  assert.equal(acks.length, 1);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Review finished\./);
+});
+
+test("a retried resume whose PR became a draft or closed ends its job, and says why", async () => {
+  for (const [pr, said] of [[{ state: "open", draft: true }, /draft/], [{ state: "closed", draft: false }, /closed/]]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "e".repeat(40));
+    fx.pullRequest = async () => ({ ...pr, head: { sha: "e".repeat(40) } });
+    await storage.put("key", { repo: repo.full, pr: 39 });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+    await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW, ackId: 55 });
+    await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, ackId: 55, seq: 1 }]);
+    await drain(obj);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+    assert.equal(await storage.get("job:j9"), undefined);
+    const [[id, text]] = edits(fx);
+    assert.equal(id, 55);
+    assert.match(text, /Action not completed[\s\S]*/);
+    assert.match(text, said);
+  }
 });

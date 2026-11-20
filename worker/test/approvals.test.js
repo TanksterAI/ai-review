@@ -624,3 +624,23 @@ test("a reopen after the approval turns the summary's notice back to withheld, w
   assert.match(summaries[0], /\*\*Automatic approval withheld\*\*[\s\S]*#discussion_r501/);
   assert.doesNotMatch(summaries[0], /approved at commit/);
 });
+
+test("a thread reopened after a resolve command was posted is left open, not resolved by the App", async () => {
+  // Thread reply: the command is numbered 0, the reopen 1 (before the alarm).
+  const one = await make({ threads: [{ ...thread("t1", false), commentId: 101 }] });
+  await one.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, commentId: 999, inReplyTo: 101, text: "@tankster-ai-review resolve" } });
+  await one.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t1" } });
+  await drain(one.obj);
+  assert.equal(one.calls.filter((c) => c[0] === "resolveThread").length, 0);
+  assert.equal((await acceptedSet(one.storage)).has("t1"), false);
+  assert.equal(approvals(one.calls).length, 0);
+
+  // Top-level: the reopened thread stays open, the others are resolved.
+  const all = await make({ threads: [thread("t1", false), thread("t2", false)] });
+  await all.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  await all.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t2" } });
+  await drain(all.obj);
+  assert.deepEqual(all.calls.filter((c) => c[0] === "resolveThread").map((c) => c[1]), ["t1"]);
+  assert.equal(all.w.threads[1].resolved, false);
+  assert.equal(approvals(all.calls).length, 0, "the newer reopen holds approval back");
+});
