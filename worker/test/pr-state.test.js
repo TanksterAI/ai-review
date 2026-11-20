@@ -1928,7 +1928,7 @@ test("review fixes 3: a run that held the neutral success and whose closing stat
   const { obj, storage } = make();
   const run = { id: "w1", repo, pr: 39, headSha: "a".repeat(40), heldSuccess: true, lastStatusOk: false };
   await obj.releaseRun(run, { reviewedSha: null });
-  assert.ok((await storage.get("outbox")).some((x) => x.type === "status" && x.sha === "a".repeat(40) && x.waiting === true));
+  assert.ok((await storage.get("outbox")).some((x) => x.type === "status" && x.sha === "a".repeat(40) && x.waiting === true && x.gate === true));
   await storage.put("outbox", []);
   await obj.releaseRun({ ...run, lastStatusOk: true }, { reviewedSha: null });
   assert.ok(!(await storage.get("outbox")).some((x) => x.type === "status"));
@@ -1950,10 +1950,32 @@ test("review fixes 4: a run given up by the alarm while it held the neutral succ
 test("review fixes 6: a gate reset is never dropped after five failed attempts; it is kept and retried later", async () => {
   const { obj, fx, storage, t } = await acked();
   fx.setStatus = async () => { throw new Error("github down"); };
-  await storage.put("outbox", [{ id: "s1", attempts: 5, type: "status", sha: "a".repeat(40), waiting: true }]);
+  await storage.put("outbox", [{ id: "s1", attempts: 5, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
   await fire(obj);
   const box = await storage.get("outbox");
   assert.equal(box.length, 1, "still queued");
   assert.equal(box[0].attempts, 0);
   assert.ok(box[0].notBefore > t.now, "retried later, not at once");
+});
+
+
+test("review fixes 7: a gate reset that setStatus reports as not written stays queued, and after the last round the PR is told", async () => {
+  const { obj, fx, storage, t } = await acked();
+  fx.setStatus = async () => false;
+  await storage.put("outbox", [{ id: "g1", attempts: 0, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
+  await fire(obj).catch(() => {});
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1, "kept for a retry, not dropped as done");
+  assert.equal(box[0].type, "status");
+  assert.equal(box[0].attempts, 1);
+  // An ordinary waiting status that cannot be written is not retried for a day.
+  await storage.put("outbox", [{ id: "w1", attempts: 0, type: "status", sha: "a".repeat(40), waiting: true }]);
+  await fire(obj).catch(() => {});
+  assert.equal((await storage.get("outbox")).length, 0);
+  // The last round gives up with a visible note, not silently.
+  await storage.put("outbox", [{ id: "g2", attempts: 5, rounds: 144, type: "status", sha: "a".repeat(40), waiting: true, gate: true }]);
+  await fire(obj);
+  const left = await storage.get("outbox");
+  assert.ok(!left.some((x) => x.type === "status"));
+  assert.ok(left.some((x) => x.type === "comment" && x.template === "gave_up" && /not reviewed/.test(x.reason)), JSON.stringify(left));
 });

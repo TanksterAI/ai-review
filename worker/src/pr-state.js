@@ -561,7 +561,7 @@ export class PrState {
         // A run given up while it held the neutral success must not leave it:
         // the reset is queued before the run is dropped, so an interruption
         // between the two leaves the run to be given up again.
-        if (run.heldSuccess && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
+        if (run.heldSuccess && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true, gate: true });
         await dropRun(this.ctx.storage, run.id);
         await this.ackEnded(await this.ctx.storage.get(`job:${run.id}`), "The review could not finish.");
         await this.ctx.storage.delete(`job:${run.id}`);
@@ -583,13 +583,16 @@ export class PrState {
     if (item) {
       // A gate reset (a commit back to pending) is the one thing never given
       // up on: it is kept and tried again later, for a day at most.
-      if (item.attempts >= MAX_ATTEMPTS && item.type === "status" && item.waiting && (item.rounds ?? 0) < 144) {
+      if (item.attempts >= MAX_ATTEMPTS && item.type === "status" && item.gate && (item.rounds ?? 0) < 144) {
         const later = this.now() + 10 * 60_000;
         await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? { ...x, attempts: 0, rounds: (x.rounds ?? 0) + 1, notBefore: later } : x)));
         await this.armAt(later);
       } else if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
         await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
+        // A gate reset given up on says so on the PR: its commit may still show
+        // the delayed success.
+        if (item.type === "status" && item.gate) await this.outbox({ type: "comment", template: "gave_up", reason: `the status of commit ${String(item.sha).slice(0, 7)} could not be reset to pending, so treat it as not reviewed`, tries: item.attempts, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
         // Its job would never get a runner: it must not stand in for later pushes.
         if (item.jobId) {
           if (item.type !== "ack") await this.ackEnded(await this.ctx.storage.get(`job:${item.jobId}`), "The review could not start.");
@@ -697,7 +700,7 @@ export class PrState {
   // commit goes back to waiting, as before the neutral status existed.
   async releaseHeld(job) {
     if (!job?.heldSha) return;
-    await this.outbox({ type: "status", sha: job.heldSha, waiting: true });
+    await this.outbox({ type: "status", sha: job.heldSha, waiting: true, gate: true });
   }
 
   // Marks a commit as waiting for a writer. A review run sets the status
@@ -705,11 +708,12 @@ export class PrState {
   // A commit already reviewed (a writer asked), or under review now, keeps the
   // status its run set or will set.
   async waitingFor(fx, repoFull, sha, slug) {
-    if (typeof fx.setStatus !== "function") return;
+    if (typeof fx.setStatus !== "function") return true;
     const st = await this.state();
-    if (sha === st.lastReviewed || sha === st.lastCompleteReviewed) return;
-    if ((await activeRun(this.ctx.storage))?.headSha === sha) return;
-    await fx.setStatus(repoFull, sha, "pending", waitingStatus(slug));
+    if (sha === st.lastReviewed || sha === st.lastCompleteReviewed) return true;
+    if ((await activeRun(this.ctx.storage))?.headSha === sha) return true;
+    // False when the write did not land (the App lacks statuses:write).
+    return (await fx.setStatus(repoFull, sha, "pending", waitingStatus(slug))) !== false;
   }
 
   async perform(item) {
@@ -767,7 +771,11 @@ export class PrState {
 
     if (item.type === "status") {
       if (!key || !item.sha) return undefined;
-      if (item.waiting) await this.waitingFor(fx, key.repo, item.sha, slug);
+      if (item.waiting) {
+        const written = await this.waitingFor(fx, key.repo, item.sha, slug);
+        // A gate reset that did not land is retried (the item is kept), not lost.
+        if (item.gate && written === false) throw new Error("the commit status could not be written");
+      }
       return undefined;
     }
 
@@ -1076,7 +1084,7 @@ export class PrState {
   // land: the commit must not keep passing the gate unreviewed. Queued before
   // the run is marked done, so a failure after it still has the reset.
   async releaseRun(run, { reviewedSha = null } = {}) {
-    if (!reviewedSha && run.heldSuccess && run.lastStatusOk === false && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
+    if (!reviewedSha && run.heldSuccess && run.lastStatusOk === false && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true, gate: true });
   }
 
   // A run is over: its job completes (moving lastReviewed on) or is dropped,
