@@ -244,7 +244,7 @@ export async function runReview({ cfg, env, repository, pr, headSha, input, now,
   const review = renderReview({
     answer, classified: shown, hidden, prepared,
     verification: { off: verified.off, weak: verified.weak, fallback: verified.fallback, fallbackBy: verified.fallbackBy, selfExcluded: verified.selfExcluded },
-    meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha, profile: cfg.profile },
+    meta: { model: used.model, modelLine: `- Model: ${used.label}`, costLine: cost, again, headSha, profile: cfg.profile, advisory: true },
   });
   await env.LEDGER.put(doneKey, utcDay(now()), { expirationTtl: 30 * 24 * 3600 });
   log({
@@ -404,6 +404,9 @@ export async function handleRunnerReview(request, env, deps = {}) {
       }
       text += `\n\n_Incremental review: commits after \`${since.slice(0, 7)}\`._`;
     }
+    // Runner mode stays advisory (a COMMENT review every time): it has no
+    // summary comment, no thread checks and no approvals, which only the
+    // Worker's own review (review-run.js) does.
     // If posting throws, the job is left open: a re-run of the runner (same
     // run id, next attempt) reviews again and posts.
     const posted = await fx.postReview(job.repo.full, job.pr, { commitId: headSha, body: text, comments });

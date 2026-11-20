@@ -753,7 +753,7 @@ test("hidden findings are in the block only, with no text, and a path only when 
 test("the summary is the Worker's own, from the confirmed findings; the drafter's is never shown", () => {
   const r = render("chill");
   assert.doesNotMatch(r.body, /DrafterSummaryText/);
-  assert.match(r.body, /### AI review \(advisory\)\n\nReviewed 1 file\. 2 findings confirmed: 1 major, 1 minor \(plus 4 nitpicks\)\.\n/);
+  assert.match(r.body, /### Tankster AI Review\n\nReviewed 1 file\. 2 findings confirmed: 1 major, 1 minor \(plus 4 nitpicks\)\.\n/);
   const none = renderReview({ answer: { summary: "Everything is broken." }, classified: { inline: [], general: [] }, prepared: shown(), hidden: hiddenSet, verification: { off: false }, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
   assert.match(none.body, /\n\nNo problems confirmed in the 1 file reviewed\.\n/);
   assert.doesNotMatch(none.body, /Everything is broken/);
@@ -937,7 +937,7 @@ test("an incomplete review says so first, names what was not covered, and its bl
     prepared: { ...coveragePrepared({ reviewable: 3, covered: 2, complete: false, passes: 2 }), uncovered: [{ path: "src/c.js", reason: "its diff was not sent" }] },
     verification: { off: false }, meta: coverageMeta,
   });
-  assert.match(r.body, /### AI review \(advisory\)\n\n\*\*Incomplete review: 2 of 3 reviewable files were covered\.\*\* /);
+  assert.match(r.body, /### Tankster AI Review\n\n\*\*Incomplete review: 2 of 3 reviewable files were covered\.\*\* /);
   assert.match(r.body, /\n- Coverage: 2 of 3 reviewable files \(66%\), 214,630 characters of diff, in 2 passes\. Not covered \(1\): `src\/c\.js` \(its diff was not sent\)\. The commit status stays failing until every file is reviewed\.\n/);
   assert.deepEqual(parseFindingsBlock(r.body).coverage, { reviewable: 3, covered: 2, complete: false });
 });
@@ -948,4 +948,24 @@ test("one pass of several tells the model the other files exist and are reviewed
   assert.match(instructions, /This is pass 2 of 3 of a large pull request\./);
   assert.match(input, /<<<BEGIN OTHER FILES IN THIS PULL REQUEST t1>>>\n"src\/b\.js"\n"README\.md"\n<<<END OTHER FILES IN THIS PULL REQUEST t1>>>/);
   assert.doesNotMatch(input, /All changed files are shown/);
+});
+
+test("renderReview: nitpicks are shown but neither block nor are kept; actionable ones do", () => {
+  const prepared = prepareFiles([{ filename: "src/a.js", patch: PATCH }]);
+  const answer = { summary: "s", findings: [
+    { path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Division by zero", body: "Guard it." },
+    { path: "src/a.js", line: 3, severity: "trivial", type: "nitpick", category: "maintainability", title: "Name it better", body: "b" },
+    { path: "src/nope.js", line: 1, severity: "minor", category: "tests", title: "Outside", body: "b" },
+    { path: "src/nope.js", line: 2, severity: "info", category: "tests", title: "Outside nit", body: "b" },
+  ] };
+  const classified = classifyFindings(answer, prepared.commentable);
+  const r = renderReview({ answer, classified, prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "chill" } });
+  assert.equal(r.shown, 4);
+  assert.equal(r.blocking, 2, "the major inline one and the minor outside one");
+  // Typed nitpick but critical: an issue, which blocks.
+  const sev = { summary: "s", findings: [{ path: "src/a.js", line: 3, severity: "critical", type: "nitpick", category: "bug", title: "Overflow", body: "b" }] };
+  const r2 = renderReview({ answer: sev, classified: classifyFindings(sev, prepared.commentable), prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "chill" } });
+  assert.equal(r2.blocking, 1);
+  assert.equal(r2.comments.length, 1, "placed inline, as an issue");
+  assert.deepEqual(r.listed.map((x) => x.title ?? x.text.split("\n")[0]), ["Outside"]);
 });

@@ -5,6 +5,7 @@
 
 import { createGithubApp } from "./github-app.js";
 import { annotatePatch, codeSpan } from "./review.js";
+import { findingIdOf } from "./addressed.js";
 
 export const ORG = "TanksterAI";
 export const RUNNER_REPO = "ai-review";
@@ -16,6 +17,9 @@ const PR_SCOPE = { pull_requests: "write" };
 // The Worker's own review reads the pull request and its files with this.
 const READ_SCOPE = { contents: "read", pull_requests: "read" };
 const STATUS_SCOPE = { statuses: "write" };
+// Reading threads through GraphQL names each comment's commit: Commit
+// objects need contents:read as well.
+const THREAD_SCOPE = { contents: "read", pull_requests: "write" };
 export const STATUS_CONTEXT = "Tankster AI Review";
 export const MARKER = "<!-- tankster-ai-review -->";
 
@@ -173,12 +177,15 @@ export function createEffects(env, deps = {}) {
       return true;
     },
 
-    async postReview(repoFull, pr, { commitId, body, comments }) {
+    // event: COMMENT, or REQUEST_CHANGES while the review has findings (as
+    // CodeRabbit's Automatic Approvals do).
+    async postReview(repoFull, pr, { commitId, body, comments, event = "COMMENT" }) {
       const name = nameOf(repoFull);
+      if (!REVIEW_EVENTS.has(event)) throw new Error("not a review event");
       const token = await app.installationToken([name], PR_SCOPE);
       const path = `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`;
       try {
-        await app.call("POST", path, { token, body: { commit_id: commitId, event: "COMMENT", body, comments } });
+        await app.call("POST", path, { token, body: { commit_id: commitId, event, body, comments } });
         return { inline: comments.length };
       } catch (e) {
         if (e.status !== 422) throw e;
@@ -190,9 +197,145 @@ export function createEffects(env, deps = {}) {
         const text = [body, `Reviewed commit ${String(commitId).slice(0, 7)}.`, listed && `#### Findings (GitHub would not place them inline)\n\n${listed}`]
           .filter(Boolean)
           .join("\n\n");
-        await app.call("POST", path, { token, body: { event: "COMMENT", body: text } });
+        try {
+          await app.call("POST", path, { token, body: { event, body: text } });
+        } catch (e2) {
+          // Refused for the event itself (GitHub allows no decision on some
+          // pull requests): the findings are still posted, as a comment.
+          if (e2.status !== 422 || event === "COMMENT") throw e2;
+          await app.call("POST", path, { token, body: { event: "COMMENT", body: text } });
+        }
         return { inline: 0 };
       }
     },
+
+    // --- approvals, threads and the summary comment (CodeRabbit parity) ---
+
+    // An approval of exactly the commit that was checked: GitHub refuses it if
+    // that commit is no longer the PR's (the caller checks the head first).
+    // false when GitHub refuses it (422: the commit left the PR, or the App
+    // may not approve this pull request), rather than an error retried for ever.
+    async approve(repoFull, pr, { commitId, body }) {
+      const name = nameOf(repoFull);
+      if (!SHA.test(String(commitId))) throw new Error("approve takes a commit id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      try {
+        await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`, {
+          token,
+          body: { commit_id: commitId, event: "APPROVE", body: `${MARKER}\n${body}` },
+        });
+        return true;
+      } catch (e) {
+        if (e.status === 422) return false;
+        throw e;
+      }
+    },
+
+    // The App's own review decision as GitHub counts it: its latest review
+    // that approved, requested changes or was dismissed (comments change
+    // nothing). {state, commitId}, or null.
+    async reviewDecision(repoFull, pr, botLogin) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], PR_SCOPE);
+      let last = null;
+      for (let page = 1; page <= 10; page++) {
+        const list = await app.call("GET", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`, { token });
+        for (const r of list ?? []) {
+          if (r?.user?.type === "Bot" && r.user.login === botLogin && DECISIONS.has(r.state)) last = { state: r.state, commitId: r.commit_id ?? null };
+        }
+        if (!list || list.length < 100) break;
+      }
+      return last;
+    },
+
+    // The App's own review threads (the first comment is the App's), with the
+    // finding each is about. botLogin as GraphQL names it: the slug, no [bot].
+    async ownThreads(repoFull, pr, botLogin) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], THREAD_SCOPE);
+      const out = [];
+      let after = null;
+      for (let page = 0; page < 20; page++) {
+        const data = await graphql(token, THREADS_QUERY, { owner: ORG, name, pr: Number(pr), after });
+        const conn = data?.repository?.pullRequest?.reviewThreads;
+        for (const t of conn?.nodes ?? []) {
+          const c = t?.comments?.nodes?.[0];
+          if (!c || c.author?.login !== botLogin) continue;
+          out.push({
+            id: t.id, resolved: Boolean(t.isResolved), outdated: Boolean(t.isOutdated), path: t.path ?? null,
+            line: Number.isInteger(t.line) ? t.line : null, originalLine: Number.isInteger(t.originalLine) ? t.originalLine : null,
+            commentId: c.databaseId, body: String(c.body ?? ""), diffHunk: String(c.diffHunk ?? ""),
+            originalCommit: c.originalCommit?.oid ?? null, findingId: findingIdOf(c.body),
+            resolvedBy: t.resolvedBy?.login ?? null,
+          });
+        }
+        if (!conn?.pageInfo?.hasNextPage) return out;
+        after = conn.pageInfo.endCursor;
+      }
+      // Never a partial list: open threads past it would go unseen, and an
+      // approval follow. The caller fails and tries again later.
+      throw new Error("too many review threads to list");
+    },
+
+    async resolveThread(repoFull, threadId) {
+      const name = nameOf(repoFull);
+      if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(threadId))) throw new Error("not a thread id");
+      const token = await app.installationToken([name], THREAD_SCOPE);
+      const data = await graphql(token, RESOLVE_MUTATION, { id: threadId });
+      return data?.resolveReviewThread?.thread?.isResolved === true;
+    },
+
+    async editReviewComment(repoFull, commentId, body) {
+      const name = nameOf(repoFull);
+      if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      await app.call("PATCH", `/repos/${ORG}/${name}/pulls/comments/${commentId}`, { token, body: { body } });
+    },
+
+    // The one summary comment, edited in place on every review (CodeRabbit's
+    // walkthrough comment does the same). A new one only when it is missing.
+    // Returns its id.
+    async upsertSummary(repoFull, pr, commentId, body) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], PR_SCOPE);
+      const text = { body: `${MARKER}\n${body}` };
+      if (Number.isSafeInteger(commentId)) {
+        try {
+          await app.call("PATCH", `/repos/${ORG}/${name}/issues/comments/${commentId}`, { token, body: text });
+          return commentId;
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+      }
+      const made = await app.call("POST", `/repos/${ORG}/${name}/issues/${Number(pr)}/comments`, { token, body: text });
+      return made?.id ?? null;
+    },
   };
+
+  // GraphQL answers 200 with errors: those are failures too.
+  async function graphql(token, query, variables) {
+    const out = await app.call("POST", "/graphql", { token, body: { query, variables } });
+    if (Array.isArray(out?.errors) && out.errors.length) {
+      throw new Error(`GitHub GraphQL failed: ${String(out.errors[0]?.message ?? "error").slice(0, 120)}`);
+    }
+    return out?.data ?? null;
+  }
 }
+
+const SHA = /^[0-9a-f]{40}$/;
+const REVIEW_EVENTS = new Set(["COMMENT", "REQUEST_CHANGES", "APPROVE"]);
+const DECISIONS = new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
+const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line originalLine resolvedBy { login }
+          comments(first: 1) { nodes { databaseId author { login } body diffHunk originalCommit { oid } } }
+        }
+      }
+    }
+  }
+}`;
+const RESOLVE_MUTATION = `mutation($id: ID!) { resolveReviewThread(input: { threadId: $id }) { thread { isResolved } } }`;

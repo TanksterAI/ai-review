@@ -272,7 +272,7 @@ test("closing a PR with many stale jobs deletes them in chunks", async () => {
   const { obj, storage } = make();
   const deletes = [];
   const del = storage.delete.bind(storage);
-  storage.delete = async (k) => { if (Array.isArray(k)) { assert.ok(k.length <= 128); deletes.push(k.length); } return del(k); };
+  storage.delete = async (k) => { if (Array.isArray(k)) { assert.ok(k.length <= 128); if (k.every((x) => x.startsWith("job:"))) deletes.push(k.length); } return del(k); };
   for (let i = 0; i < 300; i++) await storage.put(`job:x${i}`, { id: `x${i}`, createdAt: NOW });
   await obj.onEvent({ delivery: "1", ev: { ...review(), kind: "closed" } });
   assert.equal((await storage.list({ prefix: "job:" })).size, 0);

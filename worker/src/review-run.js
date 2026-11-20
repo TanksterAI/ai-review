@@ -17,7 +17,15 @@
 //            chain of free models, rotated so batches running together use
 //            different free quotas; Claude on the plan's credit is last
 //   verify   ground and verify one batch a step (every finding, TAN-299)
-//   post     one review for the whole pull request, and the commit status
+//   post     one review for the whole pull request, only when it has
+//            findings: "Changes requested", as CodeRabbit's Automatic
+//            Approvals do. A clean review posts no review.
+//   threads  the App's own open threads (and findings it could only list in
+//            a review's body) from earlier commits: those the new commits
+//            addressed are marked "Addressed in commit …" and resolved
+//            (addressed.js)
+//   summary  the one summary comment, edited in place, and the commit status.
+//            The PR's object then decides whether to approve (pr-state.js).
 //
 // Nothing waits while any provider can work. A batch waits only when every
 // drafter (or every verifier) is out of quota, and then only until the first
@@ -35,6 +43,8 @@ import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
+import { addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
+import { DEFAULT_SLUG } from "./webhook.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
 // under runmeta:<id>, so finding the run in progress never loads its data.
@@ -75,6 +85,43 @@ const fileKey = (id, i) => `${RUN}${id}:file:${String(i).padStart(5, "0")}`;
 const pieceKey = (id, i, k) => `${fileKey(id, i)}:p${k}`;
 const batchKey = (id, i) => `${RUN}${id}:batch:${String(i).padStart(4, "0")}`;
 const planKey = (id) => `${RUN}${id}:plan`;
+// Kept by the PR's object across runs: the summary comment's id, and the
+// findings a review could only list in its body (they have no thread).
+export const SUMMARY_KEY = "summaryComment";
+// One key a finding (OPEN_FINDINGS + its id), so none is ever dropped for
+// space: each stays until it is addressed or cleared.
+export const OPEN_FINDINGS = "openfinding:";
+// One key a thread, so no mark or acceptance is ever evicted to make room.
+// A thread a person reopened by hand (pr-state.js) keeps its mark (REOPENED +
+// thread id → mark number) until someone with write access resolves it or the
+// PR merges: the reviewer never resolves it again; it is that person's to close.
+export const REOPENED = "reopened:";
+// A thread resolved by someone without write access that a later review
+// found fixed, or that a writer's resolve/approve vouched for (ACCEPTED +
+// thread id): it no longer holds back approval (pr-state.js decide). It is
+// kept until the thread is reopened or the PR merges.
+export const ACCEPTED = "accepted:";
+export async function reopenMark(storage, threadId) {
+  return threadId ? storage.get(`${REOPENED}${threadId}`) : undefined;
+}
+async function idsUnder(storage, prefix) {
+  return new Set([...(await storage.list({ prefix })).keys()].map((k) => k.slice(prefix.length)));
+}
+export const reopenedSet = (storage) => idsUnder(storage, REOPENED);
+export const acceptedSet = (storage) => idsUnder(storage, ACCEPTED);
+export async function acceptThreads(storage, ids) {
+  for (let i = 0; i < ids.length; i += 128) await storage.put(Object.fromEntries(ids.slice(i, i + 128).map((id) => [`${ACCEPTED}${id}`, true])));
+}
+export async function clearPrefix(storage, prefix) {
+  const keys = [...(await storage.list({ prefix })).keys()];
+  for (let i = 0; i < keys.length; i += 128) await storage.delete(keys.slice(i, i + 128));
+}
+const threadsKey = (id) => `${RUN}${id}:threads`;
+const summaryKey = (id) => `${RUN}${id}:summary`;
+// GitHub calls one threads step may make (each counts as a subrequest).
+const COMPARES_PER_STEP = 6;
+const APPLIES_PER_STEP = 10;
+const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
 export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}`;
 
@@ -192,6 +239,8 @@ export async function stepRun(ctx, id) {
     if (run.stage === "draft") return await stageDraft(counted, run, save);
     if (run.stage === "verify") return await stageVerify(counted, run, save);
     if (run.stage === "post") return await stagePost(counted, run, save);
+    if (run.stage === "threads") return await stageThreads(counted, run, save);
+    if (run.stage === "summary") return await stageSummary(counted, run, save);
   } catch (e) {
     if (e instanceof Gone) {
       await dropRun(storage, id);
@@ -401,8 +450,15 @@ async function stagePlan(ctx, run, save) {
   for (const [i, parts] of batches.entries()) await ctx.storage.put(batchKey(run.id, i), { parts, status: "pending", draftTries: 0, verifyTries: 0, waitUntil: 0 });
   run.batches = batches.length;
   if (!batches.length && !plan.uncovered.length) {
-    // Nothing reviewable at all: a pass.
-    return finish(ctx, run, save, { state: "success", description: "No reviewable changes (deleted, binary or generated files only).", reviewedSha: run.headSha });
+    // Nothing reviewable at all: a pass. Earlier threads are still checked (a
+    // commit that deletes a file can address them), then the summary.
+    await ctx.storage.put(summaryKey(run.id), { summary: "No reviewable changes (deleted, binary or generated files only).", about: "", shown: 0, complete: true, none: true, since: run.since ?? null, covered: 0, reviewable: 0 });
+    run.result = { complete: true, shown: 0, covered: 0, reviewable: 0, none: true };
+    run.posted = { inline: 0, none: true };
+    await ctx.env.LEDGER?.put(doneKeyOf(run), utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
+    run.stage = "threads";
+    await save(run);
+    return ctx.deps.now();
   }
   if (!batches.length) {
     // Reviewable files, none of which could be taken: the review says so.
@@ -638,30 +694,279 @@ async function stagePost(ctx, run, save) {
     const lines = await ctx.fx.prLines(run.repo.full, run.pr, comments.map((c) => c.path));
     const { kept, off } = placeComments(comments, review.singleLine, lines);
     comments = kept;
+    review.off = off;
     if (off.length) text += `\n\n#### Also noted (on lines no longer in this pull request's diff)\n\n${off.map((c) => `- \`${codeSpan(c.path)}:${c.line}\`: ${titleLine(c.body)}`).join("\n")}`;
     text += `\n\n_Incremental review: commits after \`${run.since.slice(0, 7)}\`._`;
   }
-  // Posted once: a step retried after the post (a failed write below) does
-  // not post the review again.
+  // Actionable findings request changes and hold back approval; a review
+  // with only nitpicks is a comment, and they never block (as CodeRabbit's).
+  const shownCount = review.shown ?? review.blocking;
+  const blocking = review.blocking;
+  // Posted once, and only with findings: a step retried after the post (a
+  // failed write below) does not post the review again. A review with no
+  // findings posts nothing (CodeRabbit does not either); the summary comment
+  // and the commit status say how it went.
   let posted = run.posted ?? null;
-  if (!posted) {
-    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments });
+  if (!posted && shownCount > 0) {
+    posted = await ctx.fx.postReview(run.repo.full, run.pr, { commitId: run.headSha, body: text, comments, event: blocking > 0 ? "REQUEST_CHANGES" : "COMMENT" });
     run.posted = { inline: posted?.inline ?? 0 };
     await save(run);
   }
+  // Outside the post's guard: a step retried after the post still keeps them
+  // (keeping one twice changes nothing).
+  if (blocking > 0 && run.posted && !run.posted.none) {
+    // Actionable findings with no thread of their own (outside the diff,
+    // listed in the body; or GitHub would not place them) are kept, so they
+    // too must be addressed before approval. One that names no file
+    // cannot be checked against later changes, so it is not kept: it would
+    // block approval with nothing to resolve.
+    const inBody = [
+      ...review.listed,
+      // GitHub's refusal (422) moves every inline comment to the body; those
+      // off the diff are in the body either way.
+      // (Nitpicks among them never block.)
+      ...[...(run.posted.inline < comments.length ? comments : []), ...(review.off ?? [])]
+        .filter((c) => !nitpickFinding(c.body))
+        .map((c) => ({ id: findingIdOf(c.body), path: c.path, line: c.line, severe: severeFinding(c.body), text: c.body })),
+    ].filter((x) => x.id && x.path);
+    if (inBody.length) {
+      await keepOpenFindings(ctx.storage, inBody.map((x) => ({
+        id: x.id, path: x.path, line: x.line ?? null, text: String(x.text).slice(0, 2500), sha: run.headSha,
+        severe: x.severe ?? (x.severity === "critical" || x.severity === "major" || x.category === "security"),
+      })));
+    }
+  }
+  if (!run.posted) run.posted = { inline: 0, none: true };
   const complete = cov.complete;
   // Only a complete review marks the commit done and moves the PR's last
   // reviewed commit on: after an incomplete one, the next review starts from
   // the last complete one, so nothing it missed is passed over.
   if (complete) await ctx.env.LEDGER?.put(doneKeyOf(run), utcDay(ctx.deps.now()), { expirationTtl: 30 * 24 * 3600 });
-  const shownCount = merged.shown.inline.length + merged.shown.general.length;
-  ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: posted?.inline ?? 0, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
+  ctx.deps.log?.({ ev: "run_reviewed", repository: run.repo.full, pr: run.pr, passes: batches.length, covered: cov.covered, reviewable: cov.reviewable, shown: shownCount, hidden: merged.hidden.length, inline: run.posted.inline, neurons: Math.round(run.spend.neurons), usd: Number(run.spend.usd.toFixed(5)) });
+  // What the summary comment shows, once the threads are checked.
+  await ctx.storage.put(summaryKey(run.id), {
+    summary: review.summary, about: review.about, shown: shownCount, actionable: blocking, complete, since: run.since ?? null,
+    covered: cov.covered, reviewable: cov.reviewable,
+  });
+  run.result = { complete, shown: shownCount, covered: cov.covered, reviewable: cov.reviewable };
+  run.stage = "threads";
+  await save(run);
+  return ctx.deps.now();
+}
+
+// The PR's open body-only findings: kept, listed, dropped one by one, and
+// cleared. Keeping one twice changes nothing, so a retried step is safe.
+// A finding's occurrence: its id where it was reported. One finding id can be
+// reported at two places, and fixing one must not clear the other.
+export const occurrenceKey = (x) => `${x.id}@${x.path ?? ""}:${Number.isInteger(x.line) ? x.line : ""}`;
+export async function keepOpenFindings(storage, items) {
+  for (const x of items) {
+    if (!x.id) continue;
+    const key = x.key ?? occurrenceKey(x);
+    const k = `${OPEN_FINDINGS}${key}`;
+    if (!(await storage.get(k))) await storage.put(k, { ...x, key });
+  }
+}
+export async function listOpenFindings(storage) {
+  return [...(await storage.list({ prefix: OPEN_FINDINGS })).values()];
+}
+export async function dropOpenFinding(storage, key) {
+  await storage.delete(`${OPEN_FINDINGS}${key}`);
+}
+export async function clearOpenFindings(storage) {
+  await clearPrefix(storage, OPEN_FINDINGS);
+}
+
+// --- threads: earlier findings the new commits addressed ------------------------
+//
+// One record (threadsKey) carries the work across steps: the items to check,
+// then the diff near each, then the model's verdicts, then the resolving.
+// Each step makes only a few GitHub calls and at most one model call.
+
+async function stageThreads(ctx, run, save) {
+  const fx = ctx.fx;
+  // Every step ends with save(run): stepRun counts a step as failed until it
+  // is saved, and six in a row give the run up.
+  const again = async (th) => {
+    await ctx.storage.put(threadsKey(run.id), th);
+    await save(run);
+    return ctx.deps.now();
+  };
+  const done = async (th) => {
+    if (th) await ctx.storage.put(threadsKey(run.id), th);
+    run.stage = "summary";
+    await save(run);
+    return ctx.deps.now();
+  };
+  if (typeof fx.ownThreads !== "function") return done(null);
+  let th = await ctx.storage.get(threadsKey(run.id));
+  if (!th) {
+    const login = ctx.slug ?? DEFAULT_SLUG;
+    const threads = await fx.ownThreads(run.repo.full, run.pr, login);
+    const reopened = await reopenedSet(ctx.storage);
+    const accepted = await acceptedSet(ctx.storage);
+    // A thread resolved by someone without write access still holds back
+    // approval until a review finds it fixed (it is then accepted) or a
+    // writer resolves it.
+    const writers = new Map();
+    const unendorsed = async (t) => {
+      if (!t.resolved || !t.resolvedBy || t.resolvedBy === login || accepted.has(t.id) || typeof fx.canWrite !== "function") return false;
+      if (!writers.has(t.resolvedBy)) writers.set(t.resolvedBy, await fx.canWrite(run.repo.full, t.resolvedBy));
+      return !writers.get(t.resolvedBy);
+    };
+    const items = [];
+    let earlier = 0;
+    for (const t of threads) {
+      // This review's own threads were written at this head: nothing since.
+      if (!t.originalCommit || t.originalCommit === run.headSha) continue;
+      const stranger = await unendorsed(t);
+      if (t.resolved && !stranger) continue;
+      earlier++;
+      if (!t.path || reopened.has(t.id)) continue;
+      // The item's id is the thread's own: one finding can have two threads.
+      items.push({ kind: stranger ? "accept" : "thread", id: `t:${t.id}`, threadId: t.id, commentId: t.commentId, body: t.body, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: severeFinding(t.body), state: "new" });
+    }
+    const inBody = (await listOpenFindings(ctx.storage)).filter((f) => f.sha && f.sha !== run.headSha);
+    for (const f of inBody) {
+      if (!f.path) continue;
+      const key = f.key ?? occurrenceKey(f);
+      items.push({ kind: "body", id: `b:${key}`, findingKey: key, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
+    }
+    th = { items, open: earlier + inBody.length, resolved: 0, unchecked: null };
+    if (!items.length) return done(th);
+    return again(th);
+  }
+
+  // The diffs since each finding's commit, a few commits a step.
+  const pending = [...new Set(th.items.filter((x) => x.state === "new").map((x) => x.since))];
+  if (pending.length) {
+    for (const commit of pending.slice(0, COMPARES_PER_STEP)) {
+      let cmp = null;
+      try {
+        cmp = await fx.compare(run.repo.full, commit, run.headSha);
+      } catch (e) {
+        if (e.status !== 404) throw e;
+      }
+      const files = Array.isArray(cmp?.files) ? cmp.files : [];
+      // Only a straight line of commits says what changed since: after a
+      // force-push the finding's commit is not behind the head, and its diff
+      // would mix in what the rebase moved. Those are left to a person.
+      const straight = cmp?.status === "ahead" || cmp?.status === "identical";
+      for (const x of th.items) {
+        if (x.state !== "new" || x.since !== commit) continue;
+        if (!straight) { x.state = "open"; continue; }
+        const f = files.find((y) => y.filename === x.path || y.previous_filename === x.path);
+        if (!f) { x.state = files.length >= 300 ? "open" : "untouched"; continue; }
+        if (f.status === "removed") { x.state = "fixed"; continue; }
+        if (typeof f.patch !== "string") { x.state = "open"; continue; }
+        const near = nearHunks(f.patch, x.line);
+        if (!near.touched) { x.state = "untouched"; continue; }
+        // Cut to fit: the model would judge part of the change. A person does.
+        if (near.cut) { x.state = "open"; continue; }
+        x.near = near.text;
+        x.state = "judge";
+      }
+    }
+    return again(th);
+  }
+
+  // One model call a step, for as many items as fit.
+  const toJudge = th.items.filter((x) => x.state === "judge");
+  if (toJudge.length) {
+    const batch = [];
+    let chars = 0;
+    for (const x of toJudge) {
+      const size = String(x.body).length + String(x.original).length + String(x.near).length + 200;
+      if (batch.length && chars + size > JUDGE_CHARS) break;
+      batch.push(x);
+      chars += size;
+    }
+    const out = await judgeAddressed({
+      items: batch.map((x) => ({ id: x.id, path: x.path, finding: x.body, original: x.original, since: x.near, severe: x.severe })),
+      env: ctx.env, cfg: ctx.cfg, deps: ctx.deps,
+    });
+    run.spend.neurons += out.neurons ?? 0;
+    run.spend.usd += out.usd ?? 0;
+    if (out.outcome.kind !== "ok") {
+      // No model could answer: every item still to judge stays open.
+      th.unchecked = out.outcome.reason ?? "no model could check them";
+      for (const x of toJudge) x.state = "open";
+    } else {
+      for (const x of batch) x.state = out.results.get(x.id) === "fixed" ? "fixed" : "open";
+    }
+    for (const x of batch) delete x.near;
+    return again(th);
+  }
+
+  // Resolve what was fixed, a few a step: the note first, then the thread,
+  // so a thread is never resolved without saying why.
+  const fixed = th.items.filter((x) => x.state === "fixed");
+  // Read again for each thread, and again after each GitHub call: a thread
+  // reopened by hand while this review ran (a webhook can land while a call
+  // is pending) is that person's, whatever the model said.
+  const reopenedNow = async (id) => (await reopenMark(ctx.storage, id)) !== undefined;
+  for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
+    if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+    if (x.kind === "thread") {
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+      await fx.resolveThread(run.repo.full, x.threadId);
+    } else if (x.kind === "accept") {
+      // Already resolved (by someone without write access): the note, and
+      // it no longer holds back approval.
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+      await acceptThreads(ctx.storage, [x.threadId]);
+    } else {
+      await dropOpenFinding(ctx.storage, x.findingKey);
+    }
+    th.resolved++;
+    x.state = "resolved";
+  }
+  if (fixed.length > APPLIES_PER_STEP) return again(th);
+  return done(th);
+}
+
+// --- summary: the one comment, edited in place ------------------------------
+
+export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, threads, none = false }) {
+  const lines = ["### Tankster AI Review", ""];
+  lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
+  if (!complete || none) lines.push(summary, "");
+  else if (actionable) lines.push(`Actionable comments posted: ${actionable}. ${summary}`, "");
+  // Nitpicks alone: shown in the review, never blocking (as CodeRabbit's).
+  else if (shown) lines.push(`No actionable comments were generated in the latest review. ${summary} Nitpicks do not block approval.`, "");
+  else lines.push("No actionable comments were generated in the latest review. 🎉", "");
+  if (threads) {
+    const parts = [];
+    if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);
+    const stillOpen = Math.max(0, threads.open - threads.resolved);
+    if (stillOpen) parts.push(`${stillOpen} still open`);
+    if (parts.length) lines.push(`Earlier findings: ${parts.join("; ")}.`, "");
+    if (threads.unchecked) lines.push(`Some open threads could not be checked this time (${threads.unchecked}); they stay open.`, "");
+  }
+  if (about) lines.push(about);
+  return lines.join("\n").trimEnd();
+}
+
+async function stageSummary(ctx, run, save) {
+  const s = (await ctx.storage.get(summaryKey(run.id))) ?? {};
+  const th = await ctx.storage.get(threadsKey(run.id));
+  if (!run.summaryPosted && typeof ctx.fx.upsertSummary === "function") {
+    const id = await ctx.fx.upsertSummary(run.repo.full, run.pr, (await ctx.storage.get(SUMMARY_KEY)) ?? null, summaryText({ headSha: run.headSha, ...s, threads: th }));
+    if (Number.isSafeInteger(id)) await ctx.storage.put(SUMMARY_KEY, id);
+    run.summaryPosted = true;
+    await save(run);
+  }
+  const r = run.result ?? { complete: false, shown: 0, covered: 0, reviewable: 0 };
   return finish(ctx, run, save, {
-    state: complete ? "success" : "failure",
-    description: complete
-      ? `Reviewed all ${plural(cov.reviewable, "file")} (100%): ${plural(shownCount, "confirmed finding")}.`
-      : `Incomplete: ${cov.covered} of ${cov.reviewable} files reviewed. Comment "review" to try again.`,
-    posted: true,
-    reviewedSha: complete ? run.headSha : null,
+    state: r.complete ? "success" : "failure",
+    description: r.none
+      ? "No reviewable changes (deleted, binary or generated files only)."
+      : r.complete
+      ? `Reviewed all ${plural(r.reviewable, "file")} (100%): ${plural(r.shown, "confirmed finding")}.`
+      : `Incomplete: ${r.covered} of ${r.reviewable} files reviewed. Comment "review" to try again.`,
+    posted: Boolean(run.posted && !run.posted.none),
+    reviewedSha: r.complete ? run.headSha : null,
   });
 }

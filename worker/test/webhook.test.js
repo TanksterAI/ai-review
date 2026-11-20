@@ -105,3 +105,25 @@ test("an outsider's association is passed on as a hint only", () => {
 });
 
 test("prKey", () => assert.equal(prKey("TanksterAI/x", 3), "TanksterAI/x#3"));
+
+// pull_request_review_thread: only the App's own threads, and never its own doing.
+test("a resolved or reopened thread of the App's own is an event; anyone else's, or the App's own resolving, is not", () => {
+  const base = (over = {}) => ({
+    action: "resolved",
+    repository: { full_name: "TanksterAI/x", name: "x", owner: { id: 259206056 } },
+    sender: { login: "rishitank", type: "User" },
+    pull_request: { number: 7 },
+    thread: { node_id: "PRRT_1", comments: [{ user: { login: "tankster-ai-review[bot]", type: "Bot" } }] },
+    ...over,
+  });
+  const ev = normalise("pull_request_review_thread", base(), { ownerId: "259206056" });
+  assert.deepEqual(ev, { kind: "thread", action: "resolved", repo: { full: "TanksterAI/x", name: "x", ownerId: "259206056", private: false }, pr: 7, sender: { login: "rishitank", bot: false }, threadId: "PRRT_1" });
+  assert.equal(normalise("pull_request_review_thread", base({ action: "unresolved" }), { ownerId: "259206056" }).action, "unresolved");
+  assert.equal(normalise("pull_request_review_thread", base({ thread: { node_id: "PRRT_2", comments: [{ user: { login: "coderabbitai[bot]", type: "Bot" } }] } }), { ownerId: "259206056" }), null);
+  assert.equal(normalise("pull_request_review_thread", base({ sender: { login: "tankster-ai-review[bot]", type: "Bot" } }), { ownerId: "259206056" }), null);
+  assert.equal(normalise("pull_request_review_thread", base({ action: "edited" }), { ownerId: "259206056" }), null);
+  assert.equal(normalise("pull_request_review_thread", base({ pull_request: {} }), { ownerId: "259206056" }), null);
+  // Another slug: its own login.
+  const other = base({ thread: { node_id: "PRRT_1", comments: [{ user: { login: "my-app[bot]", type: "Bot" } }] } });
+  assert.equal(normalise("pull_request_review_thread", other, { ownerId: "259206056", slug: "my-app" }).kind, "thread");
+});

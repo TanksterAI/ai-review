@@ -609,7 +609,10 @@ export function codeSpan(text) {
 // collapsed section, assertive puts them inline, quiet leaves them out.
 export const PROFILES = ["chill", "assertive", "quiet"];
 
-const minorish = (f) => f.type === "nitpick" || f.severity === "trivial" || f.severity === "info";
+// A critical, major or security finding is never a nitpick, whatever type the
+// drafter gave it: it is placed, and blocks, as an issue.
+const minorish = (f) => !(f.severity === "critical" || f.severity === "major" || f.category === "security")
+  && (f.type === "nitpick" || f.severity === "trivial" || f.severity === "info");
 const at = (f) => (f.path ? `\`${codeSpan(f.path)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general");
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const modelOf = (id) => String(id).slice(String(id).indexOf(":") + 1);
@@ -710,7 +713,7 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     : "";
   const summary = incomplete + workerSummary(confirmed, prepared, verification);
   const block = findingsBlock(classified, meta.headSha, { hidden, inlineIds: new Set(inline.map((f) => f.id)), included: prepared.included, coverage: cov });
-  const lines = [MARKER, block, "### AI review (advisory)", "", summary, ""];
+  const lines = [MARKER, block, "### Tankster AI Review", "", summary, ""];
   const total = inline.length + nitpicks.length + outside.length;
   const below = nitpicks.length + outside.length;
   const quiet = left ? ` ${plural(left, "nitpick")} left out (quiet profile).` : "";
@@ -762,6 +765,7 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     const gate = cov.complete ? "" : " The commit status stays failing until every file is reviewed.";
     reviewedLine = `- Coverage: ${cov.covered} of ${plural(cov.reviewable, "reviewable file")} (${pct}%), ${prepared.chars.toLocaleString("en-GB")} characters of diff${passes}.${notReviewable}${notCovered}${gate}`;
   }
+  const aboutAt = lines.length;
   lines.push(
     "<details><summary>About this review</summary>",
     "",
@@ -769,7 +773,9 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
     ...(verification ? [verificationLine(confirmed, hidden, verification)] : []),
     reviewedLine,
     meta.costLine ?? `- Cost: ${meta.neurons.toFixed(0)} neurons; ${Math.max(0, meta.cap - meta.spent).toFixed(0)} of today's ${meta.cap} left for reviews.`,
-    "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement.",
+    meta.advisory
+      ? "- Advisory only: it never approves or blocks. A second opinion beside the Claude review, not a replacement."
+      : "- Its decision follows its findings, as CodeRabbit's Automatic Approvals do: changes requested while any is open, approved once its threads are resolved and the latest commit is reviewed in full. A second opinion beside the Claude review, not a replacement.",
     meta.again ?? "- Review again: add the `ai-review` label, or run the ai-review workflow with this PR's number.",
     "- Suggestions can be committed from the comment; check them first, like any change. Each finding also has a prompt for AI coding agents, and an id that stays the same while its title does.",
     "",
@@ -778,7 +784,14 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   let body = lines.join("\n");
   // A last bound: what is cut is the end of the text, never the block.
   if (body.length > MAX_BODY_CHARS) body = `${body.slice(0, MAX_BODY_CHARS - 40)}\n\n…(cut to GitHub's size limit)`;
-  return { body, comments, singleLine };
+  // For the summary comment: the Worker's own summary line and the details.
+  // blocking: the actionable findings the review shows (inline or outside
+  // the diff); nitpicks are shown but, as CodeRabbit's, never block, and
+  // those the quiet profile left out are not shown at all. listed: the
+  // actionable ones shown only in the body, which have no thread.
+  const actionable = [...inline, ...outside].filter((f) => !minorish(f));
+  const inBody = outside.filter((f) => !minorish(f)).map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
+  return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n"), shown: total, blocking: actionable.length, listed: inBody };
 }
 
 // A comment's first line (its labels and title), for lists where the whole
