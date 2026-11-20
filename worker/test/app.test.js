@@ -308,7 +308,7 @@ test("incremental: a suggestion's whole range must still be in the PR's diff", a
   }, { run_id: "9000" }), e, deps(e));
   const last = e.fx.calls.filter((c) => c[0] === "postReview")[2][3];
   assert.equal(last.comments.length, 0);
-  assert.match(last.body, /Also noted[\s\S]*- `src\/a\.js:3`: \*\*Major \(bug\): Range\*\*\n/);
+  assert.match(last.body, /Also noted[\s\S]*- `src\/a\.js:3`: \*\*Major · Functional Correctness: Range\*\*\n/);
   assert.doesNotMatch(last.body.split("Also noted")[1], /suggestion/);
 });
 

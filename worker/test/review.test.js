@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   annotatePatch, prepareFiles, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP, codeSpan,
-  findingId, findingsBlock, parseFindingsBlock, MAX_SUGGESTION_LINES, MAX_SUGGESTION_CHARS, MAX_PROMPT_CHARS, MAX_BLOCK_CHARS, MAX_BODY_CHARS,
+  findingId, findingsBlock, parseFindingsBlock, MAX_SUGGESTION_LINES, MAX_SUGGESTION_CHARS, MAX_PROMPT_CHARS, MAX_BLOCK_CHARS, MAX_BODY_CHARS, titleLine,
 } from "../src/review.js";
 import { PATCH, responsesResult } from "./helpers.js";
 
@@ -302,7 +302,7 @@ test("renderReview builds a COMMENT body with the marker and RIGHT-side comments
   assert.match(r.body, /Not reviewed \(1\): `yarn\.lock`/);
   assert.match(r.body, /700 neurons; 4600 of today's 6000 left/);
   const id = findingId("src/a.js", "bug", "Division by zero");
-  assert.deepEqual(r.comments, [{ path: "src/a.js", line: 3, side: "RIGHT", body: `**Major (bug): Division by zero**\n<sub>Potential issue · finding \`${id}\`</sub>\n\nGuard it.` }]);
+  assert.deepEqual(r.comments, [{ path: "src/a.js", line: 3, side: "RIGHT", body: `**🟠 Major** · **Functional Correctness**\n<sub>Potential issue · finding \`${id}\`</sub>\n\n**Division by zero**\n\nGuard it.` }]);
   assert.match(r.body, new RegExp(`\\(\`src/nope\\.js:1\`, finding \`${findingId("src/nope.js", "tests", "General")}\`\\)`));
   const clean = renderReview({ answer: { summary: "Fine." }, classified: { inline: [], general: [] }, prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } });
   assert.match(clean.body, /No material problems found/);
@@ -614,13 +614,26 @@ test("the Worker's verbatim blocks come before any multi-line model text", () =>
   }] };
   const body = renderReview({ answer, classified: classifyFindings(answer, p.commentable, p.lineText), prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } }).comments[0].body;
   const lines = body.split("\n");
-  // Title on one line, then the id, then the suggestion and the prompt, then the body.
-  assert.equal(lines[0], "**Minor (bug): x ```**");
+  // Header, then the id, then the title on one line, then the suggestion and the prompt, then the body.
+  assert.equal(lines[0], "**🟡 Minor** · **Functional Correctness**");
   assert.match(lines[1], /^<sub>Potential issue · finding `[0-9a-f]{8}`<\/sub>$/);
+  assert.equal(lines[3], "**x ```**");
   const sug = body.indexOf("````suggestion");
   const prompt = body.indexOf("Prompt for AI agents");
   const own = body.indexOf("Note:");
   assert.ok(sug > 0 && sug < prompt && prompt < own, body);
+});
+
+test("effort: only a model's quick/moderate/large counts, and a quick win shows as CodeRabbit's label; ids keep the old key", () => {
+  const p = shown();
+  const mk = (effort) => ({ summary: "s", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "security", effort, title: "Leak", body: "b" }] });
+  const body = (effort) => renderReview({ answer: mk(effort), classified: classifyFindings(mk(effort), p.commentable, p.lineText), prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } }).comments[0].body;
+  assert.equal(body("quick").split("\n")[0], "**🟠 Major** · **Security & Privacy** · **Quick win**");
+  assert.equal(body("large").split("\n")[0], "**🟠 Major** · **Security & Privacy**");
+  assert.equal(body("bogus").split("\n")[0], "**🟠 Major** · **Security & Privacy**");
+  // The id hashes the internal key, not the label.
+  assert.match(body("quick"), new RegExp(findingId("src/a.js", "security", "Leak")));
+  assert.equal(titleLine(body("quick")), "**Major · Security & Privacy: Leak**");
 });
 
 test("character references are defused, so none can spell an info string", () => {
@@ -639,11 +652,13 @@ test("a title is inline text: no closer, no line break, so it cannot open a fenc
     assert.doesNotMatch(c.inline[0].title, /\n/, title);
     const body = renderReview({ answer, classified: c, prepared: p, meta: { model: "m", neurons: 1, spent: 1, cap: 10 } }).comments[0].body;
     const lines = body.split("\n");
-    // Line 0 is the title, line 1 the id, line 2 blank, line 3 the Worker's fence.
-    assert.match(lines[0], /^\*\*Minor \(bug\): .*\*\*$/, title);
+    // Line 0 is the header, 1 the id, 3 the title, 4 blank, 5 the Worker's fence.
+    assert.match(lines[0], /^\*\*🟡 Minor\*\* · \*\*Functional Correctness\*\*$/, title);
     assert.match(lines[1], /^<sub>/);
     assert.equal(lines[2], "");
-    assert.equal(lines[3], "````suggestion");
+    assert.match(lines[3], /^\*\*.*\*\*$/, title);
+    assert.equal(lines[4], "");
+    assert.equal(lines[5], "````suggestion");
   }
   assert.equal(sanitize("```x\ny", 100, { inline: true }), "```x y");
   assert.equal(sanitize("a\r\n\n b", 100, { inline: true }), "a b");
@@ -691,14 +706,14 @@ test("chill: nitpicks, trivial and info findings go in a collapsed section; the 
   const r = render("chill");
   assert.deepEqual(r.comments.map((c) => c.line), [3]);
   assert.match(r.body, /6 findings: 1 inline, 5 below\./);
-  assert.match(r.body, /\n<details>\n<summary>🧹 Nitpick comments \(3\)<\/summary>\n\n- \*\*Minor \(bug\): Polish\*\* \(`src\/a\.js:1`, finding `aaaaaaa2`\)  \n/);
+  assert.match(r.body, /\n<details>\n<summary>🧹 Nitpick comments \(3\)<\/summary>\n\n- \*\*Minor · Functional Correctness: Polish\*\* \(`src\/a\.js:1`, finding `aaaaaaa2`\)  \n/);
   // Its prompt in a fenced text block, indented into the list item; no suggestion block.
   assert.match(r.body, /\n  Prompt for AI agents:\n  ```text\n  In src\/a\.js around line 1: Rename it\.\n  ```\n\n  b\n/);
   const nits = r.body.split("🧹 Nitpick comments")[1].split("</details>")[0];
   assert.doesNotMatch(nits, /suggestion/);
-  assert.match(nits, /\*\*Trivial \(bug\): Tiny\*\* \(`src\/a\.js:2`, finding `aaaaaaa3`\)/);
-  assert.match(nits, /\*\*Info \(bug\): Note\*\*/);
-  assert.match(r.body, /\n<details>\n<summary>Outside diff range comments \(2\)<\/summary>\n\n- \*\*Minor \(bug\): Elsewhere\*\* \(`src\/a\.js:9`, finding `aaaaaaa5`\)  \n  b\n/);
+  assert.match(nits, /\*\*Trivial · Functional Correctness: Tiny\*\* \(`src\/a\.js:2`, finding `aaaaaaa3`\)/);
+  assert.match(nits, /\*\*Info · Functional Correctness: Note\*\*/);
+  assert.match(r.body, /\n<details>\n<summary>Outside diff range comments \(2\)<\/summary>\n\n- \*\*Minor · Functional Correctness: Elsewhere\*\* \(`src\/a\.js:9`, finding `aaaaaaa5`\)  \n  b\n/);
   // The block records where each finding went.
   const v = parseFindingsBlock(r.body);
   assert.deepEqual(v.findings.filter((f) => f.inline).map((f) => f.id), ["aaaaaaa1"]);

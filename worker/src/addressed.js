@@ -14,6 +14,7 @@
 //   - Anything else (no model could answer, the diff is gone or cut, the
 //     answer is unclear) leaves the thread open for a person to resolve.
 
+import { parseHeader } from "./labels.js";
 import { ProviderError, createProviders, parseChain } from "./providers.js";
 import { fence, parseAnswer } from "./review.js";
 
@@ -129,8 +130,8 @@ export function readResults(text, ids) {
 // From our comment's label line ("**Major (security): …**"): whether a
 // finding needs two models to agree it is fixed.
 export function severeFinding(body) {
-  const first = String(body ?? "").split("\n")[0];
-  return /^\*\*(Critical|Major) \(/.test(first) || /^\*\*\w+ \(security\):/.test(first);
+  const h = parseHeader(body);
+  return Boolean(h) && (h.severity === "critical" || h.severity === "major" || h.category === "security");
 }
 
 /**
@@ -139,10 +140,11 @@ export function severeFinding(body) {
  * back approval.
  */
 export function nitpickFinding(body) {
-  const [first = "", second = ""] = String(body ?? "").split("\n");
+  const second = String(body ?? "").split("\n")[1] ?? "";
+  const h = parseHeader(body);
   // Never a critical, major or security finding (review.js minorish).
-  if (/^\*\*(Critical|Major) \(/.test(first) || /^\*\*\w+ \(security\):/.test(first)) return false;
-  return /^\*\*(Trivial|Info) \(/.test(first) || /^<sub>Nitpick · finding `/.test(second);
+  if (!h || severeFinding(body)) return false;
+  return h.severity === "trivial" || h.severity === "info" || /^<sub>Nitpick · finding `/.test(second);
 }
 
 /** The comment's body with CodeRabbit's note, added once. */
