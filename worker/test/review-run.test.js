@@ -187,8 +187,8 @@ test("only when every drafter is out does a batch wait, and the status says so; 
     if (at > s.getNow()) break;
   }
   assert.ok(at > s.getNow(), "the run waits");
-  assert.match(s.github.statuses.at(-1).description, /^Waiting for a model provider to reset at \d\d:\d\d UTC; 0 of 18 files reviewed so far\.$/);
-  assert.equal(s.github.statuses.at(-1).state, "pending");
+  assert.match(s.github.statuses.at(-1).description, /^Review delayed: waiting for a model provider to reset at \d\d:\d\d UTC; 0 of 18 files reviewed so far\.$/);
+  assert.equal(s.github.statuses.at(-1).state, "success", "neutral, as CodeRabbit's rate-limited run");
   assert.equal(s.github.posted.length, 0);
   // The providers reset; the review carries on from where it was.
   out = false;

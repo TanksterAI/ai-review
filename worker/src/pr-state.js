@@ -636,7 +636,20 @@ export class PrState {
     // kept fresh meanwhile.
     const cap = held.retryAt > this.now() ? { ok: false, retryAt: held.retryAt } : await this.capacityNow(held.chars, held.skip);
     if (!cap.ok) {
-      await this.ctx.storage.put(`job:${jobId}`, { ...held, createdAt: this.now() });
+      // As CodeRabbit's rate-limited run is neutral, not failing or pending,
+      // the required status passes while no model can take the review, and
+      // says why; the review's own result replaces it. Once per job.
+      let heldStatus = held.heldStatus;
+      if (!heldStatus && typeof fx.pullRequest === "function" && typeof fx.setStatus === "function") {
+        const head = (await fx.pullRequest(held.repo.full, held.pr))?.head?.sha;
+        const st = await this.state();
+        if (head && head !== st.lastCompleteReviewed) {
+          const when = Number.isFinite(cap.retryAt) ? ` at ${new Date(cap.retryAt).toISOString().slice(11, 16)} UTC` : "";
+          await fx.setStatus(held.repo.full, head, "success", `Review delayed: no model has capacity now; it is reviewed when one resets${when}.`);
+        }
+        heldStatus = true;
+      }
+      await this.ctx.storage.put(`job:${jobId}`, { ...held, heldStatus, createdAt: this.now() });
       console.log(JSON.stringify({ svc: "ai-review", ev: "dispatch_held", retry_at: new Date(cap.retryAt).toISOString() }));
       return { holdUntil: Math.max(this.now() + MIN_DEFER_MS, Math.min(cap.retryAt, this.now() + HOLD_RECHECK_MS)) };
     }

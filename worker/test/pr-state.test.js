@@ -865,6 +865,27 @@ test("no provider has capacity: the dispatch is held, its job kept fresh, then s
   assert.deepEqual(box, []);
 });
 
+test("no model capacity: the required status is neutral (success, saying why), as CodeRabbit's rate-limited run is, and only once", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const head = "9".repeat(40);
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: head } });
+  fx.setStatus = async (...a) => { fx.calls.push(["setStatus", ...a]); return true; };
+  const cap = { ok: false, retryAt: NOW + 5 * 3600_000 };
+  const obj = new PrState(doCtx(storage), RUNNER, { now: () => t, effects: fx, capacity: async () => cap });
+  await obj.onEvent({ delivery: "d1", ev: review() });
+  await fire(obj);
+  const statuses = () => fx.calls.filter((c) => c[0] === "setStatus");
+  assert.equal(statuses().length, 1);
+  assert.deepEqual(statuses()[0].slice(2, 4), [head, "success"]);
+  assert.match(statuses()[0][4], /^Review delayed: no model has capacity now; it is reviewed when one resets at \d\d:\d\d UTC\.$/);
+  assert.ok(statuses()[0][4].length <= 140);
+  // Looked at again: no second status for the same job.
+  await advance(obj, (v) => { t = v; }, NOW + 3600_000);
+  assert.equal(statuses().length, 1);
+});
+
 test("a held dispatch does not block other side effects behind it", async () => {
   const storage = memoryStorage();
   const fx = fakeEffects({ writers: ["rishitank"] });
