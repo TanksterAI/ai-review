@@ -146,8 +146,12 @@ export function nitpickFinding(body) {
 }
 
 /** The comment's body with CodeRabbit's note, added once. */
-export function addressedNote(body, sha) {
-  const note = `${ADDRESSED_MARK} Addressed in commit ${String(sha).slice(0, 7)}`;
+// As CodeRabbit's: one commit, or "commits first to last" when the fix came
+// in more than one (from the first commit after the finding's to the head).
+export function addressedNote(body, sha, first = null) {
+  const last = String(sha).slice(0, 7);
+  const from = first && first !== sha ? String(first).slice(0, 7) : null;
+  const note = from ? `${ADDRESSED_MARK} Addressed in commits ${from} to ${last}` : `${ADDRESSED_MARK} Addressed in commit ${last}`;
   const text = String(body ?? "");
   return text.includes(note) ? text : `${text}\n\n${note}`;
 }

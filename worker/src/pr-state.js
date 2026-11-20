@@ -13,7 +13,7 @@ import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
 import { findingIdOf, nitpickFinding } from "./addressed.js";
-import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_KEY, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
+import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_BASE, SUMMARY_KEY, SUMMARY_NOTICE, withNotice, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
 const KEEP_DELIVERIES = 200;
@@ -32,9 +32,15 @@ function seconds(v, fallback) {
   return /^\d+(\.\d+)?$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : fallback;
 }
 const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "help"];
-// As CodeRabbit's: these two work only as top-level comments, not in a
-// review thread's replies.
-const TOP_LEVEL_ONLY = new Set(["resolve", "approve"]);
+// As CodeRabbit's (reference/review-commands): these run only when they are
+// the whole comment, with no other text before or after. `review` and
+// `full review` need only be alone on their line.
+const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "help"]);
+// `ignore` is CodeRabbit's other name for `pause`.
+const ALIASES = { ignore: "pause" };
+// As CodeRabbit's: `approve` works only as a top-level comment. `resolve` in
+// a reply in one of the App's threads resolves only that thread.
+const TOP_LEVEL_ONLY = new Set(["approve"]);
 // Threads one alarm resolves at most (each is a subrequest; Workers Free
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
@@ -45,28 +51,47 @@ const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1,
 
 export function helpText(slug = DEFAULT_SLUG) {
   return [
-    `**Tankster AI Review commands**: mention \`@${slug}\` followed by:`,
+    `**Tankster AI Review commands**: start a line with \`@${slug}\` and the command, as plain text (not in code). One command per comment.`,
     "",
     "| Command | What it does |",
     "|---|---|",
     "| `review` | Review the commits pushed since the last review |",
     "| `full review` | Review the whole pull request again |",
-    "| `pause` | Stop automatic reviews on this pull request |",
-    "| `resume` | Start automatic reviews again |",
-    "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's) |",
-    "| `approve` | The same as `resolve` |",
+    "| `pause` (or `ignore`) | Stop automatic reviews on this pull request |",
+    "| `resume` | Start automatic reviews again, and review the commits pushed while they were paused |",
+    "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's). As a reply in one of its threads, resolve that thread only |",
+    "| `approve` | The same as a top-level `resolve` |",
     "| `help` | Show this list |",
+    "",
+    "`review` and `full review` must be alone on their line; the others must be the whole comment.",
     "",
     "Reviews of pull requests from forks or from authors without write access start only when someone with write access asks for one.",
     "",
-    "It requests changes while it has findings, resolves its threads once a later commit addresses them, and approves once none is open and the latest commit is reviewed in full. Post `resolve` and `approve` as top-level comments.",
+    "It requests changes while it has actionable findings, resolves its threads once a later commit addresses them, and approves once none is open and the latest commit is reviewed in full. Nitpicks never block. Post `approve` as a top-level comment.",
   ].join("\n");
 }
 
+// CodeRabbit's command rules: the handle starts a line, outside any code; one
+// command per comment (the first such line); case does not matter. Other
+// text on the command's line stops it being a command, and the whole-comment
+// commands must be all there is. Anything else is chat, which gets no reply
+// here (yet).
 export function parseCommand(text, slug = DEFAULT_SLUG) {
-  const after = String(text).split(mentionOf(slug)).pop() ?? "";
-  const line = after.trim().split("\n")[0].toLowerCase().replace(/\s+/g, " ").trim();
-  return COMMANDS.find((c) => line === c || line.startsWith(`${c} `) || line.startsWith(`${c}.`)) ?? null;
+  mentionOf(slug); // throws on a malformed slug before it reaches a pattern
+  const plain = String(text ?? "")
+    .replace(/\r\n?/g, "\n")
+    // Fenced code blocks (``` or ~~~, closed or running to the end). A
+    // command in inline code never starts its line, so it is never one.
+    .replace(/^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^[ \t]*\1[ \t]*$|(?![\s\S]))/gm, "");
+  const handle = new RegExp(`^\\s*@${slug}(?![\\w-])(.*)$`, "i");
+  const lines = plain.split("\n");
+  const at = lines.findIndex((l) => handle.test(l));
+  if (at < 0) return null;
+  const said = handle.exec(lines[at])[1].trim().toLowerCase().replace(/\s+/g, " ");
+  const cmd = ALIASES[said] ?? (COMMANDS.includes(said) ? said : null);
+  if (!cmd) return null;
+  if (WHOLE_COMMENT.has(cmd) && lines.some((l, i) => i !== at && l.trim())) return null;
+  return cmd;
 }
 
 // A job id is the PR object's own id (64 hex characters, which Cloudflare
@@ -103,6 +128,11 @@ const MIN_DEFER_MS = 60_000;
 const MAX_RETRIES = 3;
 // However it waits, a job is given up this long after it was first made.
 const MAX_JOB_LIFE_MS = 3 * 24 * 3600_000;
+
+// A command's acknowledgement, as CodeRabbit's: "Action performed" (edited
+// when the review finishes) or "Action not completed", collapsed.
+export const actionPerformed = (text) => `<details>\n<summary>Action performed</summary>\n\n${text}\n\n</details>`;
+export const actionNotCompleted = (text) => `<details>\n<summary>Action not completed</summary>\n\n${text}\n\n</details>`;
 
 export function needsApproval(slug = DEFAULT_SLUG) {
   return `This pull request comes from a fork or from an author without write access, so it is not reviewed automatically. Someone with write access can comment \`@${slug} review\` to start one.`;
@@ -313,7 +343,7 @@ export class PrState {
       await this.ctx.storage.put("state", st);
       // Merged: what the reviewer kept about it is of no more use.
       if (ev.merged) {
-        await this.ctx.storage.delete([SUMMARY_KEY, "reopenSeq"]);
+        await this.ctx.storage.delete([SUMMARY_KEY, SUMMARY_BASE, SUMMARY_NOTICE, "reopenSeq"]);
         await clearPrefix(this.ctx.storage, REOPENED);
         await clearPrefix(this.ctx.storage, ACCEPTED);
         await clearOpenFindings(this.ctx.storage);
@@ -411,8 +441,10 @@ export class PrState {
       // resolve/approve vouch for the threads as they stood when the writer
       // asked: reopens numbered after this are not covered, however long
       // the command waits or however many steps it takes (resolveAll).
-      const seq = TOP_LEVEL_ONLY.has(cmd) ? { seq: (await this.ctx.storage.get("reopenSeq")) ?? 0 } : {};
-      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr, ...seq });
+      const seq = cmd === "resolve" || cmd === "approve" ? { seq: (await this.ctx.storage.get("reopenSeq")) ?? 0 } : {};
+      // `resolve` as a reply in a thread: that thread only (its first comment).
+      const thread = ev.where === "thread" && cmd === "resolve" ? { inThreadOf: Number(ev.inReplyTo ?? ev.commentId) } : {};
+      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr, ...seq, ...thread });
       return { action: "command", cmd };
     }
     return { action: "ignored" };
@@ -513,8 +545,7 @@ export class PrState {
   async keepJobOnItem(item, st, opts) {
     if (item.jobId) return;
     item.jobId = (await this.newJob({ repo: item.repo, pr: item.pr }, st, { ...opts, queue: false })).id;
-    const box = (await this.ctx.storage.get("outbox")) ?? [];
-    await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
+    await this.keepItem(item);
   }
 
   // Starts the runner for a job that still exists (closing a PR deletes its
@@ -653,15 +684,55 @@ export class PrState {
       if (item.cmd === "resume") {
         st.paused = false;
         await this.ctx.storage.put("state", st);
-        return fx.comment(item.repo.full, item.pr, `Automatic reviews are back on. I'll review the next push, or comment \`@${slug} review\` now.`);
+        // As CodeRabbit's: the commits pushed while paused are reviewed now.
+        const head = typeof fx.pullRequest === "function" ? (await fx.pullRequest(item.repo.full, item.pr))?.head?.sha : null;
+        if (!head || head === st.lastReviewed || head === st.lastCompleteReviewed) {
+          if (!item.acked) await fx.comment(item.repo.full, item.pr, "Automatic reviews are back on.");
+          return undefined;
+        }
+        return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
       }
+      if (item.cmd === "resolve" && Number.isSafeInteger(item.inThreadOf)) return this.resolveOne(fx, item, slug);
       if (item.cmd === "resolve" || item.cmd === "approve") return this.resolveAll(fx, item, slug);
       // review / full review: now, and it covers any push still waiting.
-      await this.ctx.storage.delete("debounce");
-      await this.keepJobOnItem(item, st, { full: item.cmd === "full review", requestedBy: item.login });
-      return this.dispatchJob(fx, item.jobId);
+      // As CodeRabbit's: a commit already reviewed in full is not reviewed
+      // again by `review` (`full review` does that).
+      if (item.cmd === "review" && !item.jobId && typeof fx.pullRequest === "function") {
+        const head = (await fx.pullRequest(item.repo.full, item.pr))?.head?.sha;
+        if (head && head === st.lastCompleteReviewed && !(await activeRun(this.ctx.storage))) {
+          await fx.comment(item.repo.full, item.pr, actionNotCompleted(`Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`));
+          return undefined;
+        }
+      }
+      return this.reviewNow(fx, item, st, { full: item.cmd === "full review", text: "Review triggered." });
+    }
+    if (item.type === "ack") {
+      if (!key || !Number.isSafeInteger(item.commentId) || typeof fx.editComment !== "function") return undefined;
+      await fx.editComment(key.repo, item.commentId, item.text);
+      return undefined;
     }
     return undefined;
+  }
+
+  // A review a writer asked for (review, full review, resume): one job, and
+  // one acknowledgement, edited to "Review finished." when it is done. Both
+  // are kept on the item, so a retried alarm makes neither twice.
+  async reviewNow(fx, item, st, { full, text }) {
+    await this.ctx.storage.delete("debounce");
+    await this.keepJobOnItem(item, st, { full, requestedBy: item.login });
+    if (!item.acked) {
+      const commentId = await fx.comment(item.repo.full, item.pr, actionPerformed(text));
+      item.acked = true;
+      await this.keepItem(item);
+      const job = await this.ctx.storage.get(`job:${item.jobId}`);
+      if (job && Number.isSafeInteger(commentId)) await this.ctx.storage.put(`job:${item.jobId}`, { ...job, ackId: commentId });
+    }
+    return this.dispatchJob(fx, item.jobId);
+  }
+
+  async keepItem(item) {
+    const box = (await this.ctx.storage.get("outbox")) ?? [];
+    await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? item : x)));
   }
 
   // "worker" (the default): the review runs here, in this object's alarm, in
@@ -716,7 +787,11 @@ export class PrState {
       await this.complete({ jobId: run.id, runId: "worker", reviewedSha, fullCoverage: true });
       // The latest commit has a complete review: approve, if nothing is open.
       await this.queueDecide({});
-    } else await this.ctx.storage.delete(`job:${run.id}`);
+    } else {
+      const job = await this.ctx.storage.get(`job:${run.id}`);
+      await this.ctx.storage.delete(`job:${run.id}`);
+      if (Number.isSafeInteger(job?.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionNotCompleted("The review could not finish.") });
+    }
     await dropRun(this.ctx.storage, run.id);
     if (gaveUp) {
       const why = String(description ?? "the review kept failing").replace(/[`\n]/g, " ").slice(0, 200);
@@ -748,7 +823,11 @@ export class PrState {
     const pr = await fx.pullRequest(key.repo, key.pr);
     const head = pr?.head?.sha;
     if (pr?.state !== "open" || pr.draft || !/^[0-9a-f]{40}$/.test(String(head))) return undefined;
-    if (!item.reopened && !item.force && st.lastCompleteReviewed !== head) return undefined;
+    if (!item.reopened && !item.force && st.lastCompleteReviewed !== head) {
+      // A review of this head is still to come (or failed): say so.
+      await this.noticeApproval(fx, key, { pending: head, slug });
+      return undefined;
+    }
     const writers = new Map();
     const isWriter = async (login) => {
       if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
@@ -777,21 +856,75 @@ export class PrState {
     const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {
-        await fx.postReview(key.repo, key.pr, {
-          commitId: head, comments: [], event: "REQUEST_CHANGES",
-          body: `${MARKER}\nA review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.`,
-        });
+        // As CodeRabbit's: the approval is withdrawn (dismissed). Only if
+        // GitHub refuses that is changes requested instead.
+        const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
+        const dismissed = typeof fx.dismissReview === "function" && Number.isSafeInteger(decision.id)
+          ? await fx.dismissReview(key.repo, key.pr, decision.id, why) : false;
+        if (!dismissed) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
       }
       return undefined;
     }
-    if (open.length || inBody.length || decision?.state === "APPROVED") return undefined;
+    if (open.length || inBody.length) {
+      await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+      return undefined;
+    }
+    if (decision?.state === "APPROVED") {
+      await this.noticeApproval(fx, key, { approved: decision.commitId ?? head });
+      return undefined;
+    }
     const now = await fx.pullRequest(key.repo, key.pr);
     if (now?.head?.sha !== head || now?.state !== "open" || now.draft) return undefined;
-    const body = item.force && item.login
-      ? `Approved at @${item.login}'s request: its review threads are resolved.`
-      : `Approved: every finding is resolved, and commit \`${head.slice(0, 7)}\` was reviewed in full.`;
-    const ok = await fx.approve(key.repo, key.pr, { commitId: head, body });
+    // As CodeRabbit's: an approval with no text (the summary comment says why).
+    const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
+    if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
+    return undefined;
+  }
+
+  // The approval notice in the summary comment (CodeRabbit's "Automatic
+  // approval withheld"): why the pull request is not approved, with links to
+  // the open threads, or that it is. Written only when it changes, and only
+  // once a review has written the summary.
+  async noticeApproval(fx, key, { pending, withheld, approved, open = [], inBody = [], slug = DEFAULT_SLUG }) {
+    if (typeof fx.upsertSummary !== "function") return;
+    const base = await this.ctx.storage.get(SUMMARY_BASE);
+    if (typeof base !== "string") return;
+    const url = (t) => `https://github.com/${key.repo}/pull/${key.pr}#discussion_r${t.commentId}`;
+    let notice;
+    if (approved) notice = `**Automatic approval**: approved at commit \`${String(approved).slice(0, 12)}\`.`;
+    else if (pending) notice = `**Automatic approval pending**: commit \`${String(pending).slice(0, 12)}\` has no complete review yet.`;
+    else {
+      const lines = ["**Automatic approval withheld**", ""];
+      if (open.length) {
+        lines.push(`${open.length === 1 ? "1 review thread is" : `${open.length} review threads are`} still open and must be resolved first:`, "");
+        for (const [i, t] of open.slice(0, 20).entries()) lines.push(Number.isSafeInteger(t.commentId) ? `- [Thread ${i + 1}](${url(t)})` : `- Thread ${i + 1}`);
+        if (open.length > 20) lines.push(`- …and ${open.length - 20} more`);
+        lines.push("");
+      }
+      if (inBody.length) lines.push(`${inBody.length === 1 ? "1 finding listed in a review body is" : `${inBody.length} findings listed in review bodies are`} still open.`, "");
+      lines.push(`Address them and push, resolve the threads on the pull request, or post \`@${slug} approve\` as a new top-level comment to resolve them and request approval.`, "", `Commit: \`${String(withheld).slice(0, 12)}\`.`);
+      notice = lines.join("\n");
+    }
+    if ((await this.ctx.storage.get(SUMMARY_NOTICE)) === notice) return;
+    const id = await fx.upsertSummary(key.repo, key.pr, (await this.ctx.storage.get(SUMMARY_KEY)) ?? null, withNotice(base, notice));
+    if (Number.isSafeInteger(id)) await this.ctx.storage.put(SUMMARY_KEY, id);
+    await this.ctx.storage.put(SUMMARY_NOTICE, notice);
+  }
+
+  // `resolve` posted as a reply in one of the App's threads (CodeRabbit's
+  // reference): that thread only. The writer vouches for it, as for a
+  // top-level resolve, unless it was reopened after the command was posted;
+  // then an ordinary decision follows.
+  async resolveOne(fx, item, slug) {
+    const key = await this.ctx.storage.get("key");
+    if (!key || typeof fx.ownThreads !== "function") return undefined;
+    const t = (await fx.ownThreads(key.repo, key.pr, slug)).find((x) => x.commentId === item.inThreadOf);
+    // Not one of the App's own threads: nothing to do, as CodeRabbit.
+    if (!t) return undefined;
+    if (!t.resolved && !(await fx.resolveThread(key.repo, t.id))) throw new Error("the thread could not be resolved");
+    if (!((await reopenMark(this.ctx.storage, t.id)) > (Number.isInteger(item.seq) ? item.seq : Infinity))) await acceptThreads(this.ctx.storage, [t.id]);
+    await this.queueDecide({});
     return undefined;
   }
 
@@ -917,6 +1050,7 @@ export class PrState {
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
     await this.ctx.storage.put("state", st);
     await this.ctx.storage.delete(`job:${jobId}`);
+    if (Number.isSafeInteger(job.ackId)) await this.outbox({ type: "ack", commentId: job.ackId, text: actionPerformed("Review finished.") });
     return { ok: true };
   }
 }

@@ -190,6 +190,21 @@ test("approve: an APPROVE review pinned to the commit it checked", async () => {
   assert.equal(app.log.calls[0].path, "/repos/TanksterAI/x/pulls/3/reviews");
   assert.deepEqual(app.log.calls[0].body, { commit_id: SHA, event: "APPROVE", body: `${MARKER}\nok` });
   await assert.rejects(createEffects({}, { app }).approve("TanksterAI/x", 3, { commitId: "main", body: "ok" }));
+  // No text: the marker alone, which shows nothing (CodeRabbit's approval).
+  const quiet = fakeApp(() => ({}));
+  await createEffects({}, { app: quiet }).approve("TanksterAI/x", 3, { commitId: SHA, body: "" });
+  assert.equal(quiet.log.calls[0].body.body, MARKER);
+});
+
+test("dismissReview: withdraws one of the App's reviews; a refusal is false", async () => {
+  const app = fakeApp(() => ({}));
+  assert.equal(await createEffects({}, { app }).dismissReview("TanksterAI/x", 3, 77, "why"), true);
+  assert.equal(app.log.calls[0].method, "PUT");
+  assert.equal(app.log.calls[0].path, "/repos/TanksterAI/x/pulls/3/reviews/77/dismissals");
+  assert.deepEqual(app.log.calls[0].body, { message: "why", event: "DISMISS" });
+  for (const status of [422, 403]) assert.equal(await createEffects({}, { app: fakeApp(() => err(status)) }).dismissReview("TanksterAI/x", 3, 77, "why"), false);
+  await assert.rejects(createEffects({}, { app: fakeApp(() => err(500)) }).dismissReview("TanksterAI/x", 3, 77, "why"));
+  await assert.rejects(createEffects({}, { app }).dismissReview("TanksterAI/x", 3, "77", "why"));
 });
 
 test("reviewDecision: the App's own latest approving, change-requesting or dismissed review; comments do not count", async () => {
@@ -199,13 +214,14 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
     ...Array.from({ length: 99 }, () => ({ user: { login: "rishitank", type: "User" }, state: "APPROVED", commit_id: "2".repeat(40) })),
   ];
   const page2 = [
-    { user: bot, state: "APPROVED", commit_id: "3".repeat(40) },
+    { user: bot, state: "APPROVED", commit_id: "3".repeat(40), id: 33 },
     { user: bot, state: "COMMENTED", commit_id: "4".repeat(40) },
     { user: { login: "tankster-ai-review[bot]", type: "User" }, state: "DISMISSED", commit_id: "5".repeat(40) },
   ];
   const app = fakeApp((m, path) => (path.endsWith("&page=1") ? page1 : page2));
   const d = await createEffects({}, { app }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
-  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40) });
+  // With its id, so a stale approval can be dismissed.
+  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33 });
   assert.equal(app.log.calls.length, 2);
   const none = fakeApp(() => []);
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);

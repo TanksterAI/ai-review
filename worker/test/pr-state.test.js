@@ -48,11 +48,31 @@ async function drain(obj) {
 const command = (text, login = "rishitank") => ({ kind: "command", repo, pr: 39, sender: { login, bot: false }, text });
 
 test("commands are parsed from the text after the mention", () => {
-  assert.equal(parseCommand("@tankster-ai-review full review"), "full review");
-  assert.equal(parseCommand("hey @tankster-ai-review   Review please"), "review");
-  assert.equal(parseCommand("@tankster-ai-review pause.\nthanks"), "pause");
-  assert.equal(parseCommand("@tankster-ai-review reviewing"), null);
-  assert.equal(parseCommand("@tankster-ai-review delete everything"), null);
+  // CodeRabbit's rules: the handle starts a line, outside code; nothing else
+  // on the command's line; whole-comment commands are all there is.
+  const cases = [
+    ["@tankster-ai-review full review", "full review"],
+    ["@Tankster-AI-Review  Full   Review", "full review"],
+    ["  @tankster-ai-review review", "review"],
+    ["Please look.\n@tankster-ai-review review\nthanks", "review"],
+    ["@tankster-ai-review pause", "pause"],
+    ["@tankster-ai-review ignore", "pause"],
+    ["@tankster-ai-review resolve", "resolve"],
+    ["~~~js\n@tankster-ai-review review\n~~~\n@tankster-ai-review full review", "full review"],
+    ["hey @tankster-ai-review review", null],
+    ["@tankster-ai-review review please", null],
+    ["@tankster-ai-review review.", null],
+    ["@tankster-ai-review pause\nthanks", null],
+    ["Thanks!\n@tankster-ai-review resume", null],
+    ["```\n@tankster-ai-review review\n```", null],
+    ["`@tankster-ai-review review`", null],
+    ["`x` @tankster-ai-review review", null],
+    ["@tankster-ai-review reviewing", null],
+    ["@tankster-ai-reviewer review", null],
+    ["@tankster-ai-review delete everything", null],
+  ];
+  for (const [text, want] of cases) assert.equal(parseCommand(text), want, JSON.stringify(text));
+  assert.throws(() => parseCommand("@x review", "bad slug!"));
 });
 
 test("job ids carry the PR object's id, never the repository or PR", () => {
@@ -1132,4 +1152,96 @@ test("the waiting status never replaces the result of a commit already reviewed 
   await obj.onEvent({ delivery: "3", ev: fork(C, "synchronize") });
   await drain(obj);
   assert.deepEqual(fx.calls.filter((c) => c[0] === "setStatus").map((c) => c[2]), [C]);
+});
+
+// --- command acknowledgements (CodeRabbit's "Action performed") ---------------
+
+function withPr(fx, head) {
+  let next = 1000;
+  fx.comment = async (repoFull, pr, body) => { fx.calls.push(["comment", repoFull, pr, body]); return next++; };
+  fx.editComment = async (repoFull, id, body) => { fx.calls.push(["editComment", repoFull, id, body]); return true; };
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: fx.head ?? head } });
+  fx.head = head;
+  return fx;
+}
+const comments = (fx) => fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+const edits = (fx) => fx.calls.filter((c) => c[0] === "editComment").map((c) => [c[2], c[3]]);
+
+test("review: acknowledged with \"Review triggered.\", edited to \"Review finished.\" when it completes", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  const [ack] = comments(fx);
+  assert.match(ack, /<summary>Action performed<\/summary>[\s\S]*Review triggered\./);
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.equal((await storage.get(`job:${jobId}`)).ackId, 1000);
+  await obj.claim({ jobId, runId: "7" });
+  await obj.complete({ jobId, runId: "7", reviewedSha: "d".repeat(40) });
+  await drain(obj);
+  const [[id, text]] = edits(fx);
+  assert.equal(id, 1000);
+  assert.match(text, /Review finished\./);
+  // A retried alarm does not acknowledge twice.
+  assert.equal(comments(fx).length, 1);
+});
+
+test("review of a commit already reviewed in full is not run again; full review is", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>[\s\S]*Already reviewed the last commit\. Use `@tankster-ai-review full review`/);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  await obj.onEvent({ delivery: "2", ev: command("@tankster-ai-review full review") });
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
+  assert.match(comments(fx)[1], /Review triggered\./);
+});
+
+test("resume reviews the commits pushed while paused, as CodeRabbit's; with none, it only says so", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: true });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review resume") });
+  await drain(obj);
+  assert.equal((await storage.get("state")).paused, false);
+  assert.equal(comments(fx).at(-1), "Automatic reviews are back on.");
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+
+  await obj.onEvent({ delivery: "2", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  fx.head = "e".repeat(40);
+  await obj.onEvent({ delivery: "3", ev: command("@tankster-ai-review resume") });
+  await drain(obj);
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  const job = await storage.get(`job:${jobId}`);
+  assert.equal(job.full, false);
+  assert.equal(job.since, "c".repeat(40));
+  assert.match(comments(fx).at(-1), /Reviewing the commits pushed while they were paused/);
+});
+
+test("a review that gives up edits its acknowledgement to say it could not finish", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("job:j1", { id: "j1", ackId: 1234 });
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: true, description: "boom" });
+  await drain(obj);
+  const [[id, text]] = edits(fx);
+  assert.equal(id, 1234);
+  assert.match(text, /<summary>Action not completed<\/summary>[\s\S]*The review could not finish\./);
+});
+
+test("a retried command acknowledges once: the acknowledgement is kept on its item", async () => {
+  const { obj, fx } = make();
+  withPr(fx, "d".repeat(40));
+  let fail = 1;
+  const real = fx.dispatch;
+  fx.dispatch = async (id) => { if (fail-- > 0) throw new Error("GitHub 502"); return real(id); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  for (let i = 0; i < 5; i++) { obj.ctx.storage.alarm = null; try { await obj.alarm(); } catch {} }
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "dispatched on the retry");
+  assert.equal(comments(fx).filter((c) => /Review triggered/.test(c)).length, 1);
 });

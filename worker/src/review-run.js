@@ -88,6 +88,17 @@ const planKey = (id) => `${RUN}${id}:plan`;
 // Kept by the PR's object across runs: the summary comment's id, and the
 // findings a review could only list in its body (they have no thread).
 export const SUMMARY_KEY = "summaryComment";
+// The summary comment's text as the last review wrote it, and the approval
+// notice the latest decision added to it (pr-state.js decide).
+export const SUMMARY_BASE = "summaryBase";
+export const SUMMARY_NOTICE = "summaryNotice";
+// The approval notice goes just under the heading, as CodeRabbit's does.
+export function withNotice(base, notice) {
+  const text = String(base ?? "");
+  if (!notice) return text;
+  const at = text.indexOf("\n");
+  return at < 0 ? `${text}\n\n${notice}` : `${text.slice(0, at)}\n\n${notice}${text.slice(at)}`;
+}
 // One key a finding (OPEN_FINDINGS + its id), so none is ever dropped for
 // space: each stays until it is addressed or cleared.
 export const OPEN_FINDINGS = "openfinding:";
@@ -852,8 +863,11 @@ async function stageThreads(ctx, run, save) {
       // force-push the finding's commit is not behind the head, and its diff
       // would mix in what the rebase moved. Those are left to a person.
       const straight = cmp?.status === "ahead" || cmp?.status === "identical";
+      // The first commit after the finding's: the note names the range.
+      const first = Array.isArray(cmp?.commits) && cmp.commits.length > 1 ? cmp.commits[0]?.sha ?? null : null;
       for (const x of th.items) {
         if (x.state !== "new" || x.since !== commit) continue;
+        x.first = first;
         if (!straight) { x.state = "open"; continue; }
         const f = files.find((y) => y.filename === x.path || y.previous_filename === x.path);
         if (!f) { x.state = files.length >= 300 ? "open" : "untouched"; continue; }
@@ -908,13 +922,13 @@ async function stageThreads(ctx, run, save) {
   for (const x of fixed.slice(0, APPLIES_PER_STEP)) {
     if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
     if (x.kind === "thread") {
-      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha, x.first));
       if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
       await fx.resolveThread(run.repo.full, x.threadId);
     } else if (x.kind === "accept") {
       // Already resolved (by someone without write access): the note, and
       // it no longer holds back approval.
-      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha));
+      await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha, x.first));
       if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
       await acceptThreads(ctx.storage, [x.threadId]);
     } else {
@@ -935,8 +949,9 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   if (!complete || none) lines.push(summary, "");
   else if (actionable) lines.push(`Actionable comments posted: ${actionable}. ${summary}`, "");
   // Nitpicks alone: shown in the review, never blocking (as CodeRabbit's).
-  else if (shown) lines.push(`No actionable comments were generated in the latest review. ${summary} Nitpicks do not block approval.`, "");
-  else lines.push("No actionable comments were generated in the latest review. 🎉", "");
+  else if (shown) lines.push(`No actionable comments were generated in the recent review. ${summary} Nitpicks do not block approval.`, "");
+  // CodeRabbit's own words for a review with no findings.
+  else lines.push("No actionable comments were generated in the recent review. 🎉", "");
   if (threads) {
     const parts = [];
     if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);
@@ -953,8 +968,12 @@ async function stageSummary(ctx, run, save) {
   const s = (await ctx.storage.get(summaryKey(run.id))) ?? {};
   const th = await ctx.storage.get(threadsKey(run.id));
   if (!run.summaryPosted && typeof ctx.fx.upsertSummary === "function") {
-    const id = await ctx.fx.upsertSummary(run.repo.full, run.pr, (await ctx.storage.get(SUMMARY_KEY)) ?? null, summaryText({ headSha: run.headSha, ...s, threads: th }));
+    const text = summaryText({ headSha: run.headSha, ...s, threads: th });
+    const id = await ctx.fx.upsertSummary(run.repo.full, run.pr, (await ctx.storage.get(SUMMARY_KEY)) ?? null, text);
     if (Number.isSafeInteger(id)) await ctx.storage.put(SUMMARY_KEY, id);
+    // The decision that follows adds its approval notice to this text.
+    await ctx.storage.put(SUMMARY_BASE, text);
+    await ctx.storage.delete(SUMMARY_NOTICE);
     run.summaryPosted = true;
     await save(run);
   }

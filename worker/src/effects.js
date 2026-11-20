@@ -64,10 +64,26 @@ export function createEffects(env, deps = {}) {
     async comment(repoFull, pr, body) {
       const name = nameOf(repoFull);
       const token = await app.installationToken([name], PR_SCOPE);
-      await app.call("POST", `/repos/${ORG}/${name}/issues/${Number(pr)}/comments`, {
+      const made = await app.call("POST", `/repos/${ORG}/${name}/issues/${Number(pr)}/comments`, {
         token,
         body: { body: `${MARKER}\n${body}` },
       });
+      // Its id, so a reply can be edited later (a command's acknowledgement).
+      return Number.isSafeInteger(made?.id) ? made.id : null;
+    },
+
+    // Edits one of the App's own conversation comments. False if it is gone.
+    async editComment(repoFull, commentId, body) {
+      const name = nameOf(repoFull);
+      if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      try {
+        await app.call("PATCH", `/repos/${ORG}/${name}/issues/comments/${commentId}`, { token, body: { body: `${MARKER}\n${body}` } });
+        return true;
+      } catch (e) {
+        if (e.status === 404) return false;
+        throw e;
+      }
     },
 
     async canWrite(repoFull, login) {
@@ -222,7 +238,8 @@ export function createEffects(env, deps = {}) {
       try {
         await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`, {
           token,
-          body: { commit_id: commitId, event: "APPROVE", body: `${MARKER}\n${body}` },
+          // The marker only, when there is no text: it shows nothing.
+          body: { commit_id: commitId, event: "APPROVE", body: body ? `${MARKER}\n${body}` : MARKER },
         });
         return true;
       } catch (e) {
@@ -241,11 +258,26 @@ export function createEffects(env, deps = {}) {
       for (let page = 1; page <= 10; page++) {
         const list = await app.call("GET", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`, { token });
         for (const r of list ?? []) {
-          if (r?.user?.type === "Bot" && r.user.login === botLogin && DECISIONS.has(r.state)) last = { state: r.state, commitId: r.commit_id ?? null };
+          if (r?.user?.type === "Bot" && r.user.login === botLogin && DECISIONS.has(r.state)) last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
         }
         if (!list || list.length < 100) break;
       }
       return last;
+    },
+
+    // Withdraws one of the App's own reviews (an approval no longer true), as
+    // CodeRabbit withdraws its approval. False when GitHub refuses.
+    async dismissReview(repoFull, pr, reviewId, message) {
+      const name = nameOf(repoFull);
+      if (!Number.isSafeInteger(reviewId)) throw new Error("not a review id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      try {
+        await app.call("PUT", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews/${reviewId}/dismissals`, { token, body: { message, event: "DISMISS" } });
+        return true;
+      } catch (e) {
+        if (e.status === 422 || e.status === 403) return false;
+        throw e;
+      }
     },
 
     // The App's own review threads (the first comment is the App's), with the

@@ -54,7 +54,7 @@ test("approves when the latest commit was reviewed in full and every one of its 
   await decide(m);
   const [[, review]] = approvals(m.calls);
   assert.equal(review.commitId, HEAD);
-  assert.match(review.body, /every finding is resolved/i);
+  assert.equal(review.body, "", "no text, as CodeRabbit's approval");
   // It looked at its own threads and its own decision, by its own logins.
   assert.deepEqual(m.calls.find((c) => c[0] === "ownThreads"), ["ownThreads", "tankster-ai-review"]);
   assert.deepEqual(m.calls.find((c) => c[0] === "reviewDecision"), ["reviewDecision", "tankster-ai-review[bot]"]);
@@ -109,6 +109,18 @@ test("a thread reopened after the approval asks for changes again; reopened befo
   assert.equal(before.calls.some((c) => c[0] === "postReview"), false);
 });
 
+test("a stale approval is withdrawn by dismissing it, as CodeRabbit's; only if GitHub refuses are changes requested", async () => {
+  for (const [ok, posted] of [[true, 0], [false, 1]]) {
+    const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
+    m.fx.dismissReview = async (_r, _p, id, message) => { m.calls.push(["dismissReview", id, message]); return ok; };
+    await decide(m, { reopened: true });
+    const [[, id, message]] = m.calls.filter((c) => c[0] === "dismissReview");
+    assert.equal(id, 77);
+    assert.match(message, /reopened/);
+    assert.equal(m.calls.filter((c) => c[0] === "postReview").length, posted, `dismissed=${ok}`);
+  }
+});
+
 test("a finished review, and a resolved or reopened thread, each ask for a decision", async () => {
   const m = await make();
   const out = await m.obj.onEvent({ delivery: "d1", ev: { kind: "thread", action: "resolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t1" } });
@@ -152,7 +164,7 @@ test("resolve and approve: top-level commands from writers that resolve every th
     assert.deepEqual(m.calls.filter((c) => c[0] === "resolveThread").map((c) => c[1]), ["t1", "t3"]);
     assert.deepEqual(await listOpenFindings(m.storage), []);
     const [[, review]] = approvals(m.calls);
-    assert.match(review.body, /@rishitank/);
+    assert.equal(review.body, "", "an approval with no text, as CodeRabbit's");
   }
 
   // Someone without write access: refused, nothing resolved.
@@ -161,10 +173,28 @@ test("resolve and approve: top-level commands from writers that resolve every th
   await drain(no.obj);
   assert.equal(no.calls.some((c) => c[0] === "resolveThread" || c[0] === "approve"), false);
 
-  // In a review thread's replies they are not commands (CodeRabbit's rule).
+  // In a review thread's replies `approve` is not a command (CodeRabbit's rule).
   const reply = await make({ threads: [thread("t1", false)] });
-  const r = await reply.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  const r = await reply.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
   assert.equal(r.action, "not_a_command");
+});
+
+test("resolve as a reply in one of the App's threads resolves that thread only, then decides", async () => {
+  const threads = [{ ...thread("t1", false), commentId: 101 }, { ...thread("t2", false), commentId: 202 }];
+  for (const [inReplyTo, id] of [[202, "t2"], [101, "t1"]]) {
+    const n = await make({ threads: threads.map((t) => ({ ...t })) });
+    const out = await n.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, commentId: 999, inReplyTo, text: "@tankster-ai-review resolve" } });
+    assert.equal(out.cmd, "resolve");
+    await drain(n.obj);
+    assert.deepEqual(n.calls.filter((c) => c[0] === "resolveThread").map((c) => c[1]), [id]);
+    assert.ok((await acceptedSet(n.storage)).has(id));
+    assert.equal(approvals(n.calls).length, 0, "the other thread is still open");
+  }
+  // A reply in a thread that is not the App's: nothing happens.
+  const other = await make({ threads });
+  await other.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, commentId: 999, inReplyTo: 555, text: "@tankster-ai-review resolve" } });
+  await drain(other.obj);
+  assert.equal(other.calls.some((c) => c[0] === "resolveThread"), false);
 });
 
 test("many threads are resolved over several alarms, never more than the step allows at once", async () => {
@@ -542,4 +572,38 @@ test("a kept finding with a nitpick header but kept as severe still blocks", asy
     await decide(m);
     assert.equal(approvals(m.calls).length, approved, `severe=${severe}`);
   }
+});
+
+test("the summary comment says why approval is withheld, with links to the open threads, then that it is approved", async () => {
+  const m = await make({ threads: [{ ...thread("t1", false), commentId: 501 }, { ...thread("t2", true), commentId: 502 }] });
+  const summaries = [];
+  m.fx.upsertSummary = async (_r, _p, id, body) => { summaries.push({ id, body }); return 9; };
+  await m.storage.put("summaryBase", "### Tankster AI Review\n\n**Latest review:** commit `aaaaaaa`.");
+  await decide(m);
+  assert.equal(summaries.length, 1);
+  const [first] = summaries;
+  assert.match(first.body, /^### Tankster AI Review\n\n\*\*Automatic approval withheld\*\*/);
+  assert.match(first.body, /1 review thread is still open and must be resolved first:\n\n- \[Thread 1\]\(https:\/\/github\.com\/TanksterAI\/browser-relay\/pull\/39#discussion_r501\)/);
+  assert.match(first.body, /post `@tankster-ai-review approve` as a new top-level comment/);
+  assert.match(first.body, /\*\*Latest review:\*\* commit `aaaaaaa`\./, "the review's own text is kept");
+  // The same decision again writes nothing.
+  await decide(m);
+  assert.equal(summaries.length, 1);
+  // Resolved: approved, and the notice says so.
+  m.w.threads[0].resolved = true;
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 1);
+  assert.match(summaries.at(-1).body, /\*\*Automatic approval\*\*: approved at commit `[0-9a-f]{12}`\./);
+  assert.doesNotMatch(summaries.at(-1).body, /withheld/);
+});
+
+test("the notice says approval is pending while the head has no complete review; nothing before a review wrote the summary", async () => {
+  const m = await make({ reviewed: "b".repeat(40) });
+  const summaries = [];
+  m.fx.upsertSummary = async (_r, _p, id, body) => { summaries.push(body); return 9; };
+  await decide(m);
+  assert.equal(summaries.length, 0, "no summary yet: nothing to add to");
+  await m.storage.put("summaryBase", "### Tankster AI Review");
+  await decide(m);
+  assert.match(summaries[0], /\*\*Automatic approval pending\*\*: commit `[0-9a-f]{12}` has no complete review yet\./);
 });
