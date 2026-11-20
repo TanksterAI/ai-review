@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DRAFT_PARALLEL, STEP_SUBREQUESTS, activeRun, keepOpenFindings, listOpenFindings, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
+import { DRAFT_PARALLEL, STEP_SUBREQUESTS, summaryText, activeRun, keepOpenFindings, listOpenFindings, mergeResults, rotatedChain, startRun, stepRun } from "../src/review-run.js";
 import { config } from "../src/config.js";
 import { parseFindingsBlock } from "../src/review.js";
 import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
@@ -291,6 +291,32 @@ test("an incremental review reads only the commits since the last review, and sa
   assert.equal(comments.length, 1);
   assert.match(body, /_Incremental review: commits after `ddddddd`\._/);
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
+});
+
+test("an incremental review's summary lists the commits it covered, safely", async () => {
+  const since = "d".repeat(40);
+  const commits = [
+    { sha: "1".repeat(40), commit: { message: "Fix the thing @everyone <b>now</b> `x`\n\nbody" } },
+    { sha: "2".repeat(40), commit: { message: "Second | commit" } },
+  ];
+  const github = fakeGithub({ compare: (base) => (base === since ? { status: "ahead", total_commits: 2, commits, files: [file("worker/src/m3.js", added(4, "inc_"))] } : null) });
+  github.prLinesMap = new Map([["worker/src/m3.js", new Set([1, 2, 3, 4])]]);
+  const s = setup({ github, job: { since } });
+  await runAll(s);
+  const text = github.summaries[0].body;
+  assert.match(text, /<summary>Commits reviewed \(2\)<\/summary>/);
+  assert.match(text, /- `1111111` Fix the thing @everyone b now \/b x/);
+  assert.doesNotMatch(text, /<b>|\|/);
+});
+
+test("summaryText: a full review names no commits; a long list is cut to the last 20 with the count", () => {
+  const base = { headSha: "a".repeat(40), summary: "s", about: "", shown: 0, complete: true };
+  assert.doesNotMatch(summaryText(base), /Commits reviewed/);
+  const many = Array.from({ length: 25 }, (_, i) => ({ sha: String(i % 10).repeat(40), subject: `c${i}` }));
+  const t = summaryText({ ...base, since: "d".repeat(40), commits: many, commitCount: 25 });
+  assert.match(t, /Commits reviewed \(25\)/);
+  assert.equal((t.match(/^- `/gm) ?? []).length, 20);
+  assert.match(t, /the 20 latest/);
 });
 
 test("without the statuses permission the review is still posted, and the status is not asked for again", async () => {

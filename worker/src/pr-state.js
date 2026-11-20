@@ -738,7 +738,13 @@ export class PrState {
       if (item.cmd === "pause") {
         st.paused = true;
         await this.ctx.storage.put("state", st);
-        return fx.comment(item.repo.full, item.pr, `Automatic reviews are paused on this pull request. Comment \`@${slug} resume\` to start them again.`);
+        // As CodeRabbit's pause notice: where the reviews stand.
+        const head = typeof fx.pullRequest === "function" ? (await fx.pullRequest(item.repo.full, item.pr))?.head?.sha : null;
+        const seen = st.lastCompleteReviewed ?? st.lastReviewed;
+        const where = [];
+        if (seen) where.push(`- Last reviewed commit: \`${seen.slice(0, 7)}\``);
+        if (head && head !== seen) where.push(`- Latest commit, not reviewed: \`${head.slice(0, 7)}\``);
+        return fx.comment(item.repo.full, item.pr, `Automatic reviews are paused on this pull request. Comment \`@${slug} resume\` to start them again.${where.length ? `\n\n${where.join("\n")}` : ""}`);
       }
       if (item.cmd === "resume") {
         st.paused = false;

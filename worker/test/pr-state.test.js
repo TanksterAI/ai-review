@@ -1256,6 +1256,31 @@ test("review while a review of the head is already under way is declined, not qu
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
 });
 
+test("pause names the last reviewed commit and the latest one not reviewed, as CodeRabbit's does", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  const text = comments(fx)[0];
+  assert.match(text, /are paused on this pull request\. Comment `@tankster-ai-review resume`/);
+  assert.match(text, /- Last reviewed commit: `ccccccc`/);
+  assert.match(text, /- Latest commit, not reviewed: `eeeeeee`/);
+  // Nothing was reviewed yet, or the head is the reviewed one: only what is true is said.
+  const two = make();
+  withPr(two.fx, "c".repeat(40));
+  await two.storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await two.obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(two.obj);
+  assert.doesNotMatch(comments(two.fx)[0], /not reviewed/);
+  const none = make();
+  withPr(none.fx, "e".repeat(40));
+  await none.obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(none.obj);
+  assert.doesNotMatch(comments(none.fx)[0], /Last reviewed commit/);
+  assert.match(comments(none.fx)[0], /- Latest commit, not reviewed: `eeeeeee`/);
+});
+
 test("resume reviews the commits pushed while paused, as CodeRabbit's; with none, it only says so", async () => {
   const { obj, fx, storage } = make();
   withPr(fx, "c".repeat(40));

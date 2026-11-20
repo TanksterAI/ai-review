@@ -131,6 +131,7 @@ const threadsKey = (id) => `${RUN}${id}:threads`;
 const summaryKey = (id) => `${RUN}${id}:summary`;
 // GitHub calls one threads step may make (each counts as a subrequest).
 const COMPARES_PER_STEP = 6;
+const COMMITS_SHOWN = 20;
 const APPLIES_PER_STEP = 10;
 const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
@@ -336,6 +337,10 @@ async function stagePr(ctx, run, save) {
         for (const [i, f] of files.entries()) await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars);
         run.files = files.length;
         run.mergeBase = run.since;
+        // The commits this review covers, shown in its summary (the last 20).
+        const cs = Array.isArray(cmp.commits) ? cmp.commits : [];
+        run.commitCount = Number.isSafeInteger(cmp.total_commits) ? cmp.total_commits : cs.length;
+        run.commits = cs.slice(-COMMITS_SHOWN).map((c) => ({ sha: String(c?.sha ?? ""), subject: String(c?.commit?.message ?? "").split("\n")[0] }));
         run.stage = "content";
         await save(run);
         return ctx.deps.now();
@@ -757,6 +762,7 @@ async function stagePost(ctx, run, save) {
   // What the summary comment shows, once the threads are checked.
   await ctx.storage.put(summaryKey(run.id), {
     summary: review.summary, about: review.about, shown: shownCount, actionable: blocking, complete, since: run.since ?? null,
+    commits: run.since ? run.commits ?? [] : [], commitCount: run.since ? run.commitCount ?? 0 : 0,
     covered: cov.covered, reviewable: cov.reviewable,
   });
   run.result = { complete, shown: shownCount, covered: cov.covered, reviewable: cov.reviewable };
@@ -943,7 +949,12 @@ async function stageThreads(ctx, run, save) {
 
 // --- summary: the one comment, edited in place ------------------------------
 
-export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, threads, none = false }) {
+// A commit subject is untrusted: it is shown inside a code span, stripped of
+// anything that could close the span or open markup, so it cannot ping anyone
+// or inject HTML, and cut short.
+const subjectText = (t) => String(t ?? "").replace(/[`<>|\u0000-\u001f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 72);
+
+export function summaryText({ headSha, summary, about, shown, actionable = shown, complete, since, commits = [], commitCount = 0, threads, none = false }) {
   const lines = ["### Tankster AI Review", ""];
   lines.push(`**Latest review:** commit \`${headSha.slice(0, 7)}\`${since ? `, the commits after \`${since.slice(0, 7)}\`` : ""}.`, "");
   if (!complete || none) lines.push(summary, "");
@@ -952,6 +963,14 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   else if (shown) lines.push(`No actionable comments were generated in the recent review. ${summary} Nitpicks do not block approval.`, "");
   // CodeRabbit's own words for a review with no findings.
   else lines.push("No actionable comments were generated in the recent review. 🎉", "");
+  if (since && commits.length) {
+    const shownCommits = commits.slice(-COMMITS_SHOWN);
+    const total = Math.max(commitCount, commits.length);
+    lines.push(`<details><summary>Commits reviewed (${total})</summary>`, "");
+    if (total > shownCommits.length) lines.push(`Showing the ${shownCommits.length} latest.`, "");
+    for (const c of shownCommits) lines.push(`- \`${String(c.sha).slice(0, 7)}\` ${subjectText(c.subject)}`);
+    lines.push("", "</details>", "");
+  }
   if (threads) {
     const parts = [];
     if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);
