@@ -1886,3 +1886,26 @@ test("review fixes 2: GitHub's open and ready answer is written back over stale 
   assert.equal(st.closed, false);
   assert.equal(st.draft, false);
 });
+
+test("review fixes 3: an author without write access, not yet reviewed, is pointed to a writer too; a bot or an already reviewed one is not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const shape = { state: "open", draft: false, head: { sha: "a".repeat(40) }, author_association: "CONTRIBUTOR", user: { type: "User" } };
+  fx.pullRequest = async () => shape;
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
+  fx.pullRequest = async () => ({ ...shape, user: { type: "Bot" } });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+  fx.pullRequest = async () => shape;
+  await storage.put("state", { lastReviewed: "b".repeat(40) });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+});
+
+test("review fixes 3: a run that held the neutral success and whose closing status did not land puts the commit back to pending", async () => {
+  const { obj, storage } = make();
+  const run = { id: "w1", repo, pr: 39, headSha: "a".repeat(40), heldSuccess: true, lastStatusOk: false };
+  await obj.runDone(run, { reviewedSha: null, gaveUp: true, description: "gave up" });
+  assert.ok((await storage.get("outbox")).some((x) => x.type === "status" && x.sha === "a".repeat(40) && x.waiting === true));
+  await storage.put("outbox", []);
+  await obj.runDone({ ...run, lastStatusOk: true }, { reviewedSha: null, gaveUp: true, description: "gave up" });
+  assert.ok(!(await storage.get("outbox")).some((x) => x.type === "status"));
+});

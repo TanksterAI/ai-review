@@ -887,6 +887,9 @@ export class PrState {
     const queued = ((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.id !== ignore && (x.type === "dispatch" || (x.type === "command" && x.authorised === true && /review$/.test(String(x.cmd)))));
     // A fork's pull request is reviewed only when a writer asks.
     const fork = Boolean(info?.head?.repo?.full_name && info?.base?.repo?.full_name && info.head.repo.full_name !== info.base.repo.full_name);
+    // An author without write access (and not a bot) is reviewed once a writer
+    // asks, unless an author check already let a review start.
+    const outsider = Boolean(info) && !fork && info.user?.type !== "Bot" && Boolean(info.author_association) && !WRITER_ASSOCIATIONS.has(info.author_association) && !st.lastReviewed;
     const reviewed = Boolean(head) && head === st.lastCompleteReviewed;
     const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
       : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
@@ -897,7 +900,7 @@ export class PrState {
     const next = shut ? "none"
       : draft ? "mark_ready_for_review"
       : running || queued ? "wait"
-      : fork && !reviewed ? "ask_a_writer_to_request_review"
+      : (fork && !reviewed) || outsider ? "ask_a_writer_to_request_review"
       : st.paused ? "resume"
       : reviewed ? "read_threads"
       : "wait";
@@ -1074,6 +1077,9 @@ export class PrState {
       // Only after the edit is queued: were that to fail, the job (and its
       // ackId) is still there for the retry.
       await this.ctx.storage.delete(`job:${run.id}`);
+      // The run held the neutral "delayed" success and its closing status did
+      // not land: the commit must not keep passing the gate unreviewed.
+      if (run.heldSuccess && run.lastStatusOk === false && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
       // The summary was written again without its notice: decide puts back
       // the right one (pending, as the head has no complete review).
       await this.queueDecide({});

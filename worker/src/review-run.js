@@ -288,14 +288,18 @@ function countSubrequests(ctx, budget) {
 }
 
 async function status(ctx, run, state, description) {
-  if (!run.headSha || run.statusOk === false) return;
+  // lastStatusOk: whether the latest write landed, so a run that ends after
+  // holding the neutral "delayed" success can put the commit back to pending.
+  if (!run.headSha || run.statusOk === false) { run.lastStatusOk = false; return; }
   try {
     const ok = await ctx.fx.setStatus(run.repo.full, run.headSha, state, description);
+    run.lastStatusOk = ok !== false;
     if (ok === false && run.statusOk !== false) {
       run.statusOk = false;
       ctx.deps.log?.({ ev: "status_unavailable", reason: "the App lacks statuses:write" });
     } else if (ok) run.statusOk = true;
   } catch (e) {
+    run.lastStatusOk = false;
     ctx.deps.log?.({ ev: "status_failed", error: String(e?.message ?? e).slice(0, 120) });
   }
 }
@@ -591,6 +595,7 @@ async function next(ctx, run, save, batches, at, nextStage) {
   // Once some files are reviewed it stays pending, so a PR is never merged
   // with files unreviewed because the providers ran out.
   const delayed = `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`;
+  run.heldSuccess = done.size === 0;
   await status(ctx, run, done.size > 0 ? "pending" : "success", delayed);
   await save(run);
   return run.waitUntil;
