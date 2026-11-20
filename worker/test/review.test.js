@@ -624,6 +624,31 @@ test("the Worker's verbatim blocks come before any multi-line model text", () =>
   assert.ok(sug > 0 && sug < prompt && prompt < own, body);
 });
 
+const item = (i, severity, extra = {}) => ({ id: `${String(i).padStart(8, "0")}`, path: "src/a.js", line: i, inline: true, severity, type: "issue", category: "bug", title: `T${i}`, body: "b", prompt: "", suggestion: null, ...extra });
+const profileReview = (profile, inline, general = []) => renderReview({ answer: { summary: "s" }, classified: { inline, general }, prepared: shown(), meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile, headSha: "a".repeat(40) } });
+
+test("chill, as CodeRabbit's: at most 20 inline comments; the least severe beyond them are collapsed, never dropped", () => {
+  const items = [...Array.from({ length: 22 }, (_, i) => item(i + 1, "major")), ...Array.from({ length: 3 }, (_, i) => item(i + 30, "minor"))];
+  const r = profileReview("chill", items);
+  assert.equal(r.comments.length, 20);
+  // The three minors and two majors are in the collapsed section, with their titles.
+  assert.match(r.body, /<summary>🧹 Nitpick comments \(5\)<\/summary>/);
+  for (const t of ["T30", "T31", "T32", "T21", "T22"]) assert.match(r.body, new RegExp(`: ${t}\\*\\*`), t);
+  assert.equal(profileReview("chill", items.slice(0, 20)).comments.length, 20);
+  assert.doesNotMatch(profileReview("chill", items.slice(0, 20)).body, /Nitpick comments/);
+  // Assertive has no cap.
+  assert.equal(profileReview("assertive", items).comments.length, 25);
+});
+
+test("quiet, as CodeRabbit's: only critical, major and security findings inline; the rest collapsed, not hidden", () => {
+  const r = profileReview("quiet", [item(1, "critical"), item(2, "major"), item(3, "minor"), item(4, "minor", { category: "security" }), item(5, "trivial", { type: "nitpick" })]);
+  assert.deepEqual(r.comments.map((c) => c.line), [1, 2, 4]);
+  assert.match(r.body, /<summary>🧹 Nitpick comments \(2\)<\/summary>/);
+  assert.match(r.body, /: T3\*\*/);
+  assert.match(r.body, /: T5\*\*/);
+  assert.doesNotMatch(r.body, /left out/);
+});
+
 test("effort: only a model's quick/moderate/large counts, and a quick win shows as CodeRabbit's label; ids keep the old key", () => {
   const p = shown();
   const mk = (effort) => ({ summary: "s", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "security", effort, title: "Leak", body: "b" }] });
@@ -719,7 +744,7 @@ test("chill: nitpicks, trivial and info findings go in a collapsed section; the 
   assert.deepEqual(v.findings.filter((f) => f.inline).map((f) => f.id), ["aaaaaaa1"]);
 });
 
-test("assertive puts nitpicks inline; quiet leaves them out but keeps them in the block", () => {
+test("assertive puts nitpicks inline; quiet collapses everything below major, with the block still recording each", () => {
   const a = render("assertive");
   assert.deepEqual(a.comments.map((c) => c.line), [3, 1, 2, 4]);
   assert.doesNotMatch(a.body, /Nitpick comments/);
@@ -727,15 +752,13 @@ test("assertive puts nitpicks inline; quiet leaves them out but keeps them in th
   assert.match(a.comments[2].body, /```suggestion\nconst x = 3;\n```/);
   const q = render("quiet");
   assert.deepEqual(q.comments.map((c) => c.line), [3]);
-  // Out of view: only the block (line 2) still has them.
-  assert.doesNotMatch(q.body.split("\n").slice(2).join("\n"), /Nitpick comments|Polish|Tiny|Elsewhere nit/);
-  assert.match(q.body, /2 findings: 1 inline, 1 below\. 4 nitpicks left out \(quiet profile\)\./);
+  // Collapsed, not hidden: the nitpick section lists them.
+  assert.match(q.body, /Nitpick comments/);
+  assert.match(q.body, /Polish|Tiny/);
+  assert.doesNotMatch(q.body, /left out/);
   const v = parseFindingsBlock(q.body);
   assert.deepEqual(v.findings.filter((f) => f.status === "confirmed").map((f) => f.id), ["aaaaaaa1", "aaaaaaa2", "aaaaaaa3", "aaaaaaa4", "aaaaaaa5", "aaaaaaa6"]);
   assert.equal(v.findings.find((f) => f.id === "aaaaaaa2").inline, false);
-  // Nothing at all to show.
-  const only = renderReview({ answer: { summary: "s" }, classified: { inline: [placed().inline[1]], general: [] }, prepared: shown(), meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "quiet" } });
-  assert.match(only.body, /No findings to show; 1 nitpick left out \(quiet profile\)\./);
   // An unknown profile is chill.
   assert.deepEqual(render("loud").comments.map((c) => c.line), [3]);
 });

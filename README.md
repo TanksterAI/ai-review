@@ -88,7 +88,7 @@ sends the diff to Worker /v1/runner/review in one request (one prompt, at most 9
 
 Checked on 19 Nov 2026 against CodeRabbit's docs (Automatic Approvals, the request-changes workflow) and against what it did on TanksterAI/ai-review#14.
 
-- **A review only when there is something to say.** A review with actionable findings is filed as **Changes requested**, with its inline comments. A review with only nitpicks (typed nitpick, or trivial or info severity, but never a critical, major or security finding) is filed as a comment: they are shown, and never block, as CodeRabbit's. A review with no findings posts no review at all; CodeRabbit does not either. Those the quiet profile leaves out are not shown at all. Runner mode and v1 stay advisory: a comment review every time, with no summary comment, thread checks or approvals.
+- **A review only when there is something to say.** A review with actionable findings is filed as **Changes requested**, with its inline comments. A review with only nitpicks (typed nitpick, or trivial or info severity, but never a critical, major or security finding) is filed as a comment: they are shown, and never block, as CodeRabbit's. A review with no findings posts no review at all; CodeRabbit does not either. Runner mode and v1 stay advisory: a comment review every time, with no summary comment, thread checks or approvals.
 - **One summary comment, edited in place.** The first review creates it, and every later one edits it (its id is kept in the PR's object; a deleted one is posted again). It names the commit reviewed, the commits since the last review, "Actionable comments posted: N" or "No actionable comments were generated in the recent review. 🎉" (CodeRabbit's words), how many earlier threads were resolved, and the details (models, coverage, cost).
 - **Earlier threads, re-checked on every review** (`addressed.js`). For each of the App's own open threads written at an earlier commit:
   - its file deleted since: addressed;
@@ -288,8 +288,8 @@ No model text reaches a review unless it has passed a deterministic grounding ch
 | Finding | Where it goes |
 |---|---|
 | Confirmed issue or refactor, minor or above, on a diff line | An inline comment, with its suggestion and agent prompt where the verifiers passed them |
-| Confirmed nitpick, or trivial or info severity | `chill`: a collapsed "🧹 Nitpick comments" section of the review body, with its agent prompt only if the prompt passed verification, and never a suggestion. `assertive`: inline. `quiet`: not shown, but kept in the findings record |
-| Confirmed, outside the diff | A collapsed "Outside diff range comments" section (`quiet` leaves out its nitpicks) |
+| Confirmed nitpick, or trivial or info severity | `chill`: a collapsed "🧹 Nitpick comments" section of the review body, with its agent prompt only if the prompt passed verification, and never a suggestion. `assertive`: inline. `quiet`: collapsed in the same section, with everything below major (as CodeRabbit's quiet profile). `chill` also shows at most 20 inline comments: the least severe beyond them are collapsed in that section, never dropped, and still count as actionable |
+| Confirmed, outside the diff | A collapsed "Outside diff range comments" section (`quiet` collapses its nitpicks into the Nitpick section) |
 | Unconfirmed, refuted, or dropped by the grounding gate | The findings record only: never shown, never inline, and never counted as a finding |
 
 - **What a hidden finding leaves behind.** The findings record keeps its id, labels, status and the Worker's reason, and its path only when that names a file in the change. None of its own text is kept: no title, body, claim, evidence, prompt or suggestion, anywhere in the review.

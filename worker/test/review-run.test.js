@@ -785,7 +785,7 @@ test("a review that checks threads from many commits still finishes: every threa
   assert.equal(s.github.statuses.at(-1).state, "success");
 });
 
-test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment, nothing is kept; the quiet profile shows none", async () => {
+test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment, nothing is kept; the quiet profile collapses it too", async () => {
   const nit = { severity: "trivial", type: "nitpick", title: "Name it better" };
   const chill = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }) });
   await runAll(chill);
@@ -797,7 +797,8 @@ test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment,
 
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
-  assert.equal(quiet.github.posted.length, 0, "nothing shown, nothing to resolve: no review");
+  assert.equal(quiet.github.posted.length, 1, "quiet collapses a nitpick, as CodeRabbit's, and does not hide it");
+  assert.equal(quiet.github.posted[0].comments.length, 0);
   assert.deepEqual(await listOpenFindings(quiet.storage), []);
   assert.match(quiet.github.summaries[0].body, /No actionable comments were generated/);
 });

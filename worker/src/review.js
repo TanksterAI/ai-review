@@ -610,8 +610,10 @@ export function codeSpan(text) {
 }
 
 // Placement profiles (CodeRabbit's reviews.profile): chill puts nitpicks in a
-// collapsed section, assertive puts them inline, quiet leaves them out.
+// collapsed section, assertive puts them inline, quiet collapses everything below major.
 export const PROFILES = ["chill", "assertive", "quiet"];
+// CodeRabbit's chill profile shows at most this many inline comments.
+const CHILL_INLINE_CAP = 20;
 
 // A critical, major or security finding is never a nitpick, whatever type the
 // drafter gave it: it is placed, and blocks, as an issue.
@@ -687,14 +689,26 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   const inline = [];
   const nitpicks = [];
   const outside = [];
-  let left = 0;
+  // As CodeRabbit's profiles. chill: nitpicks collapsed, and at most 20
+  // inline comments, the least severe beyond them collapsed too. quiet: only
+  // critical, major and security findings inline, the rest collapsed. Nothing
+  // is dropped; assertive puts everything inline.
+  const loud = (f) => f.severity === "critical" || f.severity === "major" || f.category === "security";
   for (const f of classified.inline) {
-    if (!minorish(f) || profile === "assertive") inline.push(f);
-    else if (profile === "chill") nitpicks.push(f);
-    else left++;
+    if (profile === "assertive") inline.push(f);
+    else if (profile === "quiet" ? !loud(f) : minorish(f)) nitpicks.push(f);
+    else inline.push(f);
+  }
+  if (profile === "chill" && inline.length > CHILL_INLINE_CAP) {
+    // The least severe go first; among equals, the later ones.
+    const order = inline.map((f, i) => ({ f, i })).sort((a, b) => SEVERITIES.indexOf(b.f.severity) - SEVERITIES.indexOf(a.f.severity) || b.i - a.i);
+    const drop = new Set(order.slice(0, inline.length - CHILL_INLINE_CAP).map((x) => x.f));
+    const kept = inline.filter((f) => !drop.has(f));
+    nitpicks.push(...inline.filter((f) => drop.has(f)));
+    inline.splice(0, inline.length, ...kept);
   }
   for (const f of classified.general) {
-    if (profile === "quiet" && minorish(f)) left++;
+    if (profile === "quiet" && minorish(f)) nitpicks.push(f);
     else outside.push(f);
   }
   // singleLine[i]: comment i's body without its suggestion, for when only its
@@ -720,11 +734,8 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   const lines = [MARKER, block, "### Tankster AI Review", "", summary, ""];
   const total = inline.length + nitpicks.length + outside.length;
   const below = nitpicks.length + outside.length;
-  const quiet = left ? ` ${plural(left, "nitpick")} left out (quiet profile).` : "";
   if (total > 0) {
-    lines.push(`${plural(total, "finding")}: ${inline.length} inline${below ? `, ${below} below` : ""}.${quiet}`, "");
-  } else if (left) {
-    lines.push(`No findings to show;${quiet}`, "");
+    lines.push(`${plural(total, "finding")}: ${inline.length} inline${below ? `, ${below} below` : ""}.`, "");
   } else if (hidden.length) {
     lines.push("No confirmed problems in the reviewed files.", "");
   } else {
@@ -793,8 +804,10 @@ export function renderReview({ answer: _drafted, classified, prepared, meta, hid
   // the diff); nitpicks are shown but, as CodeRabbit's, never block, and
   // those the quiet profile left out are not shown at all. listed: the
   // actionable ones shown only in the body, which have no thread.
-  const actionable = [...inline, ...outside].filter((f) => !minorish(f));
-  const inBody = outside.filter((f) => !minorish(f)).map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
+  // A finding the profile collapsed (beyond chill's cap, or below quiet's
+  // line) still counts and is still held: only nitpicks never block.
+  const actionable = [...inline, ...outside, ...nitpicks].filter((f) => !minorish(f));
+  const inBody = [...outside, ...nitpicks].filter((f) => !minorish(f)).map((f) => ({ id: f.id, path: f.path || null, line: Number.isInteger(f.line) ? f.line : null, severity: f.severity, category: f.category, text: `${f.title}\n\n${f.body ?? ""}` }));
   return { body, comments, singleLine, summary, about: lines.slice(aboutAt).join("\n"), shown: total, blocking: actionable.length, listed: inBody };
 }
 
