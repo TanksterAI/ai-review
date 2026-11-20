@@ -1784,3 +1784,29 @@ test("threads lists the reviewer's own threads for an agent: open ones by defaul
   const all = await obj.threads({ slug: "tankster-ai-review", repo, pr: 39, include_resolved: true });
   assert.equal(all.threads.length, 2);
 });
+
+test("`rate limit` says whether a review can run now, or when one can; it needs write access and runs nothing", async () => {
+  expect_parse: {
+    assert.equal(parseCommand("@tankster-ai-review rate limit", "tankster-ai-review"), "rate limit");
+    assert.equal(parseCommand("@tankster-ai-review rate limit please", "tankster-ai-review"), null);
+  }
+  for (const [cap, want] of [
+    [{ ok: true }, /A review can run now/],
+    [{ ok: false, retryAt: NOW + 3600_000 }, /No model has capacity now[\s\S]*\d\d:\d\d UTC/],
+  ]) {
+    const storage = memoryStorage();
+    const fx = fakeEffects({ writers: ["rishitank"] });
+    withPr(fx, "a".repeat(40));
+    const obj = new PrState(doCtx(storage), RUNNER, { now: () => NOW, effects: fx, capacity: async () => cap });
+    await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review rate limit") });
+    await fire(obj);
+    assert.equal(comments(fx).length, 1);
+    assert.match(comments(fx)[0], want);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  }
+  const { obj, fx } = make({ writers: [] });
+  withPr(fx, "a".repeat(40));
+  await obj.onEvent({ delivery: "d2", ev: { ...command("@tankster-ai-review rate limit"), sender: { login: "stranger", bot: false } } });
+  await fire(obj);
+  assert.ok(!comments(fx).some((b) => /capacity/.test(b)), "a non-writer learns nothing about capacity");
+});

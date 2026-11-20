@@ -154,12 +154,12 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
   - events: `pull_request`, `issue_comment`, `pull_request_review_comment`, `pull_request_review_thread` (a thread resolved or reopened by hand decides the approval; added to the existing App on 19 Nov 2026).
 
   Later phases add permissions, and GitHub asks the owner to approve each addition. **Commit statuses** came with full coverage: the App created before it must be given it once (App settings → Permissions & events → Commit statuses: Read and write, then accept the request on the organisation's installation). Until then reviews are still posted, and the Worker logs `status_unavailable` instead of setting the status.
-- **Commands.** `review`, `full review`, `pause` (or `ignore`), `resume`, `resolve`, `approve` and `help`. Everything except `help` needs write access, checked through the API.
+- **Commands.** `review`, `full review`, `pause` (or `ignore`), `resume`, `resolve`, `approve`, `rate limit` (whether a review can run now, or when) and `help`. Everything except `help` needs write access, checked through the API.
   - **Syntax, as CodeRabbit's:**
     - The handle starts a line, written as plain text: not in a fenced or indented code block, not in an HTML comment, and not after other text on the line. Case does not matter. Comments are read line by line, as GitHub's Markdown reads them, so no comment can make the parser slow.
     - One command per comment: the first such line counts.
     - `review` and `full review` must be alone on their line, so `review please` is not a command.
-    - `pause`, `resume`, `resolve`, `approve` and `help` must be the whole comment (nothing else, hidden text and code blocks included).
+    - `pause`, `resume`, `resolve`, `approve`, `rate limit` and `help` must be the whole comment (nothing else, hidden text and code blocks included).
   - **Replies:**
     - `review` and `full review` answer "Action performed: Review triggered.", edited to "Review finished." when the review completes. A review that could cover only part of the files is edited to "Review finished." with how far it got. Every other end is "Action not completed" with the reason: the review gave up, could not start (its dispatch failed five times), expired before it could run, or the pull request was closed. No answer is left saying "Review triggered." for ever.
     - `review` on a head already reviewed in full answers "Action not completed: Already reviewed the last commit", and `full review` reviews it again.

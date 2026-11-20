@@ -32,18 +32,18 @@ const RECHECK_MS = 30_000;
 function seconds(v, fallback) {
   return /^\d+(\.\d+)?$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : fallback;
 }
-const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "help"];
+const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "rate limit", "help"];
 // As CodeRabbit's (reference/review-commands): these run only when they are
 // the whole comment, with no other text before or after. `review` and
 // `full review` need only be alone on their line.
-const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "help"]);
+const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "rate limit", "help"]);
 // `ignore` is CodeRabbit's other name for `pause`.
 const ALIASES = { ignore: "pause" };
 // As CodeRabbit's: `approve` works only as a top-level comment. `resolve` in
 // a reply in one of the App's threads resolves only that thread.
 // As CodeRabbit's: only resolve works as a reply in a review thread (it
 // resolves that thread); every other command goes in a PR comment.
-const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "help", "approve"]);
+const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "help", "approve", "rate limit"]);
 // Threads one alarm resolves at most (each is a subrequest; Workers Free
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
@@ -64,6 +64,7 @@ export function helpText(slug = DEFAULT_SLUG) {
     "| `resume` | Start automatic reviews again, and review the commits pushed while they were paused |",
     "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's). As a reply in one of its threads, resolve that thread only |",
     "| `approve` | The same as a top-level `resolve` |",
+    "| `rate limit` | Say whether a review can run now, or when one can |",
     "| `help` | Show this list |",
     "",
     "`review` and `full review` must be alone on their line; the others must be the whole comment.",
@@ -808,6 +809,12 @@ export class PrState {
           return undefined;
         }
         return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
+      }
+      if (item.cmd === "rate limit") {
+        const cap = await this.capacityNow();
+        const at = Number.isFinite(cap.retryAt) ? new Date(cap.retryAt).toISOString().slice(11, 16) : null;
+        await fx.comment(item.repo.full, item.pr, actionPerformed(cap.ok ? "A review can run now: a model has capacity." : `No model has capacity now${at ? `: a review runs when one resets, at ${at} UTC` : ""}. Reviews are delayed, not skipped.`));
+        return undefined;
       }
       if (item.cmd === "resolve" && Number.isSafeInteger(item.inThreadOf)) return this.resolveOne(fx, item, slug);
       if (item.cmd === "resolve" || item.cmd === "approve") return this.resolveAll(fx, item, slug);
