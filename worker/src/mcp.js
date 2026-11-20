@@ -17,8 +17,8 @@ import { ORG } from "./effects.js";
 
 export const INSTRUCTIONS = [
   "Tankster AI Review reviews a pull request by itself: when it is opened, when a draft is marked ready for review, and a few minutes after the last push.",
-  "Do not ask for a review to start one. Open pull requests ready for review, not as a draft, and push; the review follows.",
-  "Before anything else, call get_review_status and follow its next_action: wait (a review is coming or running), read_threads (the last commit is reviewed), mark_ready_for_review (a draft is not reviewed), resume (automatic reviews are paused), none (closed).",
+  "Do not ask for a review to start one, except as ask_a_writer_to_request_review says. Open pull requests ready for review, not as a draft, and push; the review follows.",
+  "Before anything else, call get_review_status and follow its next_action: wait (a review is coming or running), ask_a_writer_to_request_review (a pull request from a fork is reviewed only when someone with write access calls request_review), read_threads (the last commit is reviewed), mark_ready_for_review (a draft is not reviewed), resume (automatic reviews are paused), none (closed).",
   "request_review is for a full re-review only; it refuses, with the reason, whatever would change nothing.",
 ].join(" ");
 
@@ -75,7 +75,16 @@ async function run(name, args, token, deps) {
   const t = target(args);
   if (!t) return content("Give repository as TanksterAI/<name> and pull_number as a positive integer.", true);
   // The caller's own token must see the pull request.
-  if (!(await gh(deps.fetch, token, `/repos/${t.repo.full}/pulls/${t.pr}`))) return content("That pull request was not found, or your GitHub account cannot see it.", true);
+  const pull = await gh(deps.fetch, token, `/repos/${t.repo.full}/pulls/${t.pr}`);
+  if (!pull) return content("That pull request was not found, or your GitHub account cannot see it.", true);
+  // GitHub's own spelling of the repository is its identity: names differ only
+  // by case, but the reviewer's state is keyed on the name it is given.
+  const canonical = pull.base?.repo?.full_name;
+  if (canonical) {
+    const [o, n] = String(canonical).split("/");
+    if (o !== ORG || !NAME_RE.test(n ?? "")) return content("That pull request is not in a TanksterAI repository.", true);
+    t.repo = { full: canonical, name: n };
+  }
   const slug = deps.slug;
   if (name === "get_review_status") return content(await deps.ask(t.repo.full, t.pr, { op: "status", slug, repo: t.repo, pr: t.pr }));
   if (name === "list_review_threads") return content(await deps.ask(t.repo.full, t.pr, { op: "threads", slug, repo: t.repo, pr: t.pr, include_resolved: args.include_resolved === true }));

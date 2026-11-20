@@ -1840,3 +1840,49 @@ test("review fixes: a held job that sets the neutral status puts the commit back
   await obj.releaseHeld({ id: "j2", repo, pr: 39 });
   assert.equal((await storage.get("outbox")).length, 0);
 });
+
+test("review fixes 2: a live runner job counts as a review under way; an expired one does not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("job:r1", { id: "r1", repo, pr: 39, claimedBy: "worker", claimedAt: NOW - 60_000, dispatchedAt: NOW - 60_000 });
+  const st = await obj.status({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.equal(st.reviewing, true);
+  assert.equal(st.next_action, "wait");
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, false);
+  assert.match(out.reason, /under way/);
+  await storage.put("job:r1", { id: "r1", repo, pr: 39, claimedBy: "worker", claimedAt: NOW - 3 * 3600_000, dispatchedAt: NOW - 3 * 3600_000 });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).reviewing, false);
+});
+
+test("review fixes 2: only an authorised queued command blocks a request; an unchecked comment command does not", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("outbox", [{ id: "c1", attempts: 0, type: "command", cmd: "review", slug: "tankster-ai-review", login: "stranger", repo, pr: 39 }]);
+  const ok = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(ok.accepted, true, ok.reason);
+  assert.equal((await storage.get("outbox")).at(-1).authorised, true);
+  // The queued command is judged without itself and without unchecked ones.
+  const a = await obj.advise(fx, await obj.state(), { cmd: "review", slug: "tankster-ai-review", repo, pr: 39, ignore: (await storage.get("outbox")).at(-1).id });
+  assert.equal(a.why, null);
+});
+
+test("review fixes 2: a fork PR no one has asked a writer about says so, not just wait", async () => {
+  const { obj, fx } = make();
+  withPr(fx, "a".repeat(40));
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "a".repeat(40), repo: { full_name: "outsider/ai-review" } }, base: { repo: { full_name: "TanksterAI/ai-review" } } });
+  const st = await obj.status({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.equal(st.next_action, "ask_a_writer_to_request_review");
+  assert.equal(st.can_request_review, true);
+});
+
+test("review fixes 2: GitHub's open and ready answer is written back over stale closed and draft flags when a review is accepted", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  await storage.put("state", { draft: true, closed: true, paused: false });
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true, out.reason);
+  const st = await storage.get("state");
+  assert.equal(st.closed, false);
+  assert.equal(st.draft, false);
+});

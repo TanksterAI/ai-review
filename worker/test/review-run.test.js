@@ -306,7 +306,7 @@ test("an incremental review's summary lists the commits it covered, safely", asy
   await runAll(s);
   const text = github.summaries[0].body;
   assert.match(text, /<summary>Commits reviewed \(2\)<\/summary>/);
-  assert.match(text, /- `1111111` Fix the thing @everyone b now \/b x/);
+  assert.match(text, /- `1111111` `Fix the thing @\u200Beveryone b now \/b x`/, "the subject sits in a code span, so @everyone pings no one");
   assert.doesNotMatch(text, /<b>|\|/);
 });
 

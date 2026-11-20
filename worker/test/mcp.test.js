@@ -146,3 +146,23 @@ test("a GitHub 401, 403 or 5xx is told apart from a PR that is not found, and no
     assert.equal(s.asked.length, 0);
   }
 });
+
+test("the repository's canonical name from GitHub is what the reviewer's state is keyed on, whatever case the caller used", async () => {
+  const s = stub({ status: { ok: true } });
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    if (/^\/repos\/TanksterAI\/[\w.-]+\/pulls\/\d+$/.test(u.pathname)) return new Response(JSON.stringify({ number: 3, base: { repo: { full_name: "TanksterAI/ai-review" } } }), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  await handleMcp(post(call("get_review_status", { repository: "TanksterAI/AI-REVIEW", pull_number: 3 })), {}, { fetch: fetchImpl, ...s });
+  assert.equal(s.asked[0].repo, "TanksterAI/ai-review");
+  assert.equal(s.asked[0].msg.repo.full, "TanksterAI/ai-review");
+});
+
+test("a pull request whose base repository is not in the organisation is refused", async () => {
+  const s = stub();
+  const fetchImpl = async () => new Response(JSON.stringify({ number: 3, base: { repo: { full_name: "someone-else/ai-review" } } }), { status: 200 });
+  const body = await (await handleMcp(post(call("get_review_status", { repository: "TanksterAI/ai-review", pull_number: 3 })), {}, { fetch: fetchImpl, ...s })).json();
+  assert.equal(body.result.isError, true);
+  assert.equal(s.asked.length, 0);
+});

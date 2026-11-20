@@ -186,7 +186,7 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
 
 | Tool | What it does |
 | --- | --- |
-| `get_review_status` | Read-only. The PR's state (open, draft, reviewing, paused, closed), its head, the last reviewed head, `can_request_review` with the `reason` when not, and `next_action`: `wait`, `read_threads`, `mark_ready_for_review`, `resume` or `none`. |
+| `get_review_status` | Read-only. The PR's state (open, draft, reviewing, paused, closed), its head, the last reviewed head, `can_request_review` with the `reason` when not, and `next_action`: `wait`, `read_threads`, `mark_ready_for_review`, `resume`, `ask_a_writer_to_request_review` (a fork's pull request, reviewed only when someone with write access asks) or `none`. |
 | `list_review_threads` | Read-only. The reviewer's own threads (open ones unless `include_resolved`), each with severity, category, file, line and finding id. |
 | `request_review` | The request a `review` / `full review` comment makes (needs write access), refused with its reason when it would change nothing: a draft, a closed PR, a head under review, or (for `review`) a head already reviewed. |
 

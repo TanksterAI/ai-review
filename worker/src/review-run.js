@@ -591,7 +591,7 @@ async function next(ctx, run, save, batches, at, nextStage) {
   // Once some files are reviewed it stays pending, so a PR is never merged
   // with files unreviewed because the providers ran out.
   const delayed = `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`;
-  await status(ctx, run, cov.covered > 0 ? "pending" : "success", delayed);
+  await status(ctx, run, done.size > 0 ? "pending" : "success", delayed);
   await save(run);
   return run.waitUntil;
 }
@@ -973,7 +973,7 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
     const total = Math.max(commitCount, commits.length);
     lines.push(`<details><summary>Commits reviewed (${total})</summary>`, "");
     if (total > shownCommits.length) lines.push(`Showing the ${shownCommits.length} latest.`, "");
-    for (const c of shownCommits) lines.push(`- \`${String(c.sha).slice(0, 7)}\` ${subjectText(c.subject)}`);
+    for (const c of shownCommits) lines.push(`- \`${String(c.sha).slice(0, 7)}\` \`${codeSpan(subjectText(c.subject))}\``);
     lines.push("", "</details>", "");
   }
   if (threads) {

@@ -838,11 +838,12 @@ export class PrState {
       // a head already under review is not queued twice. A retried item
       // (its job already kept) skips these checks.
       if ((item.cmd === "review" || item.cmd === "full review") && !item.jobId && typeof fx.pullRequest === "function") {
-        const why = (await this.advise(fx, st, { cmd: item.cmd, slug, repo: item.repo, pr: item.pr, ignore: item.id })).why;
-        if (why) {
-          await fx.comment(item.repo.full, item.pr, actionNotCompleted(why));
+        const a = await this.advise(fx, st, { cmd: item.cmd, slug, repo: item.repo, pr: item.pr, ignore: item.id });
+        if (a.why) {
+          await fx.comment(item.repo.full, item.pr, actionNotCompleted(a.why));
           return undefined;
         }
+        await this.reconcile(st, a);
       }
       return this.reviewNow(fx, item, st, { full: item.cmd === "full review", text: "Review triggered." });
     }
@@ -869,24 +870,48 @@ export class PrState {
     // could leave stale; the flags are only for when GitHub cannot be asked.
     const shut = info ? info.state !== "open" : Boolean(st.closed);
     const draft = info ? Boolean(info.draft) : Boolean(st.draft);
-    const running = await activeRun(this.ctx.storage);
-    // Work already queued (a command, or a dispatch held for capacity) that
-    // has not started: a request now would queue a second review.
-    const queued = ((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.id !== ignore && (x.type === "dispatch" || (x.type === "command" && /review$/.test(String(x.cmd)))));
+    // A worker run, or a runner's job that has been dispatched or claimed and
+    // is not expired (a runner leaves no run record of its own).
+    let running = await activeRun(this.ctx.storage);
+    if (!running) {
+      const now = this.now();
+      for (const j of (await this.ctx.storage.list({ prefix: "job:" })).values()) {
+        const at = j?.claimedAt ?? j?.dispatchedAt;
+        if (at !== undefined && now - at < JOB_TTL_MS) { running = { runner: true, headSha: j.headSha ?? null }; break; }
+      }
+    }
+    // Work already queued that has not started (a dispatch held for capacity,
+    // or a command whose sender is already known to have write access): a
+    // request now would queue a second review. A comment's command is not
+    // counted until it is checked, so an outsider's cannot block a writer's.
+    const queued = ((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.id !== ignore && (x.type === "dispatch" || (x.type === "command" && x.authorised === true && /review$/.test(String(x.cmd)))));
+    // A fork's pull request is reviewed only when a writer asks.
+    const fork = Boolean(info?.head?.repo?.full_name && info?.base?.repo?.full_name && info.head.repo.full_name !== info.base.repo.full_name);
     const reviewed = Boolean(head) && head === st.lastCompleteReviewed;
     const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
       : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
-      : head && running?.headSha === head ? "A review of the last commit is already under way."
+      : running?.runner || (head && running?.headSha === head) ? "A review of the last commit is already under way."
       : queued && /review$/.test(cmd) ? "A review is already queued."
       : cmd === "review" && reviewed && !running ? `Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`
       : null;
     const next = shut ? "none"
       : draft ? "mark_ready_for_review"
       : running || queued ? "wait"
+      : fork && !reviewed ? "ask_a_writer_to_request_review"
       : st.paused ? "resume"
       : reviewed ? "read_threads"
       : "wait";
-    return { why, next, head, shut, draft, running, reviewed };
+    return { why, next, head, shut, draft, running, reviewed, open: Boolean(info) && !shut && !draft };
+  }
+
+  // GitHub says the pull request is open and ready: the stored flags follow,
+  // so a missed reopen or ready webhook cannot make the review's own
+  // decision (or the dispatch) treat it as closed or a draft.
+  async reconcile(st, a) {
+    if (!a.open || (!st.closed && !st.draft)) return;
+    st.closed = false;
+    st.draft = false;
+    await this.ctx.storage.put("state", st);
   }
 
   // MCP tool `get_review_status`: read-only.
@@ -930,8 +955,9 @@ export class PrState {
     const st = await this.state();
     const a = await this.advise(this.effects ?? createEffects(this.env, { config: await appConfig(this.env) }), st, { cmd: full ? "full review" : "review", slug, repo, pr });
     if (a.why) return { accepted: false, reason: a.why, next_action: a.next };
+    await this.reconcile(st, a);
     if (!(await this.ctx.storage.get("key"))) await this.ctx.storage.put("key", { repo: repo.full, pr });
-    await this.outbox({ type: "command", cmd: full ? "full review" : "review", slug, login, repo, pr });
+    await this.outbox({ type: "command", cmd: full ? "full review" : "review", slug, login, repo, pr, authorised: true });
     return { accepted: true, next_action: "wait" };
   }
 
