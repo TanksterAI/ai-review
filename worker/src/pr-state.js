@@ -558,9 +558,11 @@ export class PrState {
       // given up, and the PR is told (its status may still say pending).
       const run = await activeRun(this.ctx.storage);
       if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
-        await dropRun(this.ctx.storage, run.id);
-        // A run given up while it held the neutral success must not leave it.
+        // A run given up while it held the neutral success must not leave it:
+        // the reset is queued before the run is dropped, so an interruption
+        // between the two leaves the run to be given up again.
         if (run.heldSuccess && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
+        await dropRun(this.ctx.storage, run.id);
         await this.ackEnded(await this.ctx.storage.get(`job:${run.id}`), "The review could not finish.");
         await this.ctx.storage.delete(`job:${run.id}`);
         await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
@@ -890,8 +892,10 @@ export class PrState {
     // A fork's pull request is reviewed only when a writer asks.
     const fork = Boolean(info?.head?.repo?.full_name && info?.base?.repo?.full_name && info.head.repo.full_name !== info.base.repo.full_name);
     // An author without write access (and not a bot) is reviewed once a writer
-    // asks, unless an author check already let a review start.
-    const outsider = Boolean(info) && !fork && info.user?.type !== "Bot" && Boolean(info.author_association) && !WRITER_ASSOCIATIONS.has(info.author_association) && !st.lastReviewed;
+    // asks. github-actions[bot] is checked like anyone else (an outsider can
+    // drive it); other bots are not. A review of an earlier head is no sign
+    // this one is coming; one already started on this head is.
+    const outsider = Boolean(info) && !fork && (info.user?.type !== "Bot" || ACTIONS_BOT.test(String(info.user?.login ?? ""))) && Boolean(info.author_association) && !WRITER_ASSOCIATIONS.has(info.author_association) && head !== st.lastReviewed && head !== st.lastCompleteReviewed;
     const reviewed = Boolean(head) && head === st.lastCompleteReviewed;
     const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
       : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
@@ -1360,7 +1364,8 @@ export class PrState {
     if (job.claimedBy && job.claimedBy !== String(runId)) return { error: "job already claimed" };
     // An incremental job starts from the last review finished by the time it
     // is claimed, not when it was made: a review that completed in between is
-    // not reviewed twice.
+    // not reviewed twice. A runner reports no coverage (only the Worker's own
+    // runs set lastCompleteReviewed), so its baseline is lastReviewed.
     if (!job.claimedBy && job.full === false) job.since = (await this.state()).lastReviewed;
     if (!job.claimedBy) job.claimedAt = this.now();
     job.claimedBy = String(runId);

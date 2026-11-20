@@ -1895,9 +1895,33 @@ test("review fixes 3: an author without write access, not yet reviewed, is point
   assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
   fx.pullRequest = async () => ({ ...shape, user: { type: "Bot" } });
   assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+  // github-actions[bot] is checked like anyone else, so it is pointed to a writer too.
+  fx.pullRequest = async () => ({ ...shape, user: { type: "Bot", login: "github-actions[bot]" } });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
   fx.pullRequest = async () => shape;
-  await storage.put("state", { lastReviewed: "b".repeat(40) });
+  // An earlier review of another head is no evidence the current head is coming.
+  await storage.put("state", { lastReviewed: "b".repeat(40), lastCompleteReviewed: "b".repeat(40) });
+  assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "ask_a_writer_to_request_review");
+  // The current head already reviewed (even partly): nothing to ask for.
+  await storage.put("state", { lastReviewed: "a".repeat(40) });
   assert.equal((await obj.status({ slug: "tankster-ai-review", repo, pr: 39 })).next_action, "wait");
+});
+
+test("review fixes 5: an interrupted alarm give-up keeps the run until the reset is queued", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun, activeRun } = await import("../src/review-run.js");
+  const run = await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  await storage.put("runmeta:j1", { ...run, headSha: "a".repeat(40), heldSuccess: true });
+  t.now = NOW + 4 * 24 * 3600_000;
+  const real = obj.outbox.bind(obj);
+  let fail = true;
+  obj.outbox = async (item) => { if (fail && item.type === "status") { fail = false; throw new Error("interrupted"); } return real(item); };
+  await fire(obj).catch(() => {});
+  assert.ok(await activeRun(storage), "the run is still there to retry from");
+  await fire(obj);
+  await drain(obj);
+  assert.ok(fx.calls.some((c) => c[0] === "setStatus" && c[2] === "a".repeat(40) && c[3] === "pending"));
 });
 
 test("review fixes 3: a run that held the neutral success and whose closing status did not land puts the commit back to pending", async () => {
