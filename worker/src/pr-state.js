@@ -38,7 +38,9 @@ const TOP_LEVEL_ONLY = new Set(["resolve", "approve"]);
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
 const RESOLVE_PER_STEP = 20;
-// Past what ownThreads can ever list (1,000): a live mark is never evicted.
+
+// After n failures in a row outside the run's own step: up to an hour.
+const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
 
 export function helpText(slug = DEFAULT_SLUG) {
   return [
@@ -439,7 +441,13 @@ export class PrState {
     const stepping = !heavy && Boolean(await activeRun(this.ctx.storage));
     let runNext;
     try {
-      runNext = heavy ? ((await activeRun(this.ctx.storage)) ? this.now() : null) : await this.stepActiveRun();
+      // A run that is backing off keeps its backoff: a heavy item is no
+      // reason to try it early.
+      const backoff = async () => {
+        const n = (await this.ctx.storage.get("runFailures")) ?? 0;
+        return n ? this.now() + runBackoffMs(n) : this.now();
+      };
+      runNext = heavy ? ((await activeRun(this.ctx.storage)) ? await backoff() : null) : await this.stepActiveRun();
       if (!heavy) await this.ctx.storage.delete("runFailures");
     } catch (e) {
       const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
@@ -455,7 +463,7 @@ export class PrState {
         runNext = null;
       } else {
         await this.ctx.storage.put("runFailures", n);
-        runNext = run ? this.now() + Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10)) : null;
+        runNext = run ? this.now() + runBackoffMs(n) : null;
       }
     }
     const box = (await this.ctx.storage.get("outbox")) ?? [];
@@ -777,6 +785,9 @@ export class PrState {
   async resolveAll(fx, item, slug) {
     const key = await this.ctx.storage.get("key");
     if (!key || typeof fx.ownThreads !== "function") return undefined;
+    // Reopens numbered after this are newer than the command's view: a
+    // thread reopened while these calls are pending is not vouched for.
+    const seq = (await this.ctx.storage.get("reopenSeq")) ?? 0;
     const threads = await fx.ownThreads(key.repo, key.pr, slug);
     const open = threads.filter((t) => !t.resolved);
     let done = 0;
@@ -788,7 +799,9 @@ export class PrState {
     if (done < open.length) return { holdUntil: this.now() + 1000 };
     // The writer vouched for every thread, those resolved by people without
     // write access included: later decisions count them as resolved too.
-    await acceptThreads(this.ctx.storage, threads.map((t) => t.id));
+    const vouched = [];
+    for (const t of threads) if (!((await reopenMark(this.ctx.storage, t.id)) > seq)) vouched.push(t.id);
+    await acceptThreads(this.ctx.storage, vouched);
     await clearOpenFindings(this.ctx.storage);
     await this.queueDecide({ force: true, login: item.login });
     return undefined;

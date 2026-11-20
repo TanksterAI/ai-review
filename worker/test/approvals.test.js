@@ -387,3 +387,33 @@ test("an accepted thread stays accepted however many others are accepted after i
   await decide(m);
   assert.equal(approvals(m.calls).length, 1);
 });
+
+test("a thread reopened while resolve is running is not vouched for", async () => {
+  const m = await make({ threads: [thread("t1", false), { id: "t2", resolved: true, resolvedBy: "stranger" }], writers: ["rishitank"] });
+  const resolve = m.fx.resolveThread;
+  let n = 0;
+  m.fx.resolveThread = async (r, id) => {
+    // A reopen lands while GitHub's call is pending.
+    if (n++ === 0) await m.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t2" } });
+    return resolve(r, id);
+  };
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  const accepted = await acceptedSet(m.storage);
+  assert.ok(accepted.has("t1"));
+  assert.equal(accepted.has("t2"), false, "the reopen keeps its acceptance removed");
+});
+
+test("a heavy item does not cut short a backing-off review's wait", async () => {
+  const m = await make();
+  await m.storage.put("runmeta:j1", { id: "j1", stage: "draft" });
+  await m.storage.put("runFailures", 3);
+  m.obj.stepActiveRun = async () => { throw new Error("must not step"); };
+  await m.obj.outbox({ type: "decide" });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(approvals(m.calls).length, 1);
+  assert.ok(m.storage.alarm > NOW, "the review waits out its backoff");
+  assert.equal(await m.storage.get("runFailures"), 3, "its failure count is kept");
+});
