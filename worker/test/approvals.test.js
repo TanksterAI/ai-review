@@ -676,3 +676,29 @@ test("decide: a thread the App resolved while a person's reopen stands counts as
     assert.equal(approvals(m.calls).length, approved, `accepted=${accept}`);
   }
 });
+
+test("a reopen while a reopened decision's GitHub reads are pending still withdraws the approval", async () => {
+  const reopen = (m, id) => m.obj.onEvent({ delivery: `r-${id}`, ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: id } });
+  // The decision for one reopen is running; another thread is reopened while
+  // its thread list is fetched, and finds that decision still waiting, so no
+  // new one is queued. The list that comes back is the stale one.
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "rishitank" }], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
+  await acceptThreads(m.storage, ["t1"]);
+  const dismissed = [];
+  m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return true; };
+  const own = m.fx.ownThreads;
+  let first = true;
+  m.fx.ownThreads = async (...a) => { const out = (await own(...a)).map((t) => ({ ...t })); if (first) { first = false; await reopen(m, "t1"); m.w.threads[0].resolved = false; } return out; };
+  await decide(m, { reopened: true });
+  assert.deepEqual(dismissed, [77], "the approval is withdrawn, from a fresh snapshot");
+  assert.equal((await acceptedSet(m.storage)).has("t1"), false);
+});
+
+test("a reopen between the snapshot and the last head check is decided again, not approved", async () => {
+  const m = await make({ threads: [thread("t1", true)] });
+  const pr = m.fx.pullRequest;
+  let n = 0;
+  m.fx.pullRequest = async (...a) => { if (++n === 2) { await m.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "t1" } }); m.w.threads[0].resolved = false; } return pr(...a); };
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0);
+});

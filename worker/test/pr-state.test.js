@@ -1559,3 +1559,19 @@ test("ack: a close while the acknowledgement is being posted still edits it, and
   assert.equal(e[0][0], 1000);
   assert.match(e[0][1], /Action not completed[\s\S]*closed before the review finished/);
 });
+
+test("an ack is queued before its job goes: a failed queue keeps the ackId for the retry (runDone, defer)", async () => {
+  for (const op of ["runDone", "defer"]) {
+    const storage = memoryStorage();
+    const obj = new PrState(doCtx(storage), {}, { now: () => NOW, effects: {} });
+    await storage.put("key", { repo: "o/r", pr: 1 });
+    await storage.put("job:j1", { id: "j1", ackId: 4242, claimedBy: op === "defer" ? "run9" : null, createdAt: NOW, retries: 99 });
+    const put = storage.put.bind(storage);
+    storage.put = async (k, v) => { if (k === "outbox") throw new Error("outbox down"); return put(k, v); };
+    const go = op === "runDone"
+      ? obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: true, description: "x" })
+      : obj.defer({ jobId: "j1", runId: "run9", why: "error", reason: "x" });
+    await assert.rejects(go, /outbox down/, op);
+    assert.equal((await storage.get("job:j1"))?.ackId, 4242, `${op}: the job and its ackId survive`);
+  }
+});

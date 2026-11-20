@@ -901,13 +901,15 @@ export class PrState {
       await this.queueDecide({});
     } else {
       const job = await this.ctx.storage.get(`job:${run.id}`);
-      await this.ctx.storage.delete(`job:${run.id}`);
       // A review that ran but could not cover every file did finish: it says
       // how far it got. One given up, or stopped by the PR closing, did not.
       const said = String(description ?? "").replace(/[`\n]/g, " ").slice(0, 200);
       if (Number.isSafeInteger(job?.ackId)) {
         await this.queueAck(job.ackId, !gaveUp && said ? actionPerformed(`Review finished. ${said}`) : actionNotCompleted(gaveUp ? "The review could not finish." : "The pull request is no longer open."));
       }
+      // Only after the edit is queued: were that to fail, the job (and its
+      // ackId) is still there for the retry.
+      await this.ctx.storage.delete(`job:${run.id}`);
       // The summary was written again without its notice: decide puts back
       // the right one (pending, as the head has no complete review).
       await this.queueDecide({});
@@ -948,37 +950,53 @@ export class PrState {
       await this.noticeApproval(fx, key, { pending: head, slug });
       return undefined;
     }
-    const writers = new Map();
-    const isWriter = async (login) => {
-      if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
-      return writers.get(login);
-    };
-    // A thread resolved by someone without write access counts as open,
-    // unless a review since found it fixed, or a writer's resolve/approve
-    // vouched for it (both recorded in ACCEPTED).
-    const accepted = await acceptedSet(this.ctx.storage);
-    const open = [];
-    for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
-      // A nitpick never holds back approval (CodeRabbit's rule), open or not.
-      if (nitpickFinding(t.body)) continue;
-      if (!t.resolved) open.push(t);
-      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
-      // only for the threads in its own view: one reopened since and then
-      // resolved by an outsider is open, forced or not.
-      else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
-      // Resolved by the App while a person's reopen still stands (its mark
-      // goes only when a writer resolves it): a command's race, not a fix.
-      // The reviewer never resolves a reopened thread, and a command that
-      // vouched for it accepted it.
-      else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
+    // External calls let other events run: a thread reopened while they are
+    // pending would leave this snapshot (and its view of what a writer
+    // accepted) out of date, and its own decision is already waiting, so no
+    // new one is queued. Every reopen bumps reopenSeq together with its mark
+    // and the lost acceptance; a snapshot taken across a bump is taken again.
+    let open, inBody, decision, seqAtSnapshot, settled = false;
+    for (let tries = 0; tries < 3 && !settled; tries++) {
+      const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
+      open = [];
+      const writers = new Map();
+      const isWriter = async (login) => {
+        if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
+        return writers.get(login);
+      };
+      // A thread resolved by someone without write access counts as open,
+      // unless a review since found it fixed, or a writer's resolve/approve
+      // vouched for it (both recorded in ACCEPTED).
+      const accepted = await acceptedSet(this.ctx.storage);
+      for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
+        // A nitpick never holds back approval (CodeRabbit's rule), open or not.
+        if (nitpickFinding(t.body)) continue;
+        if (!t.resolved) open.push(t);
+        // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
+        // only for the threads in its own view: one reopened since and then
+        // resolved by an outsider is open, forced or not.
+        else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
+        // Resolved by the App while a person's reopen still stands (its mark
+        // goes only when a writer resolves it): a command's race, not a fix.
+        // The reviewer never resolves a reopened thread, and a command that
+        // vouched for it accepted it.
+        else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
+      }
+      // A kept finding that is a nitpick never blocks either. Only text that
+      // carries the Worker's own comment header (its id line, as from the 422
+      // fallback) is judged: a body-listed finding's text starts with the
+      // model's title, which could imitate a label. Never one kept as severe.
+      const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
+      inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
+      decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
+      seqAtSnapshot = seq0;
+      settled = ((await this.ctx.storage.get("reopenSeq")) ?? 0) === seq0;
     }
-    // A kept finding that is a nitpick never blocks either. Only text that
-    // carries the Worker's own comment header (its id line, as from the 422
-    // fallback) is judged: a body-listed finding's text starts with the
-    // model's title, which could imitate a label. Never one kept as severe.
-    const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
-    const inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
-    const decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
+    if (!settled) {
+      // Reopens kept arriving: decide again from scratch, never from this snapshot.
+      await this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
+      return undefined;
+    }
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {
         // As CodeRabbit's: the approval is withdrawn (dismissed). Only if
@@ -1003,6 +1021,9 @@ export class PrState {
     const now = await fx.pullRequest(key.repo, key.pr);
     if (now?.head?.sha !== head || now?.state !== "open" || now.draft) return undefined;
     // As CodeRabbit's: an approval with no text (the summary comment says why).
+    // A reopen since the snapshot: decide again rather than approve from it.
+    const again = () => this.outbox({ type: "decide", reopened: true, force: Boolean(item.force), login: item.login ?? null });
+    if (((await this.ctx.storage.get("reopenSeq")) ?? 0) !== seqAtSnapshot) { await again(); return undefined; }
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
@@ -1119,8 +1140,9 @@ export class PrState {
     // for days before any provider could take it gets its full time.
     const old = this.now() - (job.firstRunAt ?? job.firstAt ?? job.createdAt) > MAX_JOB_LIFE_MS;
     if (st.closed || retries >= MAX_RETRIES || old) {
-      await this.ctx.storage.delete(`job:${jobId}`);
+      // The edit is queued before the job goes: a failed queue keeps its ackId.
       await this.ackEnded(job, st.closed ? "The pull request was closed before the review finished." : "The review could not finish.");
+      await this.ctx.storage.delete(`job:${jobId}`);
       if (!st.closed) {
         // Never silently: say so on the PR, at most once an hour.
         console.log(JSON.stringify({ svc: "ai-review", ev: "review_given_up", retries }));
