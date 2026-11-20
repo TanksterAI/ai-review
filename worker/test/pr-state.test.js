@@ -77,6 +77,9 @@ test("commands are parsed from the text after the mention", () => {
     ["@tankster-ai-review resolve\n```\nwhy\n```", null],
     ["@tankster-ai-review resolve\r\n", "resolve"],
     ["@tankster-ai-review resolve\n<!-- hidden -->", null],
+    ["@tankster-ai-review constructor", null],
+    ["@tankster-ai-review __proto__", null],
+    ["@tankster-ai-review hasOwnProperty", null],
     ["    ```\n@tankster-ai-review review", "review"],
     ["@tankster-ai-review reviewing", null],
     ["@tankster-ai-reviewer review", null],
@@ -1380,4 +1383,24 @@ test("a job waiting behind the review in progress is kept fresh, so it is not pr
   const out = await obj.startWorkerRun(await storage.get("job:j1"), await obj.state());
   assert.ok(out.holdUntil > t.now);
   assert.equal((await storage.get("job:j1")).createdAt, t.now);
+});
+
+test("a run that ends without a complete review asks for a decision, so the notice is written again", async () => {
+  const { obj, storage } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false, description: "Incomplete: 2 of 5 files reviewed." });
+  const box = (await storage.get("outbox")) ?? [];
+  assert.equal(box.filter((x) => x.type === "decide").length, 1);
+});
+
+test("a retried resume whose review is under way goes on with it, not the shortcut", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, full: false, createdAt: NOW, ackId: 55 });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  // Its own job (given an opaque id first, as an old one is), not a new one.
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
+  assert.equal(await storage.get("job:j9"), undefined);
+  assert.equal(comments(fx).length, 0, "no second acknowledgement");
 });

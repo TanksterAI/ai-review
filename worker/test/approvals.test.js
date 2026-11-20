@@ -142,9 +142,13 @@ test("a finished review, and a resolved or reopened thread, each ask for a decis
   await done.storage.put(`job:j1`, { id: "j1", claimedBy: "worker", claimedAt: NOW });
   await done.obj.runDone({ id: "j1" }, { reviewedSha: HEAD });
   assert.ok(((await done.storage.get("outbox")) ?? []).some((x) => x.type === "decide"));
-  const partial = await make();
+  // One that did not cover every file asks too, so the summary's notice says
+  // approval is pending (the head has no complete review, so it cannot approve).
+  const partial = await make({ reviewed: "b".repeat(40) });
   await partial.obj.runDone({ id: "j1" }, { reviewedSha: null });
-  assert.equal(((await partial.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), false);
+  assert.ok(((await partial.storage.get("outbox")) ?? []).some((x) => x.type === "decide"));
+  await decide(partial);
+  assert.equal(approvals(partial.calls).length, 0);
 });
 
 test("resolve and approve: top-level commands from writers that resolve every thread of the App's own and approve", async () => {

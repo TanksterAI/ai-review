@@ -114,7 +114,8 @@ export function parseCommand(text, slug = DEFAULT_SLUG) {
   }
   if (at < 0) return null;
   const said = handle.exec(lines[at])[1].trim().toLowerCase().replace(/\s+/g, " ");
-  const cmd = ALIASES[said] ?? (COMMANDS.includes(said) ? said : null);
+  // Own keys only: "constructor" or "__proto__" is no alias.
+  const cmd = Object.hasOwn(ALIASES, said) ? ALIASES[said] : COMMANDS.includes(said) ? said : null;
   if (!cmd) return null;
   // Whole comment: nothing else at all, hidden or shown, before or after.
   const all = raw.split("\n");
@@ -728,6 +729,11 @@ export class PrState {
         const head = pr?.head?.sha ?? null;
         const draft = Boolean(pr?.draft) || Boolean(st.draft);
         const shut = (pr && pr.state !== "open") || st.closed;
+        // A retried resume whose review is already under way (its job kept on
+        // the item) goes on with it: the shortcut is only for a fresh one.
+        if (item.jobId && (await this.ctx.storage.get(`job:${item.jobId}`))) {
+          return this.reviewNow(fx, item, st, { full: false, text: "Automatic reviews are back on. Reviewing the commits pushed while they were paused." });
+        }
         if (!head || draft || shut || head === st.lastReviewed || head === st.lastCompleteReviewed) {
           const note = shut ? " This pull request is closed: it is reviewed if it is reopened." : draft ? " This pull request is a draft: it is reviewed once it is marked ready." : "";
           if (!item.acked) await fx.comment(item.repo.full, item.pr, `Automatic reviews are back on.${note}`);
@@ -850,6 +856,9 @@ export class PrState {
       if (Number.isSafeInteger(job?.ackId)) {
         await this.outbox({ type: "ack", commentId: job.ackId, text: !gaveUp && said ? actionPerformed(`Review finished. ${said}`) : actionNotCompleted(gaveUp ? "The review could not finish." : "The pull request is no longer open.") });
       }
+      // The summary was written again without its notice: decide puts back
+      // the right one (pending, as the head has no complete review).
+      await this.queueDecide({});
     }
     await dropRun(this.ctx.storage, run.id);
     if (gaveUp) {
