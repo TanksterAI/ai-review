@@ -419,6 +419,12 @@ export class PrState {
       if (ev.draft) {
         // Converted to a draft, or a push to one: nothing waits for it.
         await this.ctx.storage.delete("debounce");
+        // As CodeRabbit's: one note, when the draft is opened or converted,
+        // saying when it will be reviewed. Pushes to it add none.
+        if (["opened", "converted_to_draft"].includes(ev.action) && !st.draftNoted) {
+          st.draftNoted = true;
+          await this.outbox({ type: "comment", body: "Review skipped: this pull request is a draft. It is reviewed once it is marked ready for review." });
+        }
         return this.save(st, { action: "draft" });
       }
       if (st.paused) return this.save(st, { action: "paused" });

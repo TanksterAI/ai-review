@@ -170,7 +170,9 @@ test("drafts wait; forks need a writer to ask; outsiders are checked first", asy
   assert.equal((await obj.onEvent({ delivery: "5", ev: review({ author: { login: "someone", association: "CONTRIBUTOR", bot: false } }) })).action, "author_check");
   await drain(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 2, "the bot's and the private member's PRs");
-  const notes = fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+  const all = fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+  assert.match(all[0] ?? "", /Review skipped: this pull request is a draft/, "the draft's note (the event's default action is opened)");
+  const notes = all.slice(1);
   assert.equal(notes.length, 2, "one for the fork, one for the outsider; none for the bot");
   assert.ok(notes.every((n) => /write access can comment/.test(n)));
 });
@@ -1229,6 +1231,23 @@ test("review of a commit already reviewed in full is not run again; full review 
   await drain(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
   assert.match(comments(fx)[1], /Review triggered\./);
+});
+
+test("a draft PR gets one note, as CodeRabbit's: reviews are skipped until it is marked ready; pushes to it add none", async () => {
+  const { obj, fx } = make();
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review({ action: "opened", draft: true }) })).action, "draft");
+  await drain(obj);
+  assert.equal(comments(fx).length, 1);
+  assert.match(comments(fx)[0], /Review skipped: this pull request is a draft\. It is reviewed once it is marked ready for review\./);
+  await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", draft: true }) });
+  await obj.onEvent({ delivery: "3", ev: review({ action: "converted_to_draft", draft: true }) });
+  await drain(obj);
+  assert.equal(comments(fx).length, 1, "once");
+  // A push to a draft that was never noted (the App was installed later) is not noted either: no spam.
+  const other = make();
+  await other.obj.onEvent({ delivery: "1", ev: review({ action: "synchronize", draft: true }) });
+  await drain(other.obj);
+  assert.equal(comments(other.fx).length, 0);
 });
 
 test("review and full review on a draft or closed PR are declined with the reason, and run nothing", async () => {
