@@ -1541,3 +1541,21 @@ test("ack: the flag, the id and the job's copy are one write; a close before the
   assert.match(edits(fx)[0][1], /closed before the review finished/);
   assert.equal(comments(fx).length, 1);
 });
+
+test("ack: a close while the acknowledgement is being posted still edits it, and nothing is dispatched", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  const post = fx.comment;
+  fx.comment = async (r, p, body) => {
+    // The close lands while GitHub's call is pending.
+    await obj.onEvent({ delivery: "2", ev: { ...review(), kind: "closed" } });
+    return post(r, p, body);
+  };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  const e = edits(fx);
+  assert.equal(e.length, 1);
+  assert.equal(e[0][0], 1000);
+  assert.match(e[0][1], /Action not completed[\s\S]*closed before the review finished/);
+});

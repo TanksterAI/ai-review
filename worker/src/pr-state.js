@@ -820,6 +820,14 @@ export class PrState {
       if (job && Number.isSafeInteger(item.ackId)) writes[`job:${item.jobId}`] = { ...job, ackId: item.ackId };
       await this.ctx.storage.put(writes);
     }
+    // Events interleave while GitHub's call is pending: the PR may have been
+    // closed (its jobs deleted) before the comment's id was known. The
+    // acknowledgement then says so, and nothing is dispatched.
+    if (!(await this.ctx.storage.get(`job:${item.jobId}`))) {
+      const closed = (await this.state()).closed;
+      await this.queueAck(item.ackId, actionNotCompleted(closed ? "The pull request was closed before the review finished." : "The review could not start."));
+      return undefined;
+    }
     return this.dispatchJob(fx, item.jobId);
   }
 
