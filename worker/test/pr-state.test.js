@@ -1231,6 +1231,31 @@ test("review of a commit already reviewed in full is not run again; full review 
   assert.match(comments(fx)[1], /Review triggered\./);
 });
 
+test("review and full review on a draft or closed PR are declined with the reason, and run nothing", async () => {
+  for (const [state, shape, note] of [["draft", { state: "open", draft: true }, /draft: it is reviewed once it is marked ready/], ["closed", { state: "closed", draft: false }, /closed: it is reviewed if it is reopened/]]) {
+    for (const cmd of ["review", "full review"]) {
+      const { obj, fx } = make();
+      withPr(fx, "d".repeat(40));
+      fx.pullRequest = async () => ({ ...shape, head: { sha: "d".repeat(40) } });
+      await obj.onEvent({ delivery: "1", ev: command(`@tankster-ai-review ${cmd}`) });
+      await drain(obj);
+      assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>/, `${state} ${cmd}`);
+      assert.match(comments(fx)[0], note, `${state} ${cmd}`);
+      assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0, `${state} ${cmd}`);
+    }
+  }
+});
+
+test("review while a review of the head is already under way is declined, not queued twice", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await storage.put("runmeta:r1", { id: "r1", stage: "draft", headSha: "d".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>[\s\S]*already under way/);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+});
+
 test("resume reviews the commits pushed while paused, as CodeRabbit's; with none, it only says so", async () => {
   const { obj, fx, storage } = make();
   withPr(fx, "c".repeat(40));

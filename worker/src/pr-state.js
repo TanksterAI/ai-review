@@ -785,10 +785,24 @@ export class PrState {
       // review / full review: now, and it covers any push still waiting.
       // As CodeRabbit's: a commit already reviewed in full is not reviewed
       // again by `review` (`full review` does that).
-      if (item.cmd === "review" && !item.jobId && typeof fx.pullRequest === "function") {
-        const head = (await fx.pullRequest(item.repo.full, item.pr))?.head?.sha;
-        if (head && head === st.lastCompleteReviewed && !(await activeRun(this.ctx.storage))) {
-          await fx.comment(item.repo.full, item.pr, actionNotCompleted(`Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`));
+      // A request that would change nothing is declined with its reason, so
+      // a caller (a person or an agent) cannot make a redundant review: a
+      // draft or closed PR is reviewed when it is made ready or reopened, and
+      // a head already under review is not queued twice. A retried item
+      // (its job already kept) skips these checks.
+      if ((item.cmd === "review" || item.cmd === "full review") && !item.jobId && typeof fx.pullRequest === "function") {
+        const pr = await fx.pullRequest(item.repo.full, item.pr);
+        const head = pr?.head?.sha;
+        const shut = (pr && pr.state !== "open") || st.closed;
+        const draft = Boolean(pr?.draft) || Boolean(st.draft);
+        const running = await activeRun(this.ctx.storage);
+        const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
+          : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
+          : head && running?.headSha === head ? "A review of the last commit is already under way."
+          : item.cmd === "review" && head && head === st.lastCompleteReviewed && !running ? `Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`
+          : null;
+        if (why) {
+          await fx.comment(item.repo.full, item.pr, actionNotCompleted(why));
           return undefined;
         }
       }
