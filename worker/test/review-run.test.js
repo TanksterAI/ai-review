@@ -290,6 +290,7 @@ test("an incremental review reads only the commits since the last review, and sa
   const { body, comments } = github.posted[0];
   assert.equal(comments.length, 1);
   assert.match(body, /_Incremental review: commits after `ddddddd`\._/);
+  assert.match(body, /Reviewing the commits after `ddddddd`, up to `/);
   assert.match(body, /Coverage: 1 of 1 reviewable file \(100%\)/);
 });
 
