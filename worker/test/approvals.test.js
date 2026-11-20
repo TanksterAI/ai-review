@@ -644,3 +644,35 @@ test("a thread reopened after a resolve command was posted is left open, not res
   assert.equal(all.w.threads[1].resolved, false);
   assert.equal(approvals(all.calls).length, 0, "the newer reopen holds approval back");
 });
+
+test("a reopen during resolve's own GitHub call is never vouched for, nor resolved by the App", async () => {
+  const reopen = (m, id, d) => m.obj.onEvent({ delivery: d, ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: id } });
+  // Thread reply: the reopen lands while that thread is being resolved.
+  const one = await make({ threads: [{ ...thread("t1", false), commentId: 101 }] });
+  const r1 = one.fx.resolveThread;
+  one.fx.resolveThread = async (r, id) => { const ok = await r1(r, id); await reopen(one, "t1", "r1"); one.w.threads[0].resolved = false; return ok; };
+  await one.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "thread", repo, pr: 39, sender: { login: "rishitank", bot: false }, commentId: 999, inReplyTo: 101, text: "@tankster-ai-review resolve" } });
+  await drain(one.obj);
+  assert.equal((await acceptedSet(one.storage)).has("t1"), false);
+  assert.equal(approvals(one.calls).length, 0);
+
+  // Top-level: t2 is reopened while t1 is being resolved; t2 is not resolved.
+  const all = await make({ threads: [thread("t1", false), thread("t2", false)] });
+  const r2 = all.fx.resolveThread;
+  let first = true;
+  all.fx.resolveThread = async (r, id) => { if (first) { first = false; await reopen(all, "t2", "r2"); } return r2(r, id); };
+  await all.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  await drain(all.obj);
+  assert.deepEqual(all.calls.filter((c) => c[0] === "resolveThread").map((c) => c[1]), ["t1"]);
+  assert.equal(approvals(all.calls).length, 0);
+});
+
+test("decide: a thread the App resolved while a person's reopen stands counts as open, unless a command accepted it", async () => {
+  for (const [accept, approved] of [[false, 0], [true, 1]]) {
+    const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "tankster-ai-review" }] });
+    await m.storage.put("reopened:t1", 3);
+    if (accept) await acceptThreads(m.storage, ["t1"]);
+    await decide(m);
+    assert.equal(approvals(m.calls).length, approved, `accepted=${accept}`);
+  }
+});

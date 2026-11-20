@@ -966,6 +966,11 @@ export class PrState {
       // only for the threads in its own view: one reopened since and then
       // resolved by an outsider is open, forced or not.
       else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
+      // Resolved by the App while a person's reopen still stands (its mark
+      // goes only when a writer resolves it): a command's race, not a fix.
+      // The reviewer never resolves a reopened thread, and a command that
+      // vouched for it accepted it.
+      else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
     }
     // A kept finding that is a nitpick never blocks either. Only text that
     // carries the Worker's own comment header (its id line, as from the 422
@@ -1049,7 +1054,8 @@ export class PrState {
     const newer = (await reopenMark(this.ctx.storage, t.id)) > (Number.isInteger(item.seq) ? item.seq : Infinity);
     if (!newer) {
       if (!t.resolved && !(await fx.resolveThread(key.repo, t.id))) throw new Error("the thread could not be resolved");
-      await acceptThreads(this.ctx.storage, [t.id]);
+      // Read again: a reopen can land during GitHub's call.
+      if (!((await reopenMark(this.ctx.storage, t.id)) > (Number.isInteger(item.seq) ? item.seq : Infinity))) await acceptThreads(this.ctx.storage, [t.id]);
     }
     await this.queueDecide({});
     return undefined;
@@ -1072,7 +1078,11 @@ export class PrState {
     for (const t of threads) marks.set(t.id, (await reopenMark(this.ctx.storage, t.id)) > seq);
     const open = threads.filter((t) => !t.resolved && !marks.get(t.id));
     let done = 0;
-    for (const t of open.slice(0, RESOLVE_PER_STEP)) if (await fx.resolveThread(key.repo, t.id)) done++;
+    for (const t of open.slice(0, RESOLVE_PER_STEP)) {
+      // Read again: a reopen can land during an earlier thread's call.
+      if ((await reopenMark(this.ctx.storage, t.id)) > seq) { done++; continue; }
+      if (await fx.resolveThread(key.repo, t.id)) done++;
+    }
     // Nothing moved: an attempt that counts, so it cannot spin for ever.
     if (open.length && !done) throw new Error("no thread could be resolved");
     // Some still open (past this step's share, or refused): again shortly,
