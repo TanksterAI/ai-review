@@ -180,6 +180,18 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
   - **Recovery.** Setup cannot be reopened once it has succeeded. If the key leaks or the App is deleted, set the Worker secrets `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_WEBHOOK_SECRET` (and `GITHUB_APP_SLUG` if it changed); they win over the stored App. Otherwise reopen setup with a code change. Each isolate caches the App's config for up to 5 minutes.
 - **Mentions.** The App's slug decides how it is mentioned (`@<slug>`), its login (`<slug>[bot]`) and the commands its replies name. `@tankster-ai-review` above assumes the default slug.
 
+## The MCP server (for agents)
+
+`POST /mcp` is a small MCP server (JSON-RPC over HTTP) so any agent can find out what the reviewer will do and ask it for something, without having to be taught. It is called with the caller's own GitHub token as a Bearer token; each call first checks that token can see the pull request, so a caller sees only what GitHub lets them see. Only `TanksterAI/*` repositories are served.
+
+| Tool | What it does |
+| --- | --- |
+| `get_review_status` | Read-only. The PR's state (open, draft, reviewing, paused, closed), its head, the last reviewed head, `can_request_review` with the `reason` when not, and `next_action`: `wait`, `read_threads`, `mark_ready_for_review`, `resume` or `none`. |
+| `list_review_threads` | Read-only. The reviewer's own threads (open ones unless `include_resolved`), each with severity, category, file, line and finding id. |
+| `request_review` | The request a `review` / `full review` comment makes (needs write access), refused with its reason when it would change nothing: a draft, a closed PR, a head under review, or (for `review`) a head already reviewed. |
+
+The rules are kept here, not in an agent's memory. The server's `instructions` and the tool annotations tell an agent what to do, but that is advice; the refusals are decided by the PR's Durable Object from the PR as GitHub reports it and the state the reviewer keeps, the same rules a comment is held to. The merge gate is the backstop.
+
 ## Releasing v1
 
 After a change to `review.yml` or the Worker is merged and deployed, run Actions → release-v1 → Run workflow, on `main`. It creates `v1` at `main`, or moves it forward to `main`. It never moves `v1` back or sideways: it compares the two first and refuses unless `main` is ahead, so an older `review.yml` cannot become trusted again by a click. Moving `v1` back is for the owner, by hand.

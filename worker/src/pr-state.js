@@ -13,6 +13,7 @@ import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
 import { capacity, draftChain } from "./providers.js";
 import { findingIdOf, nitpickFinding } from "./addressed.js";
+import { parseHeader } from "./labels.js";
 import { ACCEPTED, MAX_RUN_LIFE_MS, REOPENED, RUN, RUN_META, SUMMARY_BASE, SUMMARY_KEY, SUMMARY_NOTICE, withNotice, acceptThreads, acceptedSet, activeRun, clearOpenFindings, clearPrefix, dropRun, listOpenFindings, reopenMark, startRun, stepRun } from "./review-run.js";
 
 const JOB_TTL_MS = 2 * 3600_000;
@@ -223,6 +224,9 @@ export class PrState {
     // Only the Worker's own runs (stepActiveRun) may say a review covered every file.
     else if (msg.op === "complete") out = await this.complete({ jobId: msg.jobId, runId: msg.runId, reviewedSha: msg.reviewedSha });
     else if (msg.op === "defer") out = await this.defer(msg);
+    else if (msg.op === "status") out = await this.status(msg);
+    else if (msg.op === "request") out = await this.request(msg);
+    else if (msg.op === "threads") out = await this.threads(msg);
     else out = { error: "unknown op" };
     return Response.json(out);
   }
@@ -816,16 +820,7 @@ export class PrState {
       // a head already under review is not queued twice. A retried item
       // (its job already kept) skips these checks.
       if ((item.cmd === "review" || item.cmd === "full review") && !item.jobId && typeof fx.pullRequest === "function") {
-        const pr = await fx.pullRequest(item.repo.full, item.pr);
-        const head = pr?.head?.sha;
-        const shut = (pr && pr.state !== "open") || st.closed;
-        const draft = Boolean(pr?.draft) || Boolean(st.draft);
-        const running = await activeRun(this.ctx.storage);
-        const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
-          : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
-          : head && running?.headSha === head ? "A review of the last commit is already under way."
-          : item.cmd === "review" && head && head === st.lastCompleteReviewed && !running ? `Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`
-          : null;
+        const why = (await this.advise(fx, st, { cmd: item.cmd, slug, repo: item.repo, pr: item.pr })).why;
         if (why) {
           await fx.comment(item.repo.full, item.pr, actionNotCompleted(why));
           return undefined;
@@ -844,6 +839,78 @@ export class PrState {
   // A review a writer asked for (review, full review, resume): one job, and
   // one acknowledgement, edited to "Review finished." when it is done. Both
   // are kept on the item, so a retried alarm makes neither twice.
+  // What a caller (a person's comment, or an agent through the MCP tools)
+  // may usefully do now. One rule set for both: a request that would change
+  // nothing is refused with its reason, and `next_action` says what to do
+  // instead. Decided here, from the PR as GitHub reports it and the state the
+  // reviewer keeps, never from what the caller remembers.
+  async advise(fx, st, { cmd = "review", slug = DEFAULT_SLUG, repo, pr }) {
+    const info = typeof fx.pullRequest === "function" ? await fx.pullRequest(repo.full, pr) : null;
+    const head = info?.head?.sha ?? null;
+    const shut = (info && info.state !== "open") || Boolean(st.closed);
+    const draft = Boolean(info?.draft) || Boolean(st.draft);
+    const running = await activeRun(this.ctx.storage);
+    const reviewed = Boolean(head) && head === st.lastCompleteReviewed;
+    const why = shut ? "This pull request is closed: it is reviewed if it is reopened."
+      : draft ? "This pull request is a draft: it is reviewed once it is marked ready."
+      : head && running?.headSha === head ? "A review of the last commit is already under way."
+      : cmd === "review" && reviewed && !running ? `Already reviewed the last commit. Use \`@${slug} full review\` to review every file again.`
+      : null;
+    const next = shut ? "none"
+      : draft ? "mark_ready_for_review"
+      : running ? "wait"
+      : st.paused ? "resume"
+      : reviewed ? "read_threads"
+      : "wait";
+    return { why, next, head, shut, draft, running, reviewed };
+  }
+
+  // MCP tool `get_review_status`: read-only.
+  async status({ slug = DEFAULT_SLUG, repo = null, pr = null } = {}) {
+    const st = await this.state();
+    const key = (await this.ctx.storage.get("key")) ?? {};
+    const a = await this.advise(this.effects ?? createEffects(this.env, { config: await appConfig(this.env) }), st, { cmd: "review", slug, repo: repo ?? { full: key.repo }, pr: pr ?? key.pr });
+    return {
+      state: a.shut ? "closed" : a.draft ? "draft" : a.running ? "reviewing" : st.paused ? "paused" : "open",
+      head: a.head,
+      reviewed_head: st.lastCompleteReviewed ?? null,
+      last_attempted_head: st.lastReviewed ?? null,
+      paused: Boolean(st.paused),
+      reviewing: Boolean(a.running),
+      can_request_review: !a.why,
+      reason: a.why,
+      next_action: a.next,
+    };
+  }
+
+  // MCP tool `list_review_threads`: the reviewer's own threads, compact.
+  async threads({ slug = DEFAULT_SLUG, repo, pr, include_resolved = false }) {
+    const fx = this.effects ?? createEffects(this.env, { config: await appConfig(this.env) });
+    if (typeof fx.ownThreads !== "function") return { threads: [] };
+    const out = [];
+    for (const t of await fx.ownThreads(repo.full, pr, slug)) {
+      if (t.resolved && !include_resolved) continue;
+      const h = parseHeader(t.body);
+      out.push({
+        id: t.id, resolved: Boolean(t.resolved), outdated: Boolean(t.outdated), path: t.path, line: t.line,
+        severity: h?.severity ?? null, category: h?.category ?? null, finding_id: t.findingId ?? null,
+        body: String(t.body ?? "").slice(0, 600),
+      });
+    }
+    return { threads: out };
+  }
+
+  // MCP tool `request_review`: the same command a comment would queue, after
+  // the same refusals. The alarm still checks the caller's write access.
+  async request({ slug = DEFAULT_SLUG, login, repo, pr, full = false }) {
+    const st = await this.state();
+    const a = await this.advise(this.effects ?? createEffects(this.env, { config: await appConfig(this.env) }), st, { cmd: full ? "full review" : "review", slug, repo, pr });
+    if (a.why) return { accepted: false, reason: a.why, next_action: a.next };
+    if (!(await this.ctx.storage.get("key"))) await this.ctx.storage.put("key", { repo: repo.full, pr });
+    await this.outbox({ type: "command", cmd: full ? "full review" : "review", slug, login, repo, pr });
+    return { accepted: true, next_action: "wait" };
+  }
+
   async reviewNow(fx, item, st, { full, text }) {
     await this.ctx.storage.delete("debounce");
     await this.keepJobOnItem(item, st, { full, requestedBy: item.login });

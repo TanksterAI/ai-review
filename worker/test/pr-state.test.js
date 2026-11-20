@@ -1691,3 +1691,96 @@ test("review fixes: an acknowledgement that cannot be posted does not stop the r
   await fire(obj);
   assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "the review is still dispatched");
 });
+
+// --- the agent interface: status and request, refused when redundant ---------
+
+test("status tells an agent what to do next, from the server's own state", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const ask = (over) => obj.status({ slug: "tankster-ai-review", ...over });
+  // Nothing reviewed yet: the automatic review will run; do not ask for one.
+  let s = await ask();
+  assert.equal(s.next_action, "wait");
+  assert.equal(s.head, "a".repeat(40));
+  assert.equal(s.reviewed_head, null);
+  assert.equal(s.can_request_review, true);
+  // A draft: wait for it to be made ready; a request would be refused.
+  fx.pullRequest = async () => ({ state: "open", draft: true, head: { sha: "a".repeat(40) } });
+  s = await ask();
+  assert.equal(s.next_action, "mark_ready_for_review");
+  assert.equal(s.can_request_review, false);
+  assert.match(s.reason, /draft/);
+  // Reviewed head: read the threads.
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "a".repeat(40) } });
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: false, closed: false });
+  s = await ask();
+  assert.equal(s.next_action, "read_threads");
+  assert.equal(s.can_request_review, false);
+  // A new head, not yet reviewed: the push is reviewed on its own.
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: "b".repeat(40) } });
+  s = await ask();
+  assert.equal(s.next_action, "wait");
+  // Closed.
+  fx.pullRequest = async () => ({ state: "closed", draft: false, head: { sha: "b".repeat(40) } });
+  assert.equal((await ask()).next_action, "none");
+});
+
+test("status of a paused PR says resume, and a request for a review is refused with the reason", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: true, closed: false });
+  const s = await obj.status({ slug: "tankster-ai-review" });
+  assert.equal(s.paused, true);
+  assert.equal(s.next_action, "resume");
+});
+
+test("request refuses what would change nothing, with a reason, and queues nothing", async () => {
+  for (const [pr, state, why] of [
+    [{ state: "open", draft: true, head: { sha: "a".repeat(40) } }, {}, /draft/],
+    [{ state: "closed", draft: false, head: { sha: "a".repeat(40) } }, {}, /closed/],
+    [{ state: "open", draft: false, head: { sha: "a".repeat(40) } }, { lastCompleteReviewed: "a".repeat(40), lastReviewed: "a".repeat(40) }, /Already reviewed/],
+  ]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "a".repeat(40));
+    fx.pullRequest = async () => pr;
+    await storage.put("state", { lastReviewed: null, paused: false, closed: false, ...state });
+    const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+    assert.equal(out.accepted, false);
+    assert.match(out.reason, why);
+    assert.deepEqual((await storage.get("outbox")) ?? [], []);
+  }
+});
+
+test("request on a head not yet reviewed queues the same command a comment would, once", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const out = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: false });
+  assert.equal(out.accepted, true);
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1);
+  assert.equal(box[0].type, "command");
+  assert.equal(box[0].cmd, "review");
+  assert.equal(box[0].login, "rishitank");
+  // A full review of a reviewed head is allowed (it is the one way to review again).
+  await storage.put("state", { lastReviewed: "a".repeat(40), lastCompleteReviewed: "a".repeat(40), paused: false, closed: false });
+  const full = await obj.request({ slug: "tankster-ai-review", login: "rishitank", repo, pr: 39, full: true });
+  assert.equal(full.accepted, true);
+});
+
+test("threads lists the reviewer's own threads for an agent: open ones by default, compact, with severity and the finding id", async () => {
+  const { obj, fx } = make();
+  const body = "**🟠 Major** · **Security & Privacy**\n<sub>Bug · finding `abc123`</sub>\n\n**Token logged**\n\nThe token is written to the log.";
+  fx.ownThreads = async () => [
+    { id: "T1", resolved: false, outdated: false, path: "src/a.js", line: 12, commentId: 5, body, findingId: "abc123" },
+    { id: "T2", resolved: true, outdated: false, path: "src/b.js", line: 3, commentId: 6, body: "**🟡 Minor** · **Performance & Scalability**\n\n**Slow**", findingId: null },
+  ];
+  const open = await obj.threads({ slug: "tankster-ai-review", repo, pr: 39 });
+  assert.deepEqual(open.threads.map((t) => t.id), ["T1"]);
+  assert.equal(open.threads[0].severity, "major");
+  assert.equal(open.threads[0].category, "security");
+  assert.equal(open.threads[0].finding_id, "abc123");
+  assert.equal(open.threads[0].path, "src/a.js");
+  assert.ok(open.threads[0].body.length <= 600);
+  const all = await obj.threads({ slug: "tankster-ai-review", repo, pr: 39, include_resolved: true });
+  assert.equal(all.threads.length, 2);
+});
