@@ -407,7 +407,11 @@ export class PrState {
       }
       // Everything else needs write access, checked through the API by the
       // alarm before it takes effect.
-      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr });
+      // resolve/approve vouch for the threads as they stood when the writer
+      // asked: reopens numbered after this are not covered, however long
+      // the command waits or however many steps it takes (resolveAll).
+      const seq = TOP_LEVEL_ONLY.has(cmd) ? { seq: (await this.ctx.storage.get("reopenSeq")) ?? 0 } : {};
+      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr, ...seq });
       return { action: "command", cmd };
     }
     return { action: "ignored" };
@@ -438,14 +442,16 @@ export class PrState {
     const heavy = isHeavy(due);
     // Whether a review step runs in this invocation: a heavy item that
     // arrives while it runs (webhooks land during its GitHub calls) waits too.
-    const stepping = !heavy && Boolean(await activeRun(this.ctx.storage));
+    // A run that is backing off keeps its deadline: no outbox item, heavy or
+    // not, is a reason to try it early.
+    const active = Boolean(await activeRun(this.ctx.storage));
+    const retryAt = (await this.ctx.storage.get("runRetryAt")) ?? 0;
+    const waiting = active && retryAt > this.now();
+    const stepping = !heavy && active && !waiting;
     let runNext;
     try {
-      // A run that is backing off keeps its backoff: a heavy item is no
-      // reason to try it early.
-      const backoff = async () => Math.max(this.now(), (await this.ctx.storage.get("runRetryAt")) ?? 0);
-      runNext = heavy ? ((await activeRun(this.ctx.storage)) ? await backoff() : null) : await this.stepActiveRun();
-      if (!heavy) await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
+      runNext = !active ? (heavy ? null : await this.stepActiveRun()) : heavy || waiting ? Math.max(this.now(), retryAt) : await this.stepActiveRun();
+      if (!heavy && !waiting) await this.ctx.storage.delete(["runFailures", "runRetryAt"]);
     } catch (e) {
       const n = ((await this.ctx.storage.get("runFailures")) ?? 0) + 1;
       console.log(JSON.stringify({ svc: "ai-review", ev: "run_alarm_failed", failures: n, error: String(e?.message ?? e).slice(0, 200) }));
@@ -787,9 +793,10 @@ export class PrState {
   async resolveAll(fx, item, slug) {
     const key = await this.ctx.storage.get("key");
     if (!key || typeof fx.ownThreads !== "function") return undefined;
-    // Reopens numbered after this are newer than the command's view: a
-    // thread reopened while these calls are pending is not vouched for.
-    const seq = (await this.ctx.storage.get("reopenSeq")) ?? 0;
+    // Reopens numbered after the command was posted are newer than its view
+    // (onEvent stores the number on the item; an item from before that has
+    // none and uses the number now).
+    const seq = Number.isInteger(item.seq) ? item.seq : (await this.ctx.storage.get("reopenSeq")) ?? 0;
     const threads = await fx.ownThreads(key.repo, key.pr, slug);
     const open = threads.filter((t) => !t.resolved);
     let done = 0;

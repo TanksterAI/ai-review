@@ -454,3 +454,41 @@ test("a forced decision does not approve over a thread reopened during resolve a
   await drain(m.obj);
   assert.equal(approvals(m.calls).length, 0);
 });
+
+test("resolve vouches for the threads as they stood when it was posted, across its steps", async () => {
+  // Over 20 open threads, so it takes two steps; X is reopened and then
+  // resolved by an outsider in between.
+  const threads = Array.from({ length: 25 }, (_, i) => thread(`t${i}`, false));
+  threads.push({ id: "X", resolved: true, resolvedBy: "stranger" });
+  const m = await make({ threads, writers: ["rishitank"] });
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review resolve" } });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  await m.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "stranger", bot: false }, threadId: "X" } });
+  await m.obj.onEvent({ delivery: "r2", ev: { kind: "thread", action: "resolved", repo, pr: 39, sender: { login: "stranger", bot: false }, threadId: "X" } });
+  for (let i = 0; i < 10 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    if (m.storage.alarm > NOW) m.setNow(m.storage.alarm);
+    m.storage.alarm = null;
+    await m.obj.alarm();
+  }
+  assert.equal((await acceptedSet(m.storage)).has("X"), false);
+  assert.equal(approvals(m.calls).length, 0);
+});
+
+test("no outbox item steps a review before its retry deadline", async () => {
+  const m = await make();
+  await m.storage.put("runmeta:j1", { id: "j1", stage: "draft", createdAt: NOW });
+  await m.storage.put({ runFailures: 2, runRetryAt: NOW + 60_000 });
+  let stepped = 0;
+  m.obj.stepActiveRun = async () => { stepped++; return null; };
+  await m.obj.outbox({ type: "comment", template: "gave_up", reason: "x", tries: 1 });
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 0);
+  assert.equal(await m.storage.get("runRetryAt"), NOW + 60_000, "the deadline stands");
+  m.setNow(NOW + 60_000);
+  m.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(stepped, 1);
+  assert.equal(await m.storage.get("runRetryAt"), undefined);
+});
