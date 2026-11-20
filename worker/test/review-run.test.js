@@ -957,3 +957,26 @@ test("the summary text a review writes is kept for the approval notice, and an o
   assert.equal(await s.storage.get("summaryBase"), s.github.summaries[0].body);
   assert.equal(await s.storage.get("summaryNotice"), undefined);
 });
+
+
+test("a held neutral success: when the closing status write fails too, the reset is handed over before the run is marked done", async () => {
+  const models = fakeModels({
+    gemini: { "gemini-3.5-flash-lite": () => geminiDay, "gemma-4-31b-it": () => geminiDay },
+    anthropic: () => reply(402, { error: { type: "billing_error", message: "Your credit balance is too low" } }),
+  });
+  const s = setup({ models });
+  const handed = [];
+  s.ctx.beforeDone = async (run) => { handed.push({ stage: run.stage, heldSuccess: run.heldSuccess, lastStatusOk: run.lastStatusOk }); };
+  await startRun(s.storage, s.job, s.getNow());
+  let at = null;
+  for (let i = 0; i < 20; i++) { at = await stepRun(s.ctx, s.job.id); if (at > s.getNow()) break; }
+  assert.ok(at > s.getNow(), "the run waits holding the neutral success");
+  // Every status write now fails, and the run is given up after three days.
+  s.github.setStatus = async () => { throw new Error("github down"); };
+  s.setNow(s.getNow() + 4 * 24 * 3600_000);
+  await stepRun(s.ctx, s.job.id);
+  assert.equal(handed.length, 1);
+  assert.equal(handed[0].heldSuccess, true);
+  assert.equal(handed[0].lastStatusOk, false);
+  assert.notEqual(handed[0].stage, "done", "handed over before the run is marked done");
+});

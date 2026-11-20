@@ -306,6 +306,9 @@ async function status(ctx, run, state, description) {
 
 async function finish(ctx, run, save, { state, description, posted = false, gaveUp = false, reviewedSha = null }) {
   if (state) await status(ctx, run, state, description);
+  // Before the run is marked done (a done run is not picked up again): any
+  // follow-up the gate needs, such as resetting a held success, is handed over.
+  await ctx.beforeDone?.(run, { reviewedSha, state });
   run.stage = "done";
   run.outcome = { state, posted, gaveUp };
   await save(run);

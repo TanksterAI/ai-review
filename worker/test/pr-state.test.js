@@ -1927,10 +1927,10 @@ test("review fixes 5: an interrupted alarm give-up keeps the run until the reset
 test("review fixes 3: a run that held the neutral success and whose closing status did not land puts the commit back to pending", async () => {
   const { obj, storage } = make();
   const run = { id: "w1", repo, pr: 39, headSha: "a".repeat(40), heldSuccess: true, lastStatusOk: false };
-  await obj.runDone(run, { reviewedSha: null, gaveUp: true, description: "gave up" });
+  await obj.releaseRun(run, { reviewedSha: null });
   assert.ok((await storage.get("outbox")).some((x) => x.type === "status" && x.sha === "a".repeat(40) && x.waiting === true));
   await storage.put("outbox", []);
-  await obj.runDone({ ...run, lastStatusOk: true }, { reviewedSha: null, gaveUp: true, description: "gave up" });
+  await obj.releaseRun({ ...run, lastStatusOk: true }, { reviewedSha: null });
   assert.ok(!(await storage.get("outbox")).some((x) => x.type === "status"));
 });
 
@@ -1944,4 +1944,16 @@ test("review fixes 4: a run given up by the alarm while it held the neutral succ
   await fire(obj);
   await drain(obj);
   assert.ok(fx.calls.some((c) => c[0] === "setStatus" && c[2] === "a".repeat(40) && c[3] === "pending"), JSON.stringify(fx.calls.map((c) => c.slice(0, 4))));
+});
+
+
+test("review fixes 6: a gate reset is never dropped after five failed attempts; it is kept and retried later", async () => {
+  const { obj, fx, storage, t } = await acked();
+  fx.setStatus = async () => { throw new Error("github down"); };
+  await storage.put("outbox", [{ id: "s1", attempts: 5, type: "status", sha: "a".repeat(40), waiting: true }]);
+  await fire(obj);
+  const box = await storage.get("outbox");
+  assert.equal(box.length, 1, "still queued");
+  assert.equal(box[0].attempts, 0);
+  assert.ok(box[0].notBefore > t.now, "retried later, not at once");
 });

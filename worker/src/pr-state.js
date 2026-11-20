@@ -581,7 +581,13 @@ export class PrState {
     // Left for the next alarm, its attempts untouched: a review step ran here.
     const item = stepping && isHeavy(found) ? null : found;
     if (item) {
-      if (item.attempts >= MAX_ATTEMPTS) {
+      // A gate reset (a commit back to pending) is the one thing never given
+      // up on: it is kept and tried again later, for a day at most.
+      if (item.attempts >= MAX_ATTEMPTS && item.type === "status" && item.waiting && (item.rounds ?? 0) < 144) {
+        const later = this.now() + 10 * 60_000;
+        await this.ctx.storage.put("outbox", box.map((x) => (x.id === item.id ? { ...x, attempts: 0, rounds: (x.rounds ?? 0) + 1, notBefore: later } : x)));
+        await this.armAt(later);
+      } else if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
         await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
         // Its job would never get a runner: it must not stand in for later pushes.
@@ -1060,9 +1066,17 @@ export class PrState {
       storage: this.ctx.storage, env: this.env, cfg: config(this.env), fx, slug,
       deps: { now: this.now, sleep: this.sleep, fetch: this.fetchImpl, log: (e) => console.log(JSON.stringify({ svc: "ai-review", ...e })) },
       again: `- Review again: comment \`@${slug} review\` for the commits since this review, or \`@${slug} full review\`. Pushes to this repository's branches by people with write access are also reviewed a few minutes after the last one, unless reviews are paused.`,
+      beforeDone: (r, out) => this.releaseRun(r, out),
       onDone: (r, out) => this.runDone(r, out),
     };
     return stepRun(ctx, run.id);
+  }
+
+  // The run held the neutral "delayed" success and its closing status did not
+  // land: the commit must not keep passing the gate unreviewed. Queued before
+  // the run is marked done, so a failure after it still has the reset.
+  async releaseRun(run, { reviewedSha = null } = {}) {
+    if (!reviewedSha && run.heldSuccess && run.lastStatusOk === false && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
   }
 
   // A run is over: its job completes (moving lastReviewed on) or is dropped,
@@ -1083,9 +1097,6 @@ export class PrState {
       // Only after the edit is queued: were that to fail, the job (and its
       // ackId) is still there for the retry.
       await this.ctx.storage.delete(`job:${run.id}`);
-      // The run held the neutral "delayed" success and its closing status did
-      // not land: the commit must not keep passing the gate unreviewed.
-      if (run.heldSuccess && run.lastStatusOk === false && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
       // The summary was written again without its notice: decide puts back
       // the right one (pending, as the head has no complete review).
       await this.queueDecide({});
