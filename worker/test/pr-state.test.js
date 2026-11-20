@@ -1909,3 +1909,15 @@ test("review fixes 3: a run that held the neutral success and whose closing stat
   await obj.runDone({ ...run, lastStatusOk: true }, { reviewedSha: null, gaveUp: true, description: "gave up" });
   assert.ok(!(await storage.get("outbox")).some((x) => x.type === "status"));
 });
+
+test("review fixes 4: a run given up by the alarm while it held the neutral success puts the commit back to pending", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun } = await import("../src/review-run.js");
+  const run = await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  await storage.put("runmeta:j1", { ...run, headSha: "a".repeat(40), heldSuccess: true });
+  t.now = NOW + 4 * 24 * 3600_000;
+  await fire(obj);
+  await drain(obj);
+  assert.ok(fx.calls.some((c) => c[0] === "setStatus" && c[2] === "a".repeat(40) && c[3] === "pending"), JSON.stringify(fx.calls.map((c) => c.slice(0, 4))));
+});

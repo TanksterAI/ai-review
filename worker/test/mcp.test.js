@@ -166,3 +166,8 @@ test("a pull request whose base repository is not in the organisation is refused
   assert.equal(body.result.isError, true);
   assert.equal(s.asked.length, 0);
 });
+
+test("the instructions say a writer's request_review is incremental by default, not only a full re-review", () => {
+  assert.match(INSTRUCTIONS, /commits since the last one, or with full=true of every file again/);
+  assert.doesNotMatch(INSTRUCTIONS, /full re-review only/);
+});

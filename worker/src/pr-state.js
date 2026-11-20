@@ -559,6 +559,8 @@ export class PrState {
       const run = await activeRun(this.ctx.storage);
       if (run && this.now() - run.createdAt > MAX_RUN_LIFE_MS) {
         await dropRun(this.ctx.storage, run.id);
+        // A run given up while it held the neutral success must not leave it.
+        if (run.heldSuccess && run.headSha) await this.outbox({ type: "status", sha: run.headSha, waiting: true });
         await this.ackEnded(await this.ctx.storage.get(`job:${run.id}`), "The review could not finish.");
         await this.ctx.storage.delete(`job:${run.id}`);
         await this.ctx.storage.delete(["runFailures", "runRetryAt"]);

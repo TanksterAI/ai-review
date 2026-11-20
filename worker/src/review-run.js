@@ -595,8 +595,10 @@ async function next(ctx, run, save, batches, at, nextStage) {
   // Once some files are reviewed it stays pending, so a PR is never merged
   // with files unreviewed because the providers ran out.
   const delayed = `Review delayed: waiting for a model provider to reset at ${new Date(run.waitUntil).toISOString().slice(11, 16)} UTC; ${cov.covered} of ${cov.reviewable} files reviewed so far.`;
-  run.heldSuccess = done.size === 0;
+  // Held until a non-success write lands, so a failed write cannot clear it.
+  if (done.size === 0) run.heldSuccess = true;
   await status(ctx, run, done.size > 0 ? "pending" : "success", delayed);
+  if (done.size > 0 && run.lastStatusOk) run.heldSuccess = false;
   await save(run);
   return run.waitUntil;
 }

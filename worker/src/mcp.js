@@ -19,7 +19,7 @@ export const INSTRUCTIONS = [
   "Tankster AI Review reviews a pull request by itself: when it is opened, when a draft is marked ready for review, and a few minutes after the last push.",
   "Do not ask for a review to start one, except as ask_a_writer_to_request_review says. Open pull requests ready for review, not as a draft, and push; the review follows.",
   "Before anything else, call get_review_status and follow its next_action: wait (a review is coming or running), ask_a_writer_to_request_review (a pull request from a fork is reviewed only when someone with write access calls request_review), read_threads (the last commit is reviewed), mark_ready_for_review (a draft is not reviewed), resume (automatic reviews are paused), none (closed).",
-  "request_review is for a full re-review only; it refuses, with the reason, whatever would change nothing.",
+  "request_review needs write access: it asks for a review of the commits since the last one, or with full=true of every file again. It refuses, with the reason, whatever would change nothing.",
 ].join(" ");
 
 const PR_ARGS = {
