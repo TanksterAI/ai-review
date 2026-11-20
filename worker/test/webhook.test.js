@@ -127,3 +127,11 @@ test("a resolved or reopened thread of the App's own is an event; anyone else's,
   const other = base({ thread: { node_id: "PRRT_1", comments: [{ user: { login: "my-app[bot]", type: "Bot" } }] } });
   assert.equal(normalise("pull_request_review_thread", other, { ownerId: "259206056", slug: "my-app" }).kind, "thread");
 });
+
+test("a body cut at 8,000 characters keeps a visible mark, so a whole-comment command in it is never the whole comment", async () => {
+  const { parseCommand } = await import("../src/pr-state.js");
+  const long = `@tankster-ai-review approve${"\n".repeat(9000)}and more`;
+  const ev = normalise("issue_comment", commentPayload(long), { ownerId: OWNER_ID });
+  assert.equal(parseCommand(ev.text), null);
+  assert.equal(parseCommand(normalise("issue_comment", commentPayload("@tankster-ai-review approve"), { ownerId: OWNER_ID }).text), "approve");
+});

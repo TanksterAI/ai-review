@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createEffects, MARKER } from "../src/effects.js";
+import { commentIdOf, createEffects, MARKER } from "../src/effects.js";
 
 function fakeApp(respond = () => ({})) {
   const log = { tokens: [], calls: [] };
@@ -190,6 +190,21 @@ test("approve: an APPROVE review pinned to the commit it checked", async () => {
   assert.equal(app.log.calls[0].path, "/repos/TanksterAI/x/pulls/3/reviews");
   assert.deepEqual(app.log.calls[0].body, { commit_id: SHA, event: "APPROVE", body: `${MARKER}\nok` });
   await assert.rejects(createEffects({}, { app }).approve("TanksterAI/x", 3, { commitId: "main", body: "ok" }));
+  // No text: the marker alone, which shows nothing (CodeRabbit's approval).
+  const quiet = fakeApp(() => ({}));
+  await createEffects({}, { app: quiet }).approve("TanksterAI/x", 3, { commitId: SHA, body: "" });
+  assert.equal(quiet.log.calls[0].body.body, MARKER);
+});
+
+test("dismissReview: withdraws one of the App's reviews; a refusal is false", async () => {
+  const app = fakeApp(() => ({}));
+  assert.equal(await createEffects({}, { app }).dismissReview("TanksterAI/x", 3, 77, "why"), true);
+  assert.equal(app.log.calls[0].method, "PUT");
+  assert.equal(app.log.calls[0].path, "/repos/TanksterAI/x/pulls/3/reviews/77/dismissals");
+  assert.deepEqual(app.log.calls[0].body, { message: "why", event: "DISMISS" });
+  for (const status of [422, 403]) assert.equal(await createEffects({}, { app: fakeApp(() => err(status)) }).dismissReview("TanksterAI/x", 3, 77, "why"), false);
+  await assert.rejects(createEffects({}, { app: fakeApp(() => err(500)) }).dismissReview("TanksterAI/x", 3, 77, "why"));
+  await assert.rejects(createEffects({}, { app }).dismissReview("TanksterAI/x", 3, "77", "why"));
 });
 
 test("reviewDecision: the App's own latest approving, change-requesting or dismissed review; comments do not count", async () => {
@@ -199,13 +214,14 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
     ...Array.from({ length: 99 }, () => ({ user: { login: "rishitank", type: "User" }, state: "APPROVED", commit_id: "2".repeat(40) })),
   ];
   const page2 = [
-    { user: bot, state: "APPROVED", commit_id: "3".repeat(40) },
+    { user: bot, state: "APPROVED", commit_id: "3".repeat(40), id: 33 },
     { user: bot, state: "COMMENTED", commit_id: "4".repeat(40) },
     { user: { login: "tankster-ai-review[bot]", type: "User" }, state: "DISMISSED", commit_id: "5".repeat(40) },
   ];
   const app = fakeApp((m, path) => (path.endsWith("&page=1") ? page1 : page2));
   const d = await createEffects({}, { app }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
-  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40) });
+  // With its id, so a stale approval can be dismissed.
+  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33 });
   assert.equal(app.log.calls.length, 2);
   const none = fakeApp(() => []);
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);
@@ -213,13 +229,13 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
 
 const thread = (over = {}) => ({
   id: "PRRT_1", isResolved: false, isOutdated: false, path: "a.js", line: 5, originalLine: 4,
-  comments: { nodes: [{ databaseId: 11, author: { login: "tankster-ai-review" }, body: "**Minor (bug): x**\n<sub>Potential issue · finding `fd6a7c0b`</sub>\n\nfix", diffHunk: "@@ -1 +1 @@\n+y", originalCommit: { oid: "1".repeat(40) } }] },
+  comments: { nodes: [{ fullDatabaseId: "4637412430", author: { login: "tankster-ai-review" }, body: "**Minor (bug): x**\n<sub>Potential issue · finding `fd6a7c0b`</sub>\n\nfix", diffHunk: "@@ -1 +1 @@\n+y", originalCommit: { oid: "1".repeat(40) } }] },
   ...over,
 });
 
 test("ownThreads: the App's own threads across pages, read through GraphQL with the finding id", async () => {
   const pages = [
-    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [thread(), thread({ id: "PRRT_2", comments: { nodes: [{ databaseId: 12, author: { login: "coderabbitai" }, body: "x", diffHunk: "", originalCommit: { oid: "1".repeat(40) } }] } })] } } } } },
+    { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c1" }, nodes: [thread(), thread({ id: "PRRT_2", comments: { nodes: [{ fullDatabaseId: "12", author: { login: "coderabbitai" }, body: "x", diffHunk: "", originalCommit: { oid: "1".repeat(40) } }] } })] } } } } },
     { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [thread({ id: "PRRT_3", isResolved: true, line: null, resolvedBy: { login: "rishitank" } })] } } } } },
   ];
   const app = fakeApp(() => pages.shift());
@@ -233,9 +249,17 @@ test("ownThreads: the App's own threads across pages, read through GraphQL with 
   assert.deepEqual(app.log.calls[0].body.variables, { owner: "TanksterAI", name: "x", pr: 3, after: null });
   assert.equal(app.log.calls[1].body.variables.after, "c1");
   assert.deepEqual(list.map((t) => [t.id, t.resolved, t.findingId, t.commentId, t.line, t.originalLine, t.originalCommit]), [
-    ["PRRT_1", false, "fd6a7c0b", 11, 5, 4, "1".repeat(40)],
-    ["PRRT_3", true, "fd6a7c0b", 11, null, 4, "1".repeat(40)],
+    ["PRRT_1", false, "fd6a7c0b", 4637412430, 5, 4, "1".repeat(40)],
+    ["PRRT_3", true, "fd6a7c0b", 4637412430, null, 4, "1".repeat(40)],
   ]);
+  // Ids past 2^31 come as fullDatabaseId, a string: read as a safe integer.
+  assert.match(app.log.calls[0].body.query, /fullDatabaseId/);
+});
+
+test("commentIdOf: fullDatabaseId strings and old Ints; nothing else", () => {
+  assert.equal(commentIdOf("4637412430"), 4637412430);
+  assert.equal(commentIdOf(11), 11);
+  for (const bad of [null, undefined, "", "12a", "-3", 0, -1, 1.5, "99999999999999999"]) assert.equal(commentIdOf(bad), null, String(bad));
 });
 
 test("GraphQL errors are errors, not empty answers", async () => {

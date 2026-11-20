@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PrState, parseCommand, jobIdFor, objectOfJob } from "../src/pr-state.js";
+import { PrState, parseCommand, jobIdFor, objectOfJob, actionPerformed } from "../src/pr-state.js";
 import { memoryStorage, fakeEffects, doCtx } from "./helpers.js";
 
 // These tests cover the runner path (REVIEW_MODE=runner); review-run.test.js
@@ -48,11 +48,62 @@ async function drain(obj) {
 const command = (text, login = "rishitank") => ({ kind: "command", repo, pr: 39, sender: { login, bot: false }, text });
 
 test("commands are parsed from the text after the mention", () => {
-  assert.equal(parseCommand("@tankster-ai-review full review"), "full review");
-  assert.equal(parseCommand("hey @tankster-ai-review   Review please"), "review");
-  assert.equal(parseCommand("@tankster-ai-review pause.\nthanks"), "pause");
-  assert.equal(parseCommand("@tankster-ai-review reviewing"), null);
-  assert.equal(parseCommand("@tankster-ai-review delete everything"), null);
+  // CodeRabbit's rules: the handle starts a line, outside code; nothing else
+  // on the command's line; whole-comment commands are all there is.
+  const cases = [
+    ["@tankster-ai-review full review", "full review"],
+    ["@Tankster-AI-Review  Full   Review", "full review"],
+    ["  @tankster-ai-review review", "review"],
+    ["Please look.\n@tankster-ai-review review\nthanks", "review"],
+    ["@tankster-ai-review pause", "pause"],
+    ["@tankster-ai-review ignore", "pause"],
+    ["@tankster-ai-review resolve", "resolve"],
+    ["~~~js\n@tankster-ai-review review\n~~~\n@tankster-ai-review full review", "full review"],
+    ["hey @tankster-ai-review review", null],
+    ["@tankster-ai-review review please", null],
+    ["@tankster-ai-review review.", null],
+    ["@tankster-ai-review pause\nthanks", null],
+    ["Thanks!\n@tankster-ai-review resume", null],
+    ["```\n@tankster-ai-review review\n```", null],
+    ["`@tankster-ai-review review`", null],
+    ["`x` @tankster-ai-review review", null],
+    ["    @tankster-ai-review review", null],
+    ["\t@tankster-ai-review review", null],
+    ["<!-- @tankster-ai-review review -->", null],
+    ["<!--\n@tankster-ai-review review\n-->\n@tankster-ai-review full review", "full review"],
+    ["```\nx\n````\n@tankster-ai-review review", "review"],
+    ["```js```\n@tankster-ai-review review", "review"],
+    ["````\n```\n@tankster-ai-review review\n````", null],
+    ["@tankster-ai-review resolve\n```\nwhy\n```", null],
+    ["@tankster-ai-review resolve\r\n", "resolve"],
+    ["@tankster-ai-review resolve\n<!-- hidden -->", null],
+    ["@tankster-ai-review constructor", null],
+    ["```\n```<!-- literal -->\n@tankster-ai-review review\n```", null],
+    ["```\n<!--\n```\n@tankster-ai-review review", "review"],
+    ["<!-- a\nb --> @tankster-ai-review review", null],
+    ["<!-- a\nb -->\n@tankster-ai-review full review", "full review"],
+    ["<!--\n```\n-->\n@tankster-ai-review review", "review"],
+    // Stricter than Markdown where they differ: a comment reopened on the line
+    // that closed one hides what follows.
+    ["<!--\n--> <!--\n@tankster-ai-review review\n-->", null],
+    // A line that starts with a comment is HTML, never a fence (as Markdown).
+    ["<!-- x -->```\n@tankster-ai-review review", "review"],
+    ["@tankster-ai-review __proto__", null],
+    ["@tankster-ai-review hasOwnProperty", null],
+    ["    ```\n@tankster-ai-review review", "review"],
+    ["@tankster-ai-review reviewing", null],
+    ["@tankster-ai-reviewer review", null],
+    ["@tankster-ai-review delete everything", null],
+  ];
+  for (const [text, want] of cases) assert.equal(parseCommand(text), want, JSON.stringify(text));
+  assert.throws(() => parseCommand("@x review", "bad slug!"));
+  // No backtracking blow-up on a long line of backticks or tildes.
+  for (const ch of ["`", "~"]) {
+    const t0 = Date.now();
+    assert.equal(parseCommand(ch.repeat(8000)), null);
+    assert.equal(parseCommand(`${ch.repeat(3)}\n${ch.repeat(7990)}x`), null);
+    assert.ok(Date.now() - t0 < 1000, `${ch}: ${Date.now() - t0} ms`);
+  }
 });
 
 test("job ids carry the PR object's id, never the repository or PR", () => {
@@ -1132,4 +1183,421 @@ test("the waiting status never replaces the result of a commit already reviewed 
   await obj.onEvent({ delivery: "3", ev: fork(C, "synchronize") });
   await drain(obj);
   assert.deepEqual(fx.calls.filter((c) => c[0] === "setStatus").map((c) => c[2]), [C]);
+});
+
+// --- command acknowledgements (CodeRabbit's "Action performed") ---------------
+
+function withPr(fx, head) {
+  let next = 1000;
+  fx.comment = async (repoFull, pr, body) => { fx.calls.push(["comment", repoFull, pr, body]); return next++; };
+  fx.editComment = async (repoFull, id, body) => { fx.calls.push(["editComment", repoFull, id, body]); return true; };
+  fx.pullRequest = async () => ({ state: "open", draft: false, head: { sha: fx.head ?? head } });
+  fx.head = head;
+  return fx;
+}
+const comments = (fx) => fx.calls.filter((c) => c[0] === "comment").map((c) => c[3]);
+const edits = (fx) => fx.calls.filter((c) => c[0] === "editComment").map((c) => [c[2], c[3]]);
+
+test("review: acknowledged with \"Review triggered.\", edited to \"Review finished.\" when it completes", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  const [ack] = comments(fx);
+  assert.match(ack, /<summary>Action performed<\/summary>[\s\S]*Review triggered\./);
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.equal((await storage.get(`job:${jobId}`)).ackId, 1000);
+  await obj.claim({ jobId, runId: "7" });
+  await obj.complete({ jobId, runId: "7", reviewedSha: "d".repeat(40) });
+  await drain(obj);
+  const [[id, text]] = edits(fx);
+  assert.equal(id, 1000);
+  assert.match(text, /Review finished\./);
+  // A retried alarm does not acknowledge twice.
+  assert.equal(comments(fx).length, 1);
+});
+
+test("review of a commit already reviewed in full is not run again; full review is", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40) });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.match(comments(fx)[0], /<summary>Action not completed<\/summary>[\s\S]*Already reviewed the last commit\. Use `@tankster-ai-review full review`/);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  await obj.onEvent({ delivery: "2", ev: command("@tankster-ai-review full review") });
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
+  assert.match(comments(fx)[1], /Review triggered\./);
+});
+
+test("resume reviews the commits pushed while paused, as CodeRabbit's; with none, it only says so", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "c".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: true });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review resume") });
+  await drain(obj);
+  assert.equal((await storage.get("state")).paused, false);
+  assert.equal(comments(fx).at(-1), "Automatic reviews are back on.");
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+
+  await obj.onEvent({ delivery: "2", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  fx.head = "e".repeat(40);
+  await obj.onEvent({ delivery: "3", ev: command("@tankster-ai-review resume") });
+  await drain(obj);
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  const job = await storage.get(`job:${jobId}`);
+  assert.equal(job.full, false);
+  assert.equal(job.since, "c".repeat(40));
+  assert.match(comments(fx).at(-1), /Reviewing the commits pushed while they were paused/);
+});
+
+test("a review that gives up edits its acknowledgement to say it could not finish", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("job:j1", { id: "j1", ackId: 1234 });
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: true, description: "boom" });
+  await drain(obj);
+  const [[id, text]] = edits(fx);
+  assert.equal(id, 1234);
+  assert.match(text, /<summary>Action not completed<\/summary>[\s\S]*The review could not finish\./);
+});
+
+test("a retried command acknowledges once: the acknowledgement is kept on its item", async () => {
+  const { obj, fx } = make();
+  withPr(fx, "d".repeat(40));
+  let fail = 1;
+  const real = fx.dispatch;
+  fx.dispatch = async (id) => { if (fail-- > 0) throw new Error("GitHub 502"); return real(id); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  for (let i = 0; i < 5; i++) { obj.ctx.storage.alarm = null; try { await obj.alarm(); } catch {} }
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "dispatched on the retry");
+  assert.equal(comments(fx).filter((c) => /Review triggered/.test(c)).length, 1);
+});
+
+// Every way a requested review can end edits its acknowledgement: none is left
+// saying "Review triggered." for ever.
+async function acked(over = {}) {
+  const t = { now: NOW };
+  const { obj, fx, storage } = make({ now: () => t.now });
+  withPr(fx, "d".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("job:j1", { id: "j1", ackId: 1234, createdAt: NOW, ...over });
+  return { obj, fx, storage, t };
+}
+const lastEdit = (fx) => { const e = edits(fx); assert.equal(e.length, 1, JSON.stringify(e)); assert.equal(e[0][0], 1234); return e[0][1]; };
+
+test("ack: a run that covered only part of the PR says it finished, and how far it got", async () => {
+  const { obj, fx } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false, description: "Incomplete: 2 of 5 files reviewed. Comment \"review\" to try again." });
+  await drain(obj);
+  assert.match(lastEdit(fx), /<summary>Action performed<\/summary>[\s\S]*Review finished\. Incomplete: 2 of 5 files reviewed\./);
+});
+
+test("ack: a run stopped because the PR is no longer open says so", async () => {
+  const { obj, fx } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false });
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*no longer open/);
+});
+
+test("ack: closing the PR edits the acknowledgement of a review not done (and posts nothing)", async () => {
+  const { obj, fx, storage } = await acked();
+  await obj.onEvent({ delivery: "c1", ev: { ...review(), kind: "closed" } });
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*closed before the review finished/);
+  assert.equal(comments(fx).length, 0);
+  assert.equal(await storage.get("job:j1"), undefined);
+});
+
+test("ack: a deferral that gives the review up edits it", async () => {
+  const { obj, fx } = await acked({ claimedBy: "7", retries: 2 });
+  assert.equal((await obj.defer({ jobId: "j1", runId: "7", why: "error" })).dropped, true);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*could not finish/);
+});
+
+test("ack: a job that expired before its claim edits it", async () => {
+  const { obj, fx, t } = await acked();
+  t.now = NOW + 3 * 3600_000;
+  assert.equal((await obj.claim({ jobId: "j1", runId: "7" })).error, "job expired");
+  await drain(obj);
+  assert.match(lastEdit(fx), /expired before it could run/);
+});
+
+test("ack: a stale job pruned by a new one edits it; a fresh one is left alone", async () => {
+  const { obj, fx, storage, t } = await acked();
+  await storage.put("job:j2", { id: "j2", ackId: 99, createdAt: NOW + 3 * 3600_000 - 1000 });
+  t.now = NOW + 3 * 3600_000;
+  await obj.newJob({ repo, pr: 39 }, await obj.state(), { queue: false });
+  assert.equal(await storage.get("job:j1"), undefined);
+  assert.ok(await storage.get("job:j2"));
+  const box = (await storage.get("outbox")) ?? [];
+  assert.deepEqual(box.filter((x) => x.type === "ack").map((x) => x.commentId), [1234]);
+});
+
+test("ack: a dispatch dropped after its retries edits it", async () => {
+  const { obj, fx, storage } = await acked();
+  await storage.put("outbox", [{ id: "o1", type: "dispatch", jobId: "j1", attempts: 5 }]);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Action not completed[\s\S]*could not start/);
+  assert.equal(await storage.get("job:j1"), undefined);
+});
+
+test("ack: a run given up by the alarm (after MAX_RUN_LIFE) edits it", async () => {
+  const { obj, fx, storage, t } = await acked();
+  obj.stepActiveRun = async () => { throw new Error("no App"); };
+  const { startRun, activeRun } = await import("../src/review-run.js");
+  await startRun(storage, { id: "j1", repo, pr: 39 }, NOW);
+  assert.ok(await activeRun(storage));
+  t.now = NOW + 4 * 24 * 3600_000;
+  await fire(obj);
+  await drain(obj);
+  assert.match(lastEdit(fx), /could not finish/);
+});
+
+test("resume turns reviews back on but does not review a draft or a closed PR", async () => {
+  for (const [pr, said] of [[{ state: "open", draft: true }, /draft: it is reviewed once it is marked ready/], [{ state: "closed", draft: false }, /closed: it is reviewed if it is reopened/]]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "c".repeat(40));
+    fx.pullRequest = async () => ({ ...pr, head: { sha: "e".repeat(40) } });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: true });
+    await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review resume") });
+    await drain(obj);
+    assert.equal((await storage.get("state")).paused, false);
+    assert.match(comments(fx).at(-1), said);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  }
+});
+
+test("only resolve works as a reply in a review thread; every other command is top-level", async () => {
+  for (const text of ["review", "full review", "pause", "resume", "help", "approve", "ignore"]) {
+    const { obj } = make();
+    const out = await obj.onEvent({ delivery: "1", ev: { ...command(`@tankster-ai-review ${text}`), where: "thread", commentId: 9, inReplyTo: 5 } });
+    assert.equal(out.action, "not_a_command", text);
+  }
+  const { obj } = make();
+  const out = await obj.onEvent({ delivery: "1", ev: { ...command("@tankster-ai-review resolve"), where: "thread", commentId: 9, inReplyTo: 5 } });
+  assert.notEqual(out.action, "not_a_command");
+});
+
+test("a job waiting behind the review in progress is kept fresh, so it is not pruned as stale", async () => {
+  const t = { now: NOW };
+  const { obj, storage } = make({ now: () => t.now });
+  const { startRun } = await import("../src/review-run.js");
+  await startRun(storage, { id: "busy", repo, pr: 39 }, NOW);
+  await storage.put("job:j1", { id: "j1", repo, pr: 39, createdAt: NOW });
+  t.now = NOW + 3600_000;
+  const out = await obj.startWorkerRun(await storage.get("job:j1"), await obj.state());
+  assert.ok(out.holdUntil > t.now);
+  assert.equal((await storage.get("job:j1")).createdAt, t.now);
+});
+
+test("a run that ends without a complete review asks for a decision, so the notice is written again", async () => {
+  const { obj, storage } = await acked();
+  await obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: false, description: "Incomplete: 2 of 5 files reviewed." });
+  const box = (await storage.get("outbox")) ?? [];
+  assert.equal(box.filter((x) => x.type === "decide").length, 1);
+});
+
+test("a retried resume whose head was reviewed meanwhile finishes its job: no second review, the acknowledgement says finished", async () => {
+  // Worker mode (the default): a requested run is forced, so dispatching it
+  // would review the head again.
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), {}, { now: () => NOW, effects: fx });
+  withPr(fx, "c".repeat(40));
+  await storage.put("key", { repo: repo.full, pr: 39 });
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, full: false, createdAt: NOW, ackId: 55 });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  const { activeRun } = await import("../src/review-run.js");
+  assert.equal(await activeRun(storage), null, "no run started");
+  assert.equal(await storage.get("job:j9"), undefined);
+  assert.deepEqual(edits(fx), [[55, actionPerformed("Review finished.")]]);
+  assert.equal(comments(fx).length, 0);
+});
+
+test("a retried resume whose job is already running leaves it to finish", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW, ackId: 55, claimedBy: "worker" });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  assert.ok(await storage.get("job:j9"));
+  assert.equal(comments(fx).length + edits(fx).length, 0);
+});
+
+test("a retried resume whose review is still to start goes on with it, not the shortcut", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "e".repeat(40));
+  await storage.put("state", { lastReviewed: "c".repeat(40), lastCompleteReviewed: "c".repeat(40), paused: false });
+  await storage.put("job:j9", { id: "j9", repo, pr: 39, full: false, createdAt: NOW, ackId: 55 });
+  await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, seq: 1 }]);
+  await drain(obj);
+  // Its own job (given an opaque id first, as an old one is), not a new one.
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1);
+  assert.equal(await storage.get("job:j9"), undefined);
+  assert.equal(comments(fx).length, 0, "no second acknowledgement");
+});
+
+test("ack: a retry after the job write failed still gives the job its acknowledgement (no second comment)", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  // The first try: comment posted, item kept, then the job read fails.
+  const real = storage.get.bind(storage);
+  let fail = true;
+  storage.get = async (k) => { if (fail && typeof k === "string" && k.startsWith("job:") && (await real("outbox"))?.some((x) => x.acked)) { fail = false; throw new Error("storage blip"); } return real(k); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  for (let i = 0; i < 5; i++) { obj.ctx.storage.alarm = null; try { await obj.alarm(); } catch {} }
+  storage.get = real;
+  assert.equal(fail, false, "the job read did fail once");
+  const [jobId] = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.ok(jobId, "dispatched on the retry");
+  assert.equal((await storage.get(`job:${jobId}`)).ackId, 1000);
+  assert.equal(comments(fx).length, 1);
+});
+
+test("ack: complete queues its edit once, even when retried before the job is deleted", async () => {
+  const { obj, fx, storage } = await acked({ claimedBy: "7", claimedAt: NOW });
+  const del = storage.delete.bind(storage);
+  let fail = true;
+  storage.delete = async (k) => { if (fail && k === "job:j1") { fail = false; throw new Error("storage blip"); } return del(k); };
+  await assert.rejects(obj.complete({ jobId: "j1", runId: "7", reviewedSha: "d".repeat(40) }));
+  storage.delete = del;
+  await obj.complete({ jobId: "j1", runId: "7", reviewedSha: "d".repeat(40) });
+  const acks = ((await storage.get("outbox")) ?? []).filter((x) => x.type === "ack");
+  assert.equal(acks.length, 1);
+  await drain(obj);
+  assert.match(lastEdit(fx), /Review finished\./);
+});
+
+test("a retried resume whose PR became a draft or closed ends its job, and says why", async () => {
+  for (const [pr, said] of [[{ state: "open", draft: true }, /draft/], [{ state: "closed", draft: false }, /closed/]]) {
+    const { obj, fx, storage } = make();
+    withPr(fx, "e".repeat(40));
+    fx.pullRequest = async () => ({ ...pr, head: { sha: "e".repeat(40) } });
+    await storage.put("key", { repo: repo.full, pr: 39 });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+    await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW, ackId: 55 });
+    await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, ackId: 55, seq: 1 }]);
+    await drain(obj);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+    assert.equal(await storage.get("job:j9"), undefined);
+    const [[id, text]] = edits(fx);
+    assert.equal(id, 55);
+    assert.match(text, /Action not completed[\s\S]*/);
+    assert.match(text, said);
+  }
+});
+
+test("a retried resume ends its job on the item's acknowledgement id when the job's was never saved", async () => {
+  const cases = [
+    [{ state: "open", draft: false }, "c".repeat(40), /Action performed[\s\S]*Review finished\./],
+    [{ state: "open", draft: true }, "e".repeat(40), /Action not completed[\s\S]*draft/],
+    [{ state: "closed", draft: false }, "e".repeat(40), /Action not completed[\s\S]*closed/],
+  ];
+  for (const [pr, head, said] of cases) {
+    const { obj, fx, storage } = make();
+    withPr(fx, head);
+    fx.pullRequest = async () => ({ ...pr, head: { sha: head } });
+    await storage.put("key", { repo: repo.full, pr: 39 });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+    await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW });
+    await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, ackId: 77, seq: 1 }]);
+    await drain(obj);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+    assert.equal(await storage.get("job:j9"), undefined);
+    const [[id, text]] = edits(fx);
+    assert.equal(id, 77);
+    assert.match(text, said);
+  }
+});
+
+test("ack: the flag, the id and the job's copy are one write; a close before the retry edits the acknowledgement", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  // The acknowledgement is posted, then the dispatch fails: the item waits for a retry.
+  fx.dispatch = async () => { throw new Error("GitHub 502"); };
+  const puts = [];
+  const put = storage.put.bind(storage);
+  storage.put = async (k, v) => { puts.push(typeof k === "object" ? Object.keys(k) : [k]); return put(k, v); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  obj.ctx.storage.alarm = null;
+  try { await obj.alarm(); } catch {}
+  const [item] = ((await storage.get("outbox")) ?? []).filter((x) => x.type === "command");
+  assert.equal(item.ackId, 1000);
+  assert.equal((await storage.get(`job:${item.jobId}`)).ackId, 1000);
+  assert.ok(puts.some((ks) => ks.includes("outbox") && ks.includes(`job:${item.jobId}`)), "one write holds both");
+  // Closed before the retry: the close edits the acknowledgement.
+  await obj.onEvent({ delivery: "2", ev: { ...review(), kind: "closed" } });
+  await drain(obj);
+  assert.deepEqual(edits(fx).map(([id]) => id), [1000]);
+  assert.match(edits(fx)[0][1], /closed before the review finished/);
+  assert.equal(comments(fx).length, 1);
+});
+
+test("ack: a close while the acknowledgement is being posted still edits it, and nothing is dispatched", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  const post = fx.comment;
+  fx.comment = async (r, p, body) => {
+    // The close lands while GitHub's call is pending.
+    await obj.onEvent({ delivery: "2", ev: { ...review(), kind: "closed" } });
+    return post(r, p, body);
+  };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+  const e = edits(fx);
+  assert.equal(e.length, 1);
+  assert.equal(e[0][0], 1000);
+  assert.match(e[0][1], /Action not completed[\s\S]*closed before the review finished/);
+});
+
+test("an ack is queued before its job goes: a failed queue keeps the ackId for the retry (runDone, defer)", async () => {
+  for (const op of ["runDone", "defer"]) {
+    const storage = memoryStorage();
+    const obj = new PrState(doCtx(storage), {}, { now: () => NOW, effects: {} });
+    await storage.put("key", { repo: "o/r", pr: 1 });
+    await storage.put("job:j1", { id: "j1", ackId: 4242, claimedBy: op === "defer" ? "run9" : null, createdAt: NOW, retries: 99 });
+    const put = storage.put.bind(storage);
+    storage.put = async (k, v) => { if (k === "outbox") throw new Error("outbox down"); return put(k, v); };
+    const go = op === "runDone"
+      ? obj.runDone({ id: "j1" }, { reviewedSha: null, gaveUp: true, description: "x" })
+      : obj.defer({ jobId: "j1", runId: "run9", why: "error", reason: "x" });
+    await assert.rejects(go, /outbox down/, op);
+    assert.equal((await storage.get("job:j1"))?.ackId, 4242, `${op}: the job and its ackId survive`);
+  }
+});
+
+test("review fixes: a hidden comment on a whole-comment command's line stops it; a cut-off body is never the whole comment", async () => {
+  assert.equal(parseCommand("@tankster-ai-review approve <!-- extra text -->"), null);
+  assert.equal(parseCommand("@tankster-ai-review approve"), "approve");
+});
+
+test("review fixes: a job waiting behind a provider's long wait is held for less than its lifetime, so a later job cannot prune it", async () => {
+  const { obj, storage } = make();
+  const { startRun, activeRun, RUN_META } = await import("../src/review-run.js");
+  await startRun(storage, { id: "busy", repo, pr: 39 }, NOW);
+  const run = await activeRun(storage);
+  const key = [...(await storage.list({ prefix: RUN_META })).keys()][0];
+  await storage.put(key, { ...run, waitUntil: NOW + 6 * 3600_000 });
+  await storage.put("job:j1", { id: "j1", repo, pr: 39, createdAt: NOW });
+  const held = await obj.startWorkerRun(await storage.get("job:j1"), await obj.state());
+  assert.ok(held.holdUntil <= NOW + 3600_000, `held until +${(held.holdUntil - NOW) / 3600_000} h`);
+});
+
+test("review fixes: an acknowledgement that cannot be posted does not stop the review", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  fx.comment = async () => { throw new Error("locked conversation"); };
+  await obj.onEvent({ delivery: "d1", ev: command("@tankster-ai-review review") });
+  await fire(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 1, "the review is still dispatched");
 });

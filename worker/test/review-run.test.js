@@ -644,7 +644,7 @@ test("no findings: no review at all, and the one summary comment is edited in pl
   assert.equal(s.github.posted.length, 0, "a clean review posts nothing new");
   assert.equal(s.github.summaries.length, 1);
   assert.equal(s.github.summaries[0].id, 77);
-  assert.match(s.github.summaries[0].body, /No actionable comments were generated in the latest review\. 🎉/);
+  assert.match(s.github.summaries[0].body, /No actionable comments were generated in the recent review\. 🎉/);
   assert.match(s.github.summaries[0].body, /<details><summary>About this review<\/summary>/);
   // The gate still gets its answer.
   assert.equal(s.github.statuses.at(-1).state, "success");
@@ -767,7 +767,7 @@ test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment,
   assert.equal(chill.github.posted[0].event, "COMMENT");
   assert.equal(chill.github.posted[0].comments.length, 0, "a nitpick goes in the body under the chill profile");
   assert.deepEqual(await listOpenFindings(chill.storage), [], "nothing to hold back approval");
-  assert.match(chill.github.summaries[0].body, /No actionable comments were generated in the latest review\. Reviewed .*1 nitpick.* Nitpicks do not block approval\./);
+  assert.match(chill.github.summaries[0].body, /No actionable comments were generated in the recent review\. Reviewed .*1 nitpick.* Nitpicks do not block approval\./);
 
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
@@ -912,4 +912,20 @@ test("a nitpick GitHub would not place (422) is not kept; an actionable one is",
   const kept = await listOpenFindings(s.storage);
   assert.equal(kept.length, 1);
   assert.match(kept[0].text, /Off by one/);
+});
+
+test("a fix that came in several commits is noted with the range, as CodeRabbit's", async () => {
+  const since = () => ({ status: "ahead", commits: [{ sha: "f".repeat(40) }, { sha: HEAD }], files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+  const s = setup({ github: threadsGithub({ files: SMALL, threads: [ownThread()], since }), models: judging({ "t:PRRT_a": "fixed" }), env: { ADDRESSED_CHAIN: "anthropic:claude-haiku-5-5" } });
+  await runAll(s);
+  assert.deepEqual(s.github.resolved, ["PRRT_a"]);
+  assert.match(s.github.edits[0].body, /\n\n✅ Addressed in commits fffffff to aaaaaaa$/);
+});
+
+test("the summary text a review writes is kept for the approval notice, and an old notice is cleared", async () => {
+  const s = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ flag: "nothing-here.js" }) });
+  await s.storage.put("summaryNotice", "old");
+  await runAll(s);
+  assert.equal(await s.storage.get("summaryBase"), s.github.summaries[0].body);
+  assert.equal(await s.storage.get("summaryNotice"), undefined);
 });

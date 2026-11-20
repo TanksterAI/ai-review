@@ -223,3 +223,11 @@ test("findingIdOf reads ids with any number of collision suffixes", () => {
   }
   assert.equal(findingIdOf("**Minor (bug): x**\n<sub>Potential issue · finding `aaaaaaaa--2`</sub>"), null);
 });
+
+test("addressedNote names a range when the fix came in more than one commit, as CodeRabbit's", () => {
+  const head = "04130ba" + "0".repeat(33);
+  const first = "0509a3f" + "1".repeat(33);
+  assert.equal(addressedNote("body", head, first), "body\n\n✅ Addressed in commits 0509a3f to 04130ba");
+  assert.equal(addressedNote("body", head, head), "body\n\n✅ Addressed in commit 04130ba");
+  assert.equal(addressedNote("body", head, null), "body\n\n✅ Addressed in commit 04130ba");
+});
