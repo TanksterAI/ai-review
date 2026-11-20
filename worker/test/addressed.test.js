@@ -211,4 +211,8 @@ test("nitpickFinding: typed nitpick, or trivial or info severity", () => {
   assert.equal(nitpickFinding("**Minor (bug): x**\n<sub>Potential issue · finding `aaaaaaaa`</sub>"), false);
   assert.equal(nitpickFinding("**Major (security): x**\n<sub>Potential issue · finding `aaaaaaaa`</sub>"), false);
   assert.equal(nitpickFinding("a person's comment saying Trivial"), false);
+  // A critical, major or security finding typed nitpick is still an issue.
+  assert.equal(nitpickFinding("**Critical (security): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), false);
+  assert.equal(nitpickFinding("**Major (bug): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), false);
+  assert.equal(nitpickFinding("**Minor (security): x**\n<sub>Nitpick · finding `aaaaaaaa`</sub>"), false);
 });

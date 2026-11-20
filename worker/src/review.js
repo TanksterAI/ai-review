@@ -609,7 +609,10 @@ export function codeSpan(text) {
 // collapsed section, assertive puts them inline, quiet leaves them out.
 export const PROFILES = ["chill", "assertive", "quiet"];
 
-const minorish = (f) => f.type === "nitpick" || f.severity === "trivial" || f.severity === "info";
+// A critical, major or security finding is never a nitpick, whatever type the
+// drafter gave it: it is placed, and blocks, as an issue.
+const minorish = (f) => !(f.severity === "critical" || f.severity === "major" || f.category === "security")
+  && (f.type === "nitpick" || f.severity === "trivial" || f.severity === "info");
 const at = (f) => (f.path ? `\`${codeSpan(f.path)}${Number.isInteger(f.line) ? `:${f.line}` : ""}\`` : "general");
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 const modelOf = (id) => String(id).slice(String(id).indexOf(":") + 1);

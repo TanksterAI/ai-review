@@ -504,3 +504,11 @@ test("an open nitpick thread does not hold back approval; an open issue thread d
   await decide(blocked);
   assert.equal(approvals(blocked.calls).length, 0);
 });
+
+test("closing a pull request clears a backing-off run's retry state", async () => {
+  const m = await make();
+  await m.storage.put({ runFailures: 4, runRetryAt: NOW + 60_000 });
+  await m.obj.onEvent({ delivery: "c1", ev: { kind: "closed", repo, pr: 39, merged: false } });
+  assert.equal(await m.storage.get("runFailures"), undefined);
+  assert.equal(await m.storage.get("runRetryAt"), undefined);
+});

@@ -962,5 +962,10 @@ test("renderReview: nitpicks are shown but neither block nor are kept; actionabl
   const r = renderReview({ answer, classified, prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "chill" } });
   assert.equal(r.shown, 4);
   assert.equal(r.blocking, 2, "the major inline one and the minor outside one");
+  // Typed nitpick but critical: an issue, which blocks.
+  const sev = { summary: "s", findings: [{ path: "src/a.js", line: 3, severity: "critical", type: "nitpick", category: "bug", title: "Overflow", body: "b" }] };
+  const r2 = renderReview({ answer: sev, classified: classifyFindings(sev, prepared.commentable), prepared, meta: { model: "m", neurons: 1, spent: 1, cap: 10, profile: "chill" } });
+  assert.equal(r2.blocking, 1);
+  assert.equal(r2.comments.length, 1, "placed inline, as an issue");
   assert.deepEqual(r.listed.map((x) => x.title ?? x.text.split("\n")[0]), ["Outside"]);
 });

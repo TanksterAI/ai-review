@@ -318,7 +318,7 @@ export class PrState {
         await clearPrefix(this.ctx.storage, ACCEPTED);
         await clearOpenFindings(this.ctx.storage);
       }
-      await this.ctx.storage.delete("debounce");
+      await this.ctx.storage.delete(["debounce", "runFailures", "runRetryAt"]);
       await this.deleteAll([...(await this.ctx.storage.list({ prefix: "job:" })).keys()]);
       // A review in progress stops: nothing is posted on a closed PR.
       for (const prefix of [RUN_META, RUN]) await this.deleteAll([...(await this.ctx.storage.list({ prefix })).keys()]);

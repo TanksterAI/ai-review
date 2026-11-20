@@ -138,6 +138,8 @@ export function severeFinding(body) {
  */
 export function nitpickFinding(body) {
   const [first = "", second = ""] = String(body ?? "").split("\n");
+  // Never a critical, major or security finding (review.js minorish).
+  if (/^\*\*(Critical|Major) \(/.test(first) || /^\*\*\w+ \(security\):/.test(first)) return false;
   return /^\*\*(Trivial|Info) \(/.test(first) || /^<sub>Nitpick · finding `/.test(second);
 }
 

@@ -935,7 +935,7 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   if (!complete || none) lines.push(summary, "");
   else if (actionable) lines.push(`Actionable comments posted: ${actionable}. ${summary}`, "");
   // Nitpicks alone: shown in the review, never blocking (as CodeRabbit's).
-  else if (shown) lines.push(`No actionable comments were generated in the latest review; ${plural(shown, "nitpick")} noted in the review, none of them blocking. ${summary}`, "");
+  else if (shown) lines.push(`No actionable comments were generated in the latest review. ${summary} Nitpicks do not block approval.`, "");
   else lines.push("No actionable comments were generated in the latest review. 🎉", "");
   if (threads) {
     const parts = [];

@@ -767,7 +767,7 @@ test("nitpicks never block, as CodeRabbit's: a nitpick-only review is a comment,
   assert.equal(chill.github.posted[0].event, "COMMENT");
   assert.equal(chill.github.posted[0].comments.length, 0, "a nitpick goes in the body under the chill profile");
   assert.deepEqual(await listOpenFindings(chill.storage), [], "nothing to hold back approval");
-  assert.match(chill.github.summaries[0].body, /No actionable comments were generated in the latest review; 1 nitpick noted/);
+  assert.match(chill.github.summaries[0].body, /No actionable comments were generated in the latest review\. Reviewed .*1 nitpick.* Nitpicks do not block approval\./);
 
   const quiet = setup({ github: threadsGithub({ files: SMALL }), models: fakeModels({ finding: nit }), env: { REVIEW_PROFILE: "quiet" } });
   await runAll(quiet);
