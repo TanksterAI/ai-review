@@ -1021,8 +1021,10 @@ export class PrState {
     const now = await fx.pullRequest(key.repo, key.pr);
     if (now?.head?.sha !== head || now?.state !== "open" || now.draft) return undefined;
     // As CodeRabbit's: an approval with no text (the summary comment says why).
-    // A reopen since the snapshot: decide again rather than approve from it.
-    const again = () => this.outbox({ type: "decide", reopened: true, force: Boolean(item.force), login: item.login ?? null });
+    // A reopen since the snapshot: decide again, of the same kind (a reopened
+    // decision never approves, so an ordinary one must stay ordinary), rather
+    // than approve from it.
+    const again = () => this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
     if (((await this.ctx.storage.get("reopenSeq")) ?? 0) !== seqAtSnapshot) { await again(); return undefined; }
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });

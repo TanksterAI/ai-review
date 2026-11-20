@@ -702,3 +702,13 @@ test("a reopen between the snapshot and the last head check is decided again, no
   await decide(m);
   assert.equal(approvals(m.calls).length, 0);
 });
+
+test("a retry after a reopen during the final head check keeps its kind: a nitpick reopen still ends in approval", async () => {
+  const nit = { id: "n1", resolved: true, resolvedBy: "rishitank", body: "**Trivial (maintainability): Name it better**\n<sub>Nitpick · finding `aaaaaaaa`</sub>\n\nx" };
+  const m = await make({ threads: [nit] });
+  const pr = m.fx.pullRequest;
+  let n = 0;
+  m.fx.pullRequest = async (...a) => { if (++n === 2) { await m.obj.onEvent({ delivery: "r1", ev: { kind: "thread", action: "unresolved", repo, pr: 39, sender: { login: "rishitank", bot: false }, threadId: "n1" } }); m.w.threads[0].resolved = false; } return pr(...a); };
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 1, "an ordinary replacement approves: only a nitpick is open");
+});
