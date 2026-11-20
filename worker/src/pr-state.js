@@ -812,12 +812,14 @@ export class PrState {
       const commentId = await fx.comment(item.repo.full, item.pr, actionPerformed(text));
       item.acked = true;
       if (Number.isSafeInteger(commentId)) item.ackId = commentId;
-      await this.keepItem(item);
+      // The flag, the id and the job's copy of it in one write (a multi-key
+      // put is atomic): no failure can leave one without the others.
+      const box = (await this.ctx.storage.get("outbox")) ?? [];
+      const job = await this.ctx.storage.get(`job:${item.jobId}`);
+      const writes = { outbox: box.map((x) => (x.id === item.id ? item : x)) };
+      if (job && Number.isSafeInteger(item.ackId)) writes[`job:${item.jobId}`] = { ...job, ackId: item.ackId };
+      await this.ctx.storage.put(writes);
     }
-    // The comment id is kept on the item with the flag, so a retry after the
-    // job write failed still gives the job its acknowledgement.
-    const job = await this.ctx.storage.get(`job:${item.jobId}`);
-    if (job && Number.isSafeInteger(item.ackId) && job.ackId !== item.ackId) await this.ctx.storage.put(`job:${item.jobId}`, { ...job, ackId: item.ackId });
     return this.dispatchJob(fx, item.jobId);
   }
 

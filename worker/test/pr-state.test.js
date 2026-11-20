@@ -1518,3 +1518,26 @@ test("a retried resume ends its job on the item's acknowledgement id when the jo
     assert.match(text, said);
   }
 });
+
+test("ack: the flag, the id and the job's copy are one write; a close before the retry edits the acknowledgement", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "d".repeat(40));
+  // The acknowledgement is posted, then the dispatch fails: the item waits for a retry.
+  fx.dispatch = async () => { throw new Error("GitHub 502"); };
+  const puts = [];
+  const put = storage.put.bind(storage);
+  storage.put = async (k, v) => { puts.push(typeof k === "object" ? Object.keys(k) : [k]); return put(k, v); };
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review review") });
+  obj.ctx.storage.alarm = null;
+  try { await obj.alarm(); } catch {}
+  const [item] = ((await storage.get("outbox")) ?? []).filter((x) => x.type === "command");
+  assert.equal(item.ackId, 1000);
+  assert.equal((await storage.get(`job:${item.jobId}`)).ackId, 1000);
+  assert.ok(puts.some((ks) => ks.includes("outbox") && ks.includes(`job:${item.jobId}`)), "one write holds both");
+  // Closed before the retry: the close edits the acknowledgement.
+  await obj.onEvent({ delivery: "2", ev: { ...review(), kind: "closed" } });
+  await drain(obj);
+  assert.deepEqual(edits(fx).map(([id]) => id), [1000]);
+  assert.match(edits(fx)[0][1], /closed before the review finished/);
+  assert.equal(comments(fx).length, 1);
+});
