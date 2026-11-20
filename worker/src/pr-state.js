@@ -755,16 +755,19 @@ export class PrState {
         if (kept) {
           // Already running: its own end edits the acknowledgement.
           if (kept.claimedBy) return undefined;
+          // The item's id stands in when the job's write failed (reviewNow
+          // saves it on the item first).
+          const ackId = Number.isSafeInteger(kept.ackId) ? kept.ackId : item.ackId;
           // The head was reviewed meanwhile: the job is done without a second
           // review (a requested run is forced, so it would review it again).
           if (head && (head === st.lastReviewed || head === st.lastCompleteReviewed)) {
-            await this.queueAck(kept.ackId, actionPerformed("Review finished."));
+            await this.queueAck(ackId, actionPerformed("Review finished."));
             await this.ctx.storage.delete(`job:${item.jobId}`);
             return undefined;
           }
           // It became a draft, or closed, meanwhile: no review now.
           if (draft || shut) {
-            await this.ackEnded(kept, shut ? "This pull request is closed: it is reviewed if it is reopened." : "This pull request is a draft: it is reviewed once it is marked ready.");
+            await this.ackEnded({ ackId }, shut ? "This pull request is closed: it is reviewed if it is reopened." : "This pull request is a draft: it is reviewed once it is marked ready.");
             await this.ctx.storage.delete(`job:${item.jobId}`);
             return undefined;
           }

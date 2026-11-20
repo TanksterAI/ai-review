@@ -1495,3 +1495,26 @@ test("a retried resume whose PR became a draft or closed ends its job, and says 
     assert.match(text, said);
   }
 });
+
+test("a retried resume ends its job on the item's acknowledgement id when the job's was never saved", async () => {
+  const cases = [
+    [{ state: "open", draft: false }, "c".repeat(40), /Action performed[\s\S]*Review finished\./],
+    [{ state: "open", draft: true }, "e".repeat(40), /Action not completed[\s\S]*draft/],
+    [{ state: "closed", draft: false }, "e".repeat(40), /Action not completed[\s\S]*closed/],
+  ];
+  for (const [pr, head, said] of cases) {
+    const { obj, fx, storage } = make();
+    withPr(fx, head);
+    fx.pullRequest = async () => ({ ...pr, head: { sha: head } });
+    await storage.put("key", { repo: repo.full, pr: 39 });
+    await storage.put("state", { lastReviewed: "c".repeat(40), paused: false });
+    await storage.put("job:j9", { id: "j9", repo, pr: 39, createdAt: NOW });
+    await storage.put("outbox", [{ id: "o9", attempts: 1, type: "command", cmd: "resume", repo, pr: 39, login: "rishitank", jobId: "j9", acked: true, ackId: 77, seq: 1 }]);
+    await drain(obj);
+    assert.equal(fx.calls.filter((c) => c[0] === "dispatch").length, 0);
+    assert.equal(await storage.get("job:j9"), undefined);
+    const [[id, text]] = edits(fx);
+    assert.equal(id, 77);
+    assert.match(text, said);
+  }
+});
