@@ -285,3 +285,30 @@ test("text cut through a surrogate pair is made well-formed before it is sent", 
   const out = batchContext({ files: new Map([["a.js", line]]) }, { included: ["a.js"], shown: new Map([["a.js", [1]]]) }, 5000);
   assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(out.text), "a lone high surrogate was left");
 });
+
+test("redact stays fast on files built to be slow, and leaves code that only names a credential alone", () => {
+  const inputs = ["a-".repeat(150_000), "a.".repeat(150_000), `${"a+".repeat(40_000)}://x:yyy`, "abcd-efgh".repeat(30_000), "password".repeat(40_000), "password=".repeat(30_000), "token_".repeat(40_000), "Bearer ".repeat(30_000), `password${" ".repeat(250_000)}`];
+  const at = Date.now();
+  for (const text of inputs) redact(text);
+  assert.ok(Date.now() - at < 2000, `redact took ${Date.now() - at} ms`);
+  for (const keep of ["const isTokenValid = validateToken2(session)", "const tokenUrl = process.env.TOKEN_URL_V2;", "token = tokens.get_token_v2_cached()", "maxTokens = 123456789012", "TOKEN_LIMIT=100000000000"]) assert.equal(redact(keep), keep);
+  for (const [text, secret] of [["const password: string = \"hunter2hunter2\";", "hunter2hunter2"], ["postgres://u:pa/ss@host/db", "pa/ss"], ["authorization: bearer abcdefghijklmnopqrstuvwxyz123456", "abcdefghijklmnopqrstuvwxyz"]]) assert.ok(!redact(text).includes(secret), text);
+});
+
+test("isSecretPath covers prefixed names and the usual config stores of credentials", () => {
+  for (const p of ["gcp-service-account.json", "prod-kubeconfig", "app-secrets.json", "config/prod.secrets.yaml", "client_secret_123.json", "terraform.tfvars.json", ".docker/config.json", ".kube/config", ".pgpass", "wp-config.php", ".yarnrc.yml"]) assert.equal(isSecretPath(p), true, p);
+});
+
+test("a glob with many alternatives cannot be made to take long", () => {
+  const evil = `${"{*,*}".repeat(10)}Z`;
+  const at = Date.now();
+  assert.equal(globToRegExp(evil).test("a".repeat(30)), false);
+  assert.ok(Date.now() - at < 500, `took ${Date.now() - at} ms`);
+});
+
+test("notes: a bare issue number, a commit-like word and an empty note do not get through as plain text", () => {
+  assert.match(contextLine({ notes: ["GH-12 is too large to read whole"] }), /\(` GH-12 is too large to read whole `\)\.$/);
+  assert.match(contextLine({ notes: ["deadbeef1 could not be read"] }), /\(` deadbeef1 could not be read `\)\.$/);
+  assert.match(contextLine({ notes: ["docs/_a_/b.md could not be read"] }), /\(` docs\/_a_\/b\.md could not be read `\)\.$/);
+  assert.equal(contextLine({ notes: ["", "  ", "docs/a.md could not be read"] }), "- Context: none found (docs/a.md could not be read).");
+});
