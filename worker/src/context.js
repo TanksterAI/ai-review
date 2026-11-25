@@ -42,12 +42,13 @@ const LINE_CHARS = 400;
 const SECRET_PATH = new RegExp(
   "(^|/)(" + [
     "\\.env(rc)?($|\\.[^/]*$)", "[^/]*\\.env$", "\\.dev\\.vars(\\.[^/]*)?$",
-    "\\.npmrc$", "\\.netrc$", "\\.pypirc$", "\\.htpasswd$", "\\.git-credentials$", "kubeconfig(\\.[^/]*)?$",
+    "\\.npmrc$", "\\.yarnrc\\.yml$", "\\.netrc$", "\\.pypirc$", "\\.pgpass$", "\\.htpasswd$", "\\.git-credentials$", "wp-config\\.php$",
+    "[^/]*kubeconfig(\\.[^/]*)?$", "\\.kube/", "\\.docker/config\\.json$",
     "id_(rsa|dsa|ecdsa|ed25519)(\\.pub)?$",
     "credentials(\\.(json|ya?ml|toml|ini|txt|csv|xml))?$",
-    "secrets?\\.(json|ya?ml|toml|env|txt)$",
-    "service[-_]?account[^/]*\\.json$",
-    "[^/]*\\.(tfstate|tfstate\\.backup|tfvars|pem|key|p8|p12|pfx|pkcs12|jks|keystore|kdbx)$",
+    "[^/]*secrets?\\.(json|ya?ml|toml|env|txt)$", "client_secret[^/]*\\.json$",
+    "[^/]*service[-_]?account[^/]*\\.json$",
+    "[^/]*\\.(tfstate|tfstate\\.backup|tfvars|tfvars\\.json|pem|key|p8|p12|pfx|pkcs12|jks|keystore|kdbx)$",
     "\\.?secrets?/", "\\.(ssh|aws|gnupg)/",
   ].join("|") + ")", "i");
 export const isSecretPath = (path) => SECRET_PATH.test(String(path));
@@ -65,12 +66,14 @@ const REDACT = [
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
 ];
 const KEYWORD = "(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)";
-// A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key), then a quoted value.
-const ASSIGNED = new RegExp(`\\b(\\w*${KEYWORD}\\w*["']?\\s*[:=]\\s*)(["'\`])[^"'\`\\n]{8,}\\2`, "gi");
-// The same with no quotes (an .env style line, YAML): the value must look like a secret (12 or more characters with a digit in them).
-const ASSIGNED_BARE = new RegExp(`\\b(\\w*${KEYWORD}\\w*["']?\\s*[:=]\\s*)(?=[A-Za-z0-9+/_.~=-]*\\d)[A-Za-z0-9+/_.~=-]{12,}`, "gi");
-const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]{3,}(@)/gi;
-const BEARER = /\b(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/g;
+// Every quantifier below is bounded, so the time a file takes is linear in its size however it is written.
+// A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key, `password: string`), then a quoted value.
+const NAME_THEN = `(${KEYWORD}\\w{0,40}["']?(?:\\s{0,20}:\\s{0,20}[\\w<>|]{1,30})?\\s{0,20}[:=]\\s{0,20})`;
+const ASSIGNED = new RegExp(`${NAME_THEN}(["'\`])[^"'\`\\n]{8,500}\\2`, "gi");
+// The same with no quotes (an .env style line, YAML): a value that looks like a secret (12 or more characters with a digit and a letter, not a call or a path into an object).
+const ASSIGNED_BARE = new RegExp(`${NAME_THEN}(?=[A-Za-z0-9+/_~=-]{0,200}\\d)(?=[A-Za-z0-9+/_~=-]{0,200}[A-Za-z])[A-Za-z0-9+/_~=-]{12,200}(?![\\w(.])`, "gi");
+const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,64}:)[^\s@]{3,200}(@)/gi;
+const BEARER = /\b(Bearer\s{1,5})[A-Za-z0-9._~+/-]{20,2000}=*/gi;
 
 /** The text with the common forms of a credential blanked out (a safety net, not a guarantee). */
 export function redact(text) {
@@ -159,14 +162,16 @@ export function globToRegExp(glob) {
   let re = "";
   let depth = 0;
   const g = String(glob).slice(0, 200);
+  // Alternatives multiply the work a failed match does, so a glob with more than a few of them keeps its braces as plain characters.
+  const braces = (g.match(/\{/g) ?? []).length <= 3 && (g.match(/,/g) ?? []).length <= 8;
   for (let i = 0; i < g.length; i++) {
     const c = g[i];
     if (c === "*" && g[i + 1] === "*") { re += g[i + 2] === "/" ? "(?:.*/)?" : ".*"; i += g[i + 2] === "/" ? 2 : 1; }
     else if (c === "*") re += "[^/]*";
     else if (c === "?") re += "[^/]";
-    else if (c === "{") { depth++; re += "(?:"; }
-    else if (c === "}" && depth > 0) { depth--; re += ")"; }
-    else if (c === "," && depth > 0) re += "|";
+    else if (c === "{" && braces) { depth++; re += "(?:"; }
+    else if (c === "}" && braces && depth > 0) { depth--; re += ")"; }
+    else if (c === "," && braces && depth > 0) re += "|";
     else re += c.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
   }
   re += ")".repeat(depth);
@@ -379,7 +384,8 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
 const noteSpan = (n) => {
   const t = wellFormed(String(n ?? "").replace(/\s+/g, " ").trim().slice(0, 200));
   // Plain words, digits and the punctuation of a path or a sentence can do nothing in Markdown: shown as they are.
-  if (/^[A-Za-z0-9 ._,'()/-]*$/.test(t) && !/www\./i.test(t)) return t;
+  if (t === "") return "";
+  if (/^[A-Za-z0-9 .,'()/-]*$/.test(t) && !/www\./i.test(t) && !/\bgh-\d+\b|\b[0-9a-f]{7,40}\b/i.test(t)) return t;
   const run = Math.max(0, ...(t.match(/`+/g) ?? []).map((r) => r.length));
   const fence = "`".repeat(run + 1);
   return `${fence} ${t} ${fence}`;
@@ -395,6 +401,6 @@ export function contextLine(summary) {
   if (summary.tests) bits.push(`${summary.tests} test file${summary.tests === 1 ? "" : "s"}`);
   if (summary.callers) bits.push(`uses of ${summary.callers} changed name${summary.callers === 1 ? "" : "s"}`);
   // A note can carry a path the author chose: unless it is plain, it is shown as code, so no mention, link or reference in it can act.
-  const notes = (summary.notes ?? []).slice(0, 3).map((n) => noteSpan(n)).join("; ");
+  const notes = (summary.notes ?? []).map((n) => noteSpan(n)).filter(Boolean).slice(0, 3).join("; ");
   return `- Context: ${bits.length ? bits.join(", ") : "none found"}${notes ? ` (${notes})` : ""}.`;
 }
