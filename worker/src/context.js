@@ -31,6 +31,9 @@ export const MAX_GUIDE_FILES = 8;
 export const MAX_CONTEXT_FILES = 60;
 export const MAX_CONTEXT_FILE_CHARS = 100_000;
 export const MAX_TESTS = 6;
+// Blobs bigger than this (bytes, from the tree) are not fetched at all: only the first part of a guideline or a test is ever shown.
+export const MAX_GUIDE_BLOB_BYTES = 100_000;
+export const MAX_TEST_BLOB_BYTES = 400_000;
 export const TESTS_PER_FILE = 2;
 export const MAX_CALLER_SYMBOLS = 4;
 export const CALLERS_PER_SYMBOL = 3;
@@ -78,7 +81,8 @@ const BEARER = /\b(Bearer\s{1,5})[A-Za-z0-9._~+/-]{20,2000}=*/gi;
 /** The text with the common forms of a credential blanked out (a safety net, not a guarantee). */
 export function redact(text) {
   let t = String(text ?? "");
-  for (const re of REDACT) t = t.replace(re, "[redacted]");
+  // A blanked block keeps its line breaks, so the line numbers shown after it stay true.
+  for (const re of REDACT) t = t.replace(re, (m) => `[redacted]${"\n".repeat(m.split("\n").length - 1)}`);
   return t
     .replace(ASSIGNED, "$1$2[redacted]$2")
     .replace(ASSIGNED_BARE, "$1[redacted]")
@@ -119,7 +123,7 @@ export function pickGuidelines(entries, changedPaths) {
   const out = [];
   const add = (path, dir) => {
     const e = byPath.get(path);
-    if (e && e.size > 0 && !out.some((x) => x.path === path)) out.push({ path, sha: e.sha, dir });
+    if (e && e.size > 0 && e.size <= MAX_GUIDE_BLOB_BYTES && !out.some((x) => x.path === path)) out.push({ path, sha: e.sha, dir });
   };
   for (const p of ROOT_GUIDES) add(p, "");
   const dirs = new Set();
@@ -219,7 +223,7 @@ function stemOf(path) {
 export function indexTests(entries) {
   const index = new Map();
   for (const e of entries) {
-    if (!isTestPath(e.path) || isSecretPath(e.path)) continue;
+    if (!isTestPath(e.path) || isSecretPath(e.path) || e.size > MAX_TEST_BLOB_BYTES) continue;
     const s = stemOf(e.path);
     if (!s) continue;
     if (!index.has(s)) index.set(s, []);
@@ -327,7 +331,11 @@ export function excerpt(text, near, cap) {
     }
     if (prev < lines.length) out.push(`${" ".repeat(width)}| … lines ${prev + 1}-${lines.length} not shown`);
     const joined = out.join("\n");
-    if (joined.length <= cap || radius === 0) return { text: joined.length <= cap ? joined : `${joined.slice(0, Math.max(0, cap - 40))}\n[cut: over the room for this file]`, whole: false };
+    if (joined.length <= cap) return { text: joined, whole: false };
+    if (radius === 0) {
+      const mark = "\n[cut: over the room for this file]";
+      return { text: cap > mark.length ? `${joined.slice(0, cap - mark.length)}${mark}` : "", whole: false };
+    }
   }
   return { text: "", whole: false };
 }
