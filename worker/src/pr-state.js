@@ -403,11 +403,13 @@ export class PrState {
       since: full ? null : st.lastReviewed,
       requestedBy,
       baseEpoch: st.baseEpoch ?? 0,
+      ...(st.forceNext ? { force: true } : {}),
       createdAt: this.now(),
       firstAt: this.now(),
       claimedBy: null,
     };
     await this.ctx.storage.put(`job:${id}`, job);
+    if (st.forceNext) { delete st.forceNext; await this.ctx.storage.put("state", st); }
     if (queue) await this.outbox({ type: "dispatch", jobId: id });
     return job;
   }
@@ -454,6 +456,9 @@ export class PrState {
         // A review that was already running for the old base must not put its
         // commit back as reviewed when it finishes (complete()).
         st.baseEpoch = (st.baseEpoch ?? 0) + 1;
+        // The head's "reviewed in full" mark (in the ledger) is of the old base: the
+        // next job, whenever it is made (a paused PR waits for resume), skips it.
+        st.forceNext = true;
       }
       if (ev.draft) {
         // Converted to a draft, or a push to one: nothing waits for it.
@@ -471,6 +476,14 @@ export class PrState {
       // a review asked for by hand still runs.
       if (!reviewsBase(this.env, ev.baseRef)) {
         await this.ctx.storage.delete("debounce");
+        // Automatic work already waiting (a held job, a queued author check) was
+        // made for the old base and must not start a runner. Asked-for reviews
+        // and runs already claimed stay.
+        const waiting = [...(await this.ctx.storage.list({ prefix: "job:" }))].filter(([, j]) => !j.requestedBy && !j.claimedBy);
+        await this.deleteAll(waiting.map(([k]) => k));
+        const gone = new Set(waiting.map(([, j]) => j.id));
+        const box = (await this.ctx.storage.get("outbox")) ?? [];
+        await this.ctx.storage.put("outbox", box.filter((x) => x.type !== "author_check" && !(x.type === "dispatch" && gone.has(x.jobId))));
         if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "success", description: `Not reviewed automatically: base branch ${ev.baseRef} is not in the reviewed branches.` });
         return this.save(st, { action: "base_branch_skipped" });
       }
