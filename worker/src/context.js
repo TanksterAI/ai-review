@@ -223,7 +223,8 @@ function stemOf(path) {
 export function indexTests(entries) {
   const index = new Map();
   for (const e of entries) {
-    if (!isTestPath(e.path) || isSecretPath(e.path) || e.size > MAX_TEST_BLOB_BYTES) continue;
+    // A size that is missing (0) means the blob's weight is unknown, so it is not fetched.
+    if (!isTestPath(e.path) || isSecretPath(e.path) || !(e.size > 0 && e.size <= MAX_TEST_BLOB_BYTES)) continue;
     const s = stemOf(e.path);
     if (!s) continue;
     if (!index.has(s)) index.set(s, []);

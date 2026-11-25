@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, excerpt, indexTests, pickGuidelines, redact, testsFor } from "../src/context.js";
+import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, changedSymbols, excerpt, indexTests, pickGuidelines, redact, testsFor } from "../src/context.js";
 import { buildPrompt } from "../src/review.js";
 import { verifierPrompt } from "../src/verify.js";
 
@@ -42,4 +42,12 @@ test("the drafter may name an identifier that is only in the context, and only w
   const withContext = buildPrompt({ ...base, context: { text: "x", guide: "", filesText: "x" } });
   assert.match(withContext.instructions, /identifier that appears only in the context/);
   assert.doesNotMatch(buildPrompt(base).instructions, /appears only in the context/);
+});
+
+test("a test whose size is unknown is not fetched, and a name over the search limit is not searched for", () => {
+  const index = indexTests([{ type: "blob", path: "test/a.test.js", sha: "4".repeat(40) }, blob("test2/a.test.js", 1, "5")].map((e) => ({ ...e, size: Number(e.size) || 0 })));
+  assert.deepEqual(testsFor(index, "src/a.js").map((e) => e.path), ["test2/a.test.js"]);
+  const patch = (n) => `@@ -0,0 +1 @@\n+export function ${"a".repeat(n)}() {}`;
+  assert.deepEqual(changedSymbols(patch(80)), ["a".repeat(80)]);
+  assert.deepEqual(changedSymbols(patch(81)), []);
 });
