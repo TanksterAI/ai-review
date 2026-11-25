@@ -406,3 +406,38 @@ test("webhook: a thread of the App's own resolved by hand reaches the PR's objec
   const theirs = body.replace("tankster-ai-review[bot]", "coderabbitai[bot]");
   assert.equal((await (await handleWebhook(hook(theirs, { event: "pull_request_review_thread" }), e)).json()).status, "ignored");
 });
+
+test("webhook: a merge queue's commit passes at once, with no review and no per-PR state", async () => {
+  const e = env();
+  const sha = "d".repeat(40);
+  const body = JSON.stringify({
+    action: "checks_requested",
+    repository: { full_name: "TanksterAI/browser-relay", name: "browser-relay", owner: { id: 259206056 } },
+    sender: { login: "rishitank", type: "User" },
+    merge_group: { head_sha: sha, base_ref: "refs/heads/main" },
+  });
+  const res = await handleWebhook(hook(body, { event: "merge_group" }), e, { effects: e.fx });
+  assert.equal(res.status, 202);
+  assert.equal(e.PR_STATE.objects.size, 0);
+  const call = e.fx.calls.find((c) => c[0] === "setStatus");
+  assert.deepEqual([call[1], call[2], call[3]], ["TanksterAI/browser-relay", sha, "success"]);
+  assert.match(call[4], /merge queue/i);
+});
+
+test("webhook: a merge queue status that fails once is retried before the delivery is answered", async () => {
+  const e = env();
+  let n = 0;
+  const real = e.fx.setStatus;
+  e.fx.setStatus = async (...a) => { if (++n < 3) throw new Error("GitHub 502"); return real(...a); };
+  const body = JSON.stringify({
+    action: "checks_requested",
+    repository: { full_name: "TanksterAI/browser-relay", name: "browser-relay", owner: { id: 259206056 } },
+    sender: { login: "rishitank", type: "User" },
+    merge_group: { head_sha: "d".repeat(40), base_ref: "refs/heads/main" },
+  });
+  const res = await handleWebhook(hook(body, { event: "merge_group" }), e, { effects: e.fx, sleep: async () => {} });
+  assert.equal(res.status, 202);
+  assert.equal(n, 3);
+  e.fx.setStatus = async () => { throw new Error("down"); };
+  assert.equal((await handleWebhook(hook(body, { event: "merge_group" }), e, { effects: e.fx, sleep: async () => {} })).status, 502);
+});

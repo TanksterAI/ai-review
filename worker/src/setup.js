@@ -49,9 +49,10 @@ export function manifest(origin) {
       // reviewable file of the pull request was covered (the merge gate).
       statuses: "write",
     },
+    // merge_group: the queue's temporary commit passes at once (index.js).
     // pull_request_review_thread: a thread resolved or reopened by hand
     // decides the App's approval (pr-state.js decide).
-    default_events: ["pull_request", "issue_comment", "pull_request_review_comment", "pull_request_review_thread"],
+    default_events: ["pull_request", "issue_comment", "pull_request_review_comment", "pull_request_review_thread", "merge_group"],
   };
 }
 

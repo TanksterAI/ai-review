@@ -48,7 +48,7 @@ test("the manifest asks for exactly what v2 uses, and points back at this Worker
   assert.equal(m.public, false);
   assert.equal(m.hook_attributes.url, `${ORIGIN}/v1/github/webhook`);
   assert.equal(m.redirect_url, `${ORIGIN}/v1/setup/github-app/callback`);
-  assert.deepEqual(m.default_events, ["pull_request", "issue_comment", "pull_request_review_comment", "pull_request_review_thread"]);
+  assert.deepEqual(m.default_events, ["pull_request", "issue_comment", "pull_request_review_comment", "pull_request_review_thread", "merge_group"]);
   // statuses: the "Tankster AI Review" commit status the merge gate reads.
   assert.deepEqual(m.default_permissions, { metadata: "read", contents: "read", pull_requests: "write", issues: "read", actions: "write", statuses: "write" });
   assert.equal(m.default_permissions.workflows, undefined);

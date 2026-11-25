@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  annotatePatch, prepareFiles, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP, codeSpan,
+  annotatePatch, prepareFiles, SKIP, buildPrompt, extractText, parseAnswer, sanitize, classifyFindings, renderReview, MARKER, MAX_FINDINGS, ZWSP, codeSpan,
   findingId, findingsBlock, parseFindingsBlock, MAX_SUGGESTION_LINES, MAX_SUGGESTION_CHARS, MAX_PROMPT_CHARS, MAX_BLOCK_CHARS, MAX_BODY_CHARS, titleLine,
 } from "../src/review.js";
 import { PATCH, responsesResult } from "./helpers.js";
@@ -1036,4 +1036,22 @@ test("renderReview: nitpicks are shown but neither block nor are kept; actionabl
   assert.equal(r2.blocking, 1);
   assert.equal(r2.comments.length, 1, "placed inline, as an issue");
   assert.deepEqual(r.listed.map((x) => x.title ?? x.text.split("\n")[0]), ["Outside"]);
+});
+
+test("the default skip list matches CodeRabbit's, in both directions", () => {
+  const skipped = (p) => SKIP.some((re) => re.test(p));
+  // CodeRabbit skips these, so we do too.
+  for (const p of ["data/fixtures.csv", "src/generated/api.ts", "gen/client.go", "deps.lock", "yarn.lock", "app.3f9a1c7e.js", "static/main.a1b2c3d4e5.css", "logs/run.log", "debug.log"]) {
+    assert.equal(skipped(p), true, `${p} should be skipped`);
+  }
+  // CodeRabbit reviews these, so we do too.
+  for (const p of ["build/index.js", "vendor/lib.js", "coverage/report.js", "out/main.js", "src/vendor.js", "docs/building.md", "src/index.js", "worker/src/review.js", "assets/logo.svg"]) {
+    assert.equal(skipped(p), false, `${p} should be reviewed`);
+  }
+});
+
+test("skip list: hand-written look-alikes are still reviewed", () => {
+  const skipped = (p) => SKIP.some((re) => re.test(p));
+  for (const p of ["a/data.20240101.js", "cmd/gen/main.go", "src/foo.12345678.mjs", "src/report.2024dec01.js"]) assert.equal(skipped(p), false, p);
+  for (const p of ["app.3f9a1c7e.js", "gen/client.go", "src/generated/api.ts", "main.deadbe12.css"]) assert.equal(skipped(p), true, p);
 });
