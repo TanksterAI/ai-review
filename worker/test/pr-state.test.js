@@ -2054,7 +2054,42 @@ test("a push to a paused PR leaves a pending status, so the required check never
 test("a retarget to a reviewed base reviews a PR that was skipped for its old base", async () => {
   const { obj } = makeWith({ BASE_BRANCHES: "main" });
   assert.equal((await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) })).action, "base_branch_skipped");
-  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "main" }) })).action, "debounced");
+  // Reviewed now, not after a quiet period: it is not a push.
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "main" }) })).action, "job");
+});
+
+test("a retarget forgets what was reviewed against the old base, so the head is reviewed in full", async () => {
+  const { obj, storage } = makeWith({});
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40), fullCoverage: true });
+  assert.equal((await storage.get("state")).lastCompleteReviewed, "a".repeat(40));
+  const r = await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "release" }) });
+  assert.equal(r.action, "job");
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, null);
+  assert.equal(st.lastCompleteReviewed, null);
+  assert.equal((await storage.get(`job:${r.jobId}`)).since, null);
+});
+
+test("auto-pause that starts while a push waits gives that push's head a waiting status", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), { ...RUNNER, AUTO_PAUSE_AFTER: "1" }, { now: () => t, effects: fx });
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  const pushed = "e".repeat(40);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", head: { sha: pushed } }) })).action, "debounced");
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40) });
+  assert.equal((await storage.get("state")).paused, true);
+  await advance(obj, (x) => (t = x), t + 10 * 60 * 1000);
+  await drain(obj);
+  const s = fx.calls.filter((c) => c[0] === "setStatus" && c[2] === pushed).at(-1);
+  assert.ok(s, "the pushed head has a status");
+  assert.equal(s[3], "pending");
 });
 
 test("auto-pause counts a job once, even if its completion is repeated", async () => {

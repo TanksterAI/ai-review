@@ -1052,6 +1052,6 @@ test("the default skip list matches CodeRabbit's, in both directions", () => {
 
 test("skip list: hand-written look-alikes are still reviewed", () => {
   const skipped = (p) => SKIP.some((re) => re.test(p));
-  for (const p of ["a/data.20240101.js", "cmd/gen/main.go", "src/foo.12345678.mjs"]) assert.equal(skipped(p), false, p);
+  for (const p of ["a/data.20240101.js", "cmd/gen/main.go", "src/foo.12345678.mjs", "src/report.2024dec01.js"]) assert.equal(skipped(p), false, p);
   for (const p of ["app.3f9a1c7e.js", "gen/client.go", "src/generated/api.ts", "main.deadbe12.css"]) assert.equal(skipped(p), true, p);
 });

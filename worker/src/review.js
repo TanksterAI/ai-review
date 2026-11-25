@@ -34,7 +34,9 @@ export const SKIP = [
   /\.lock$/,
   /\.min\.(js|css|mjs)$/,
   // Bundles with a content hash in the name, such as app.3f9a1c7e.js.
-  /\.(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\.(js|css|mjs)$/,
+  // Hash lengths bundlers use (8, 10, 16, 20, 32), never one that starts like a
+  // year (report.2024dec01.js is a date, not a hash).
+  /\.(?!(?:19|20)\d{2})(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])(?:[0-9a-f]{8}|[0-9a-f]{10}|[0-9a-f]{16}|[0-9a-f]{20}|[0-9a-f]{32})\.(js|css|mjs)$/,
   /\.map$/,
   // build/, vendor/, coverage/ and out/ are reviewed, as CodeRabbit does.
   /(^|\/)(dist|node_modules|\.next)\//,

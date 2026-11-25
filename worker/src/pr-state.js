@@ -302,9 +302,12 @@ export class PrState {
   }
 
   // A push: (re)start the quiet period before the incremental review.
-  async debounce() {
+  async debounce(sha) {
     const now = this.now();
     const d = (await this.ctx.storage.get("debounce")) ?? { first: now };
+    // The newest head in the burst: if reviews pause before it is reviewed, it
+    // still gets a status (fireDebounce).
+    if (sha) d.sha = sha;
     // A burst already past its cap (it waited on a job) starts afresh, so this
     // push still gets its quiet period.
     if (now >= d.first + this.debounceMaxMs) d.first = now;
@@ -334,6 +337,10 @@ export class PrState {
     const key = await this.ctx.storage.get("key");
     if (st.paused || st.closed || st.draft || !key) {
       await this.ctx.storage.delete("debounce");
+      // Paused while this push waited (auto-pause after a review): the required
+      // status must not sit empty on its head. A head already reviewed keeps its
+      // own status (waitingFor).
+      if (st.paused && !st.closed && !st.draft && d.sha) await this.outbox({ type: "status", sha: d.sha, state: "pending", waiting: true });
       return;
     }
     const last = d.last ?? d.first;
@@ -447,6 +454,14 @@ export class PrState {
         }
         return this.save(st, { action: "draft" });
       }
+      // Retargeted (the base changed, the head did not): what was reviewed was
+      // reviewed against the old base. No commit counts as reviewed any more, so
+      // the head is reviewed in full against the new one, now.
+      const retargeted = ev.action === "edited";
+      if (retargeted) {
+        st.lastReviewed = null;
+        st.lastCompleteReviewed = null;
+      }
       // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
       // status passes, saying why, so the required check does not wait forever;
       // a review asked for by hand still runs.
@@ -460,7 +475,7 @@ export class PrState {
         if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "pending", waiting: true });
         return this.save(st, { action: "paused" });
       }
-      const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
+      const opening = retargeted || ["opened", "reopened", "ready_for_review"].includes(ev.action);
       // Forks wait for a writer, with a note and a pending status (the merge
       // gate requires one), whoever opened them: a bot included.
       if (ev.fork) {
@@ -488,7 +503,7 @@ export class PrState {
       // incrementally once the pushes stop.
       if (!opening) {
         await this.ctx.storage.put("state", st);
-        return { action: "debounced", due: await this.debounce() };
+        return { action: "debounced", due: await this.debounce(ev.head?.sha) };
       }
       await this.ctx.storage.delete("debounce");
       const job = await this.newJob(ev, st);
@@ -774,7 +789,7 @@ export class PrState {
         if (st.paused || st.closed) return undefined;
         // A push waits for the quiet period, as a writer's own push does.
         if (!item.opening) {
-          await this.debounce();
+          await this.debounce(item.sha);
           return undefined;
         }
         await this.ctx.storage.delete("debounce");
