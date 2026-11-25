@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, excerpt, indexTests, pickGuidelines, redact, testsFor } from "../src/context.js";
+import { buildPrompt } from "../src/review.js";
 import { verifierPrompt } from "../src/verify.js";
 
 const blob = (path, size = 100, c = "1") => ({ type: "blob", path, sha: String(c).repeat(40).slice(0, 40), size });
@@ -33,4 +34,12 @@ test("the verifier is told a test that only runs the code, or asserts the fault,
   const p = verifierPrompt({ title: "t", body: "b", diff: "d", findings: [], tag: "t1", context: { guide: "G", files: "F" } });
   assert.match(p.system, /a test asserts the opposite of the claim/);
   assert.match(p.system, /only runs the code, or that asserts the faulty result, does not refute a claim/);
+});
+
+test("the drafter may name an identifier that is only in the context, and only when there is context", () => {
+  const prepared = { text: "### src/a.js (modified, +1 -0)\n2 + const b = 2;\n", omitted: [], elsewhere: [] };
+  const base = { repository: "TanksterAI/x", title: "t", body: "b", prepared, tag: "tag1" };
+  const withContext = buildPrompt({ ...base, context: { text: "x", guide: "", filesText: "x" } });
+  assert.match(withContext.instructions, /identifier that appears only in the context/);
+  assert.doesNotMatch(buildPrompt(base).instructions, /appears only in the context/);
 });
