@@ -1195,6 +1195,9 @@ export class PrState {
     const key = await this.ctx.storage.get("key");
     const st = await this.state();
     if (!key || st.closed) return undefined;
+    // The base this decision starts from: a retarget while the calls below are
+    // pending leaves the head the same but the review (of the old base) stale.
+    const epoch0 = st.baseEpoch ?? 0;
     const pr = await fx.pullRequest(key.repo, key.pr);
     const head = pr?.head?.sha;
     if (pr?.state !== "open" || pr.draft || !/^[0-9a-f]{40}$/.test(String(head))) return undefined;
@@ -1279,6 +1282,9 @@ export class PrState {
     // than approve from it.
     const again = () => this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
     if (((await this.ctx.storage.get("reopenSeq")) ?? 0) !== seqAtSnapshot) { await again(); return undefined; }
+    // A retarget since the snapshot: the review is of the old base, so decide
+    // again (it then finds no complete review of this head and says pending).
+    if (((await this.state()).baseEpoch ?? 0) !== epoch0) { await again(); return undefined; }
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
