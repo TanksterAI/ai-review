@@ -49,6 +49,15 @@ export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
   if (!repo || (ownerId && repo.ownerId !== String(ownerId))) return null;
   const sender = { login: String(p.sender?.login ?? ""), bot: p.sender?.type === "Bot" };
 
+  // A merge queue asks for the required checks on its temporary commit. The PR
+  // was reviewed before it joined the queue, so the commit passes at once
+  // (as CodeRabbit's does); there is no PR number and nothing to review.
+  if (event === "merge_group") {
+    const sha = p.merge_group?.head_sha;
+    if (p.action !== "checks_requested" || !/^[0-9a-f]{40}$/.test(String(sha))) return null;
+    return { kind: "merge_group", repo, sender, sha };
+  }
+
   if (event === "pull_request") {
     const pr = p.pull_request;
     if (!pr || !Number.isInteger(pr.number)) return null;
@@ -58,11 +67,14 @@ export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
       sender,
       head: { sha: pr.head?.sha, ref: pr.head?.ref, repo: pr.head?.repo?.full_name ?? null },
       baseSha: pr.base?.sha,
+      baseRef: typeof pr.base?.ref === "string" ? pr.base.ref : null,
       fork: pr.head?.repo?.full_name !== repo.full,
       draft: Boolean(pr.draft),
       author: { login: String(pr.user?.login ?? ""), association: String(pr.author_association ?? "NONE"), bot: pr.user?.type === "Bot" },
     };
     if (p.action === "closed") return { kind: "closed", ...base, merged: Boolean(pr.merged) };
+    // A retarget can turn a PR skipped for its old base into one to review.
+    if (p.action === "edited" && p.changes?.base) return { kind: "review", action: "edited", ...base, before: null };
     if (REVIEW_ACTIONS.has(p.action)) return { kind: "review", action: p.action, ...base, before: p.before ?? null };
     return null;
   }

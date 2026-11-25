@@ -1979,3 +1979,243 @@ test("review fixes 7: a gate reset that setStatus reports as not written stays q
   assert.ok(!left.some((x) => x.type === "status"));
   assert.ok(left.some((x) => x.type === "comment" && x.template === "gave_up" && /not reviewed/.test(x.reason)), JSON.stringify(left));
 });
+
+function makeWith(envOver) {
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), { ...RUNNER, ...envOver }, { now: () => NOW, effects: fx });
+  return { obj, storage, fx };
+}
+
+test("auto-pause: off unless set; once set, the Nth automatic review pauses the PR with a notice", async () => {
+  const sha = (c) => c.repeat(40);
+  // Off by default: five automatic reviews and it is still not paused.
+  const off = makeWith({});
+  for (let i = 0; i < 5; i++) {
+    const j = await off.obj.onEvent({ delivery: `o${i}`, ev: review({ action: "reopened" }) });
+    await drain(off.obj);
+    await off.obj.claim({ jobId: j.jobId, runId: `${i}` });
+    await off.obj.complete({ jobId: j.jobId, runId: `${i}`, reviewedSha: sha("c") });
+  }
+  assert.equal((await off.storage.get("state")).paused, false);
+
+  // AUTO_PAUSE_AFTER=1: the opening review is the first, so it pauses.
+  const on = makeWith({ AUTO_PAUSE_AFTER: "1" });
+  const first = await on.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(on.obj);
+  await on.obj.claim({ jobId: first.jobId, runId: "1" });
+  await on.obj.complete({ jobId: first.jobId, runId: "1", reviewedSha: sha("c") });
+  await drain(on.obj);
+  assert.equal((await on.storage.get("state")).paused, true);
+  const note = on.fx.calls.filter((c) => c[0] === "comment").at(-1)[3];
+  assert.match(note, /paused/i);
+  assert.match(note, /1 reviewed commit/);
+  assert.match(note, /@tankster-ai-review resume/);
+  assert.equal((await on.obj.onEvent({ delivery: "2", ev: review({ action: "synchronize" }) })).action, "paused");
+  // resume starts the count again.
+  await on.obj.onEvent({ delivery: "3", ev: command("@tankster-ai-review resume") });
+  await drain(on.obj);
+  const st = await on.storage.get("state");
+  assert.equal(st.paused, false);
+  assert.equal(st.autoReviewed ?? 0, 0);
+});
+
+test("base branches: a PR into another branch is not reviewed automatically, and says so in its status", async () => {
+  const { obj, fx, storage } = makeWith({ BASE_BRANCHES: "main, release/*" });
+  const skipped = await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) });
+  assert.equal(skipped.action, "base_branch_skipped");
+  await drain(obj);
+  const s = fx.calls.find((c) => c[0] === "setStatus");
+  assert.deepEqual([s[2], s[3]], ["a".repeat(40), "success"]);
+  assert.match(s[4], /feature\/x/);
+  assert.ok(!fx.calls.some((c) => c[0] === "dispatch"));
+  // Listed branches, and patterns, are reviewed.
+  for (const [i, baseRef] of ["main", "release/1.2"].entries()) {
+    const m = makeWith({ BASE_BRANCHES: "main, release/*" });
+    const r = await m.obj.onEvent({ delivery: `${i}`, ev: review({ baseRef }) });
+    assert.equal(r.action, "job", baseRef);
+  }
+  // Not set: every base is reviewed (our status is required org-wide).
+  const all = makeWith({});
+  assert.equal((await all.obj.onEvent({ delivery: "1", ev: review({ baseRef: "anything" }) })).action, "job");
+  assert.ok(storage);
+});
+
+test("a push to a paused PR leaves a pending status, so the required check never sits empty", async () => {
+  const { obj, fx } = make();
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", head: { sha: "e".repeat(40) } }) })).action, "paused");
+  await drain(obj);
+  const s = fx.calls.filter((c) => c[0] === "setStatus").at(-1);
+  assert.deepEqual([s[2], s[3]], ["e".repeat(40), "pending"]);
+});
+
+test("a retarget to a reviewed base reviews a PR that was skipped for its old base", async () => {
+  const { obj } = makeWith({ BASE_BRANCHES: "main" });
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) })).action, "base_branch_skipped");
+  // Reviewed now, not after a quiet period: it is not a push.
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "main" }) })).action, "job");
+});
+
+test("a retarget forgets what was reviewed against the old base, so the head is reviewed in full", async () => {
+  const { obj, storage } = makeWith({});
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40), fullCoverage: true });
+  assert.equal((await storage.get("state")).lastCompleteReviewed, "a".repeat(40));
+  const r = await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "release" }) });
+  assert.equal(r.action, "job");
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, null);
+  assert.equal(st.lastCompleteReviewed, null);
+  assert.equal((await storage.get(`job:${r.jobId}`)).since, null);
+});
+
+test("auto-pause that starts while a push waits gives that push's head a waiting status", async () => {
+  let t = NOW;
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), { ...RUNNER, AUTO_PAUSE_AFTER: "1" }, { now: () => t, effects: fx });
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  const pushed = "e".repeat(40);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", head: { sha: pushed } }) })).action, "debounced");
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40) });
+  assert.equal((await storage.get("state")).paused, true);
+  await advance(obj, (x) => (t = x), t + 10 * 60 * 1000);
+  await drain(obj);
+  const s = fx.calls.filter((c) => c[0] === "setStatus" && c[2] === pushed).at(-1);
+  assert.ok(s, "the pushed head has a status");
+  assert.equal(s[3], "pending");
+});
+
+test("auto-pause counts a job once, even if its completion is repeated", async () => {
+  const { obj, storage } = makeWith({ AUTO_PAUSE_AFTER: "2" });
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  const st = await storage.get("state");
+  assert.equal(st.autoReviewed, 1);
+  assert.equal(st.paused, false);
+});
+
+test("base branches: a paused PR into an excluded base still gets the explaining status", async () => {
+  const { obj, fx } = makeWith({ BASE_BRANCHES: "main" });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", baseRef: "dev" }) })).action, "base_branch_skipped");
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "setStatus").at(-1)[3], "success");
+});
+
+test("a retarget of a draft forgets what was reviewed against the old base", async () => {
+  const { obj, storage } = makeWith({});
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40), fullCoverage: true });
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "release", draft: true }) })).action, "draft");
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, null);
+  assert.equal(st.lastCompleteReviewed, null);
+});
+
+test("a review that was running for the old base does not mark its commit reviewed for the new one", async () => {
+  const { obj, storage } = makeWith({});
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  const r = await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "release" }) });
+  assert.equal(r.action, "job");
+  // The old job finishes after the retarget.
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40), fullCoverage: true });
+  const st = await storage.get("state");
+  assert.equal(st.lastReviewed, null);
+  assert.equal(st.lastCompleteReviewed, null);
+});
+
+test("retargeted while paused, resume reviews the head in full", async () => {
+  const { obj, fx, storage } = make();
+  withPr(fx, "a".repeat(40));
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "a".repeat(40), fullCoverage: true });
+  await obj.onEvent({ delivery: "2", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  assert.equal((await obj.onEvent({ delivery: "3", ev: review({ action: "edited", baseRef: "release" }) })).action, "paused");
+  const before = fx.calls.filter((c) => c[0] === "dispatch").length;
+  await obj.onEvent({ delivery: "4", ev: command("@tankster-ai-review resume") });
+  await drain(obj);
+  const dispatched = fx.calls.filter((c) => c[0] === "dispatch").map((c) => c[1]);
+  assert.equal(dispatched.length, before + 1);
+  const job = await storage.get(`job:${dispatched.at(-1)}`);
+  assert.equal(job.since, null);
+});
+
+test("a push by a checked author to a paused PR leaves a waiting status", async () => {
+  const { obj, fx } = make({ writers: ["rishitank", "privatemember"] });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  const sha = "f".repeat(40);
+  // Not paused-by-state at the event, so the author check is queued first; the
+  // pause lands while it waits.
+  await obj.ctx.storage.put("state", { ...(await obj.state()), paused: false });
+  const r = await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", head: { sha }, author: { login: "privatemember", association: "CONTRIBUTOR", bot: false } }) });
+  assert.equal(r.action, "author_check");
+  await obj.ctx.storage.put("state", { ...(await obj.state()), paused: true });
+  await drain(obj);
+  const s = fx.calls.filter((c) => c[0] === "setStatus" && c[2] === sha).at(-1);
+  assert.ok(s, "the head has a status");
+  assert.equal(s[3], "pending");
+});
+
+test("a retarget to an excluded base drops automatic work already waiting", async () => {
+  const { obj } = makeWith({ BASE_BRANCHES: "main" });
+  const auto = await obj.onEvent({ delivery: "1", ev: review({ action: "opened" }) });
+  await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "scratch" }) });
+  assert.equal(await obj.ctx.storage.get(`job:${auto.jobId}`), undefined, "the automatic job is gone");
+  assert.equal(((await obj.ctx.storage.get("outbox")) ?? []).some((x) => x.type === "dispatch" && x.jobId === auto.jobId), false);
+});
+
+test("auto-pause: a retried completion counts its job once and says why reviews paused, once", async () => {
+  const m = makeWith({ AUTO_PAUSE_AFTER: "2" });
+  const a = await m.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(m.obj);
+  await m.obj.claim({ jobId: a.jobId, runId: "1" });
+  const ack = m.obj.queueAck.bind(m.obj);
+  let fail = true;
+  m.obj.queueAck = async (...x) => { if (fail) { fail = false; throw new Error("boom"); } return ack(...x); };
+  await assert.rejects(m.obj.complete({ jobId: a.jobId, runId: "1", reviewedSha: "c".repeat(40) }));
+  await m.obj.complete({ jobId: a.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  assert.equal((await m.storage.get("state")).autoReviewed, 1, "one job, one count");
+  assert.equal((await m.storage.get("state")).paused, false, "one review is not the limit of two");
+
+  // At the limit: the failure comes after the pause is stored; the retry still
+  // leaves one notice and one count.
+  const n = makeWith({ AUTO_PAUSE_AFTER: "1" });
+  const j = await n.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(n.obj);
+  await n.obj.claim({ jobId: j.jobId, runId: "1" });
+  const ack2 = n.obj.queueAck.bind(n.obj);
+  let fail2 = true;
+  n.obj.queueAck = async (...x) => { if (fail2) { fail2 = false; throw new Error("boom"); } return ack2(...x); };
+  await assert.rejects(n.obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) }));
+  await n.obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  await drain(n.obj);
+  assert.equal((await n.storage.get("state")).autoReviewed, 1);
+  assert.equal(n.fx.calls.filter((c) => c[0] === "comment" && /paused/i.test(c[3])).length, 1, "the notice, once");
+});
+
+test("a base pattern with many stars is matched without runaway backtracking", async () => {
+  const { obj } = makeWith({ BASE_BRANCHES: "*a*a*a*a*a*a*a*a*b" });
+  const t = Date.now();
+  const r = await obj.onEvent({ delivery: "1", ev: review({ baseRef: "a".repeat(250) }) });
+  assert.equal(r.action, "base_branch_skipped");
+  assert.ok(Date.now() - t < 1000);
+});

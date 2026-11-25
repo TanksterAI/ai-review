@@ -712,3 +712,23 @@ test("a retry after a reopen during the final head check keeps its kind: a nitpi
   await decide(m);
   assert.equal(approvals(m.calls).length, 1, "an ordinary replacement approves: only a nitpick is open");
 });
+
+test("a retarget during the decision is decided again, not approved from the old base's review", async () => {
+  const m = await make({ threads: [thread("t1", true)] });
+  const pr = m.fx.pullRequest;
+  let n = 0;
+  m.fx.pullRequest = async (...a) => {
+    // The final head check: the base changes while it is pending. The head is the same.
+    if (++n === 2) await m.obj.onEvent({ delivery: "e1", ev: { kind: "review", action: "edited", repo, pr: 39, sender: { login: "rishitank", bot: false }, head: { sha: HEAD }, baseRef: "release", draft: false, fork: false, author: { login: "rishitank", association: "OWNER", bot: false } } });
+    return pr(...a);
+  };
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0, "the review was of the old base");
+});
+
+test("an approval on an unchanged base still proceeds", async () => {
+  const m = await make({ threads: [thread("t1", true)] });
+  await m.obj.ctx.storage.put("state", { lastReviewed: HEAD, lastCompleteReviewed: HEAD, paused: false, closed: false, baseEpoch: 2 });
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 1);
+});

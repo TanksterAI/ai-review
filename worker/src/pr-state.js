@@ -185,6 +185,34 @@ export function needsApproval(slug = DEFAULT_SLUG) {
 // GitHub keeps 140 characters of a description.
 const ACTIONS_BOT = /^github-actions(\[bot\])?$/i;
 
+// Settings (Worker variables; per-repository configuration comes later).
+// BASE_BRANCHES: comma-separated names or patterns ("main, release/*"). Empty
+// means every base branch is reviewed, which the org's required status needs.
+// A glob (only * is special) matched without a regular expression: the usual
+// two-pointer walk that remembers the last star, never exponential.
+function globMatch(pat, text) {
+  let p = 0, t = 0, star = -1, mark = 0;
+  while (t < text.length) {
+    if (p < pat.length && pat[p] === "*") { star = p++; mark = t; }
+    else if (p < pat.length && pat[p] === text[t]) { p++; t++; }
+    else if (star >= 0) { p = star + 1; t = ++mark; }
+    else return false;
+  }
+  while (p < pat.length && pat[p] === "*") p++;
+  return p === pat.length;
+}
+export function reviewsBase(env, baseRef) {
+  const list = String(env?.BASE_BRANCHES ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (!list.length || !baseRef) return true;
+  return list.some((pat) => globMatch(pat, String(baseRef)));
+}
+// AUTO_PAUSE_AFTER: pause automatic reviews after this many reviewed commits
+// (CodeRabbit's default is 5; ours is 0, never, because our status is required).
+export function autoPauseAfter(env) {
+  const n = Number.parseInt(String(env?.AUTO_PAUSE_AFTER ?? ""), 10);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
 export function waitingStatus(slug = DEFAULT_SLUG) {
   return `Waiting: someone with write access must comment @${slug} review`;
 }
@@ -287,9 +315,12 @@ export class PrState {
   }
 
   // A push: (re)start the quiet period before the incremental review.
-  async debounce() {
+  async debounce(sha) {
     const now = this.now();
     const d = (await this.ctx.storage.get("debounce")) ?? { first: now };
+    // The newest head in the burst: if reviews pause before it is reviewed, it
+    // still gets a status (fireDebounce).
+    if (sha) d.sha = sha;
     // A burst already past its cap (it waited on a job) starts afresh, so this
     // push still gets its quiet period.
     if (now >= d.first + this.debounceMaxMs) d.first = now;
@@ -319,6 +350,10 @@ export class PrState {
     const key = await this.ctx.storage.get("key");
     if (st.paused || st.closed || st.draft || !key) {
       await this.ctx.storage.delete("debounce");
+      // Paused while this push waited (auto-pause after a review): the required
+      // status must not sit empty on its head. A head already reviewed keeps its
+      // own status (waitingFor).
+      if (st.paused && !st.closed && !st.draft && d.sha) await this.outbox({ type: "status", sha: d.sha, state: "pending", waiting: true });
       return;
     }
     const last = d.last ?? d.first;
@@ -380,6 +415,7 @@ export class PrState {
       full,
       since: full ? null : st.lastReviewed,
       requestedBy,
+      baseEpoch: st.baseEpoch ?? 0,
       createdAt: this.now(),
       firstAt: this.now(),
       claimedBy: null,
@@ -421,6 +457,17 @@ export class PrState {
     if (ev.kind === "review") {
       st.closed = false;
       st.draft = Boolean(ev.draft);
+      // Retargeted (the base changed, the head did not): what was reviewed was
+      // reviewed against the old base. No commit counts as reviewed any more, so
+      // the head is reviewed in full against the new one, now.
+      const retargeted = ev.action === "edited";
+      if (retargeted) {
+        st.lastReviewed = null;
+        st.lastCompleteReviewed = null;
+        // A review that was already running for the old base must not put its
+        // commit back as reviewed when it finishes (complete()).
+        st.baseEpoch = (st.baseEpoch ?? 0) + 1;
+      }
       if (ev.draft) {
         // Converted to a draft, or a push to one: nothing waits for it.
         await this.ctx.storage.delete("debounce");
@@ -432,8 +479,28 @@ export class PrState {
         }
         return this.save(st, { action: "draft" });
       }
-      if (st.paused) return this.save(st, { action: "paused" });
-      const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
+      // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
+      // status passes, saying why, so the required check does not wait forever;
+      // a review asked for by hand still runs.
+      if (!reviewsBase(this.env, ev.baseRef)) {
+        await this.ctx.storage.delete("debounce");
+        // Automatic work already waiting (a held job, a queued author check) was
+        // made for the old base and must not start a runner. Asked-for reviews
+        // and runs already claimed stay.
+        const waiting = [...(await this.ctx.storage.list({ prefix: "job:" }))].filter(([, j]) => !j.requestedBy && !j.claimedBy);
+        await this.deleteAll(waiting.map(([k]) => k));
+        const gone = new Set(waiting.map(([, j]) => j.id));
+        const box = (await this.ctx.storage.get("outbox")) ?? [];
+        await this.ctx.storage.put("outbox", box.filter((x) => x.type !== "author_check" && !(x.type === "dispatch" && gone.has(x.jobId))));
+        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "success", description: `Not reviewed automatically: base branch ${ev.baseRef} is not in the reviewed branches.` });
+        return this.save(st, { action: "base_branch_skipped" });
+      }
+      if (st.paused) {
+        // The required status must not sit empty on a head nobody reviews.
+        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "pending", waiting: true });
+        return this.save(st, { action: "paused" });
+      }
+      const opening = retargeted || ["opened", "reopened", "ready_for_review"].includes(ev.action);
       // Forks wait for a writer, with a note and a pending status (the merge
       // gate requires one), whoever opened them: a bot included.
       if (ev.fork) {
@@ -461,7 +528,7 @@ export class PrState {
       // incrementally once the pushes stop.
       if (!opening) {
         await this.ctx.storage.put("state", st);
-        return { action: "debounced", due: await this.debounce() };
+        return { action: "debounced", due: await this.debounce(ev.head?.sha) };
       }
       await this.ctx.storage.delete("debounce");
       const job = await this.newJob(ev, st);
@@ -729,6 +796,8 @@ export class PrState {
       // Re-checked here: several may have been queued before the first posted.
       if (item.replyTo && !(await this.mayReply(item.replyTo.login, item.replyTo.kind))) return undefined;
       const text = item.template === "needs_approval" ? needsApproval(slug)
+        : item.template === "auto_paused"
+          ? `Automatic reviews are paused after ${item.limit} reviewed commit${item.limit === 1 ? "" : "s"}. Comment \`@${slug} resume\` to start them again and review what was pushed meanwhile, or \`@${slug} review\` to review the latest commit once.`
         : item.template === "gave_up"
           ? (item.waited
             ? `The AI review of this pull request waited three days for a model provider (${item.reason}), so it has stopped trying. Comment \`@${slug} review\` to try again.`
@@ -742,10 +811,15 @@ export class PrState {
     if (item.type === "author_check") {
       const st = await this.state();
       if (await fx.canWrite(item.repo.full, item.login)) {
-        if (st.paused || st.closed) return undefined;
+        if (st.closed) return undefined;
+        if (st.paused) {
+          // The required status must not sit empty on a head nobody reviews.
+          if (item.sha) await this.outbox({ type: "status", sha: item.sha, state: "pending", waiting: true });
+          return undefined;
+        }
         // A push waits for the quiet period, as a writer's own push does.
         if (!item.opening) {
-          await this.debounce();
+          await this.debounce(item.sha);
           return undefined;
         }
         await this.ctx.storage.delete("debounce");
@@ -771,6 +845,10 @@ export class PrState {
 
     if (item.type === "status") {
       if (!key || !item.sha) return undefined;
+      if (item.state && item.description) {
+        if ((await fx.setStatus(key.repo, item.sha, item.state, item.description)) === false) throw new Error("the commit status could not be written");
+        return undefined;
+      }
       if (item.waiting) {
         const written = await this.waitingFor(fx, key.repo, item.sha, slug);
         // A gate reset that did not land is retried (the item is kept), not lost.
@@ -801,6 +879,7 @@ export class PrState {
       }
       if (item.cmd === "resume") {
         st.paused = false;
+        st.autoReviewed = 0;
         await this.ctx.storage.put("state", st);
         // As CodeRabbit's: the commits pushed while paused are reviewed now.
         // Not a draft's, nor a closed PR's: those wait to be ready or reopened.
@@ -1137,6 +1216,9 @@ export class PrState {
     const key = await this.ctx.storage.get("key");
     const st = await this.state();
     if (!key || st.closed) return undefined;
+    // The base this decision starts from: a retarget while the calls below are
+    // pending leaves the head the same but the review (of the old base) stale.
+    const epoch0 = st.baseEpoch ?? 0;
     const pr = await fx.pullRequest(key.repo, key.pr);
     const head = pr?.head?.sha;
     if (pr?.state !== "open" || pr.draft || !/^[0-9a-f]{40}$/.test(String(head))) return undefined;
@@ -1221,6 +1303,9 @@ export class PrState {
     // than approve from it.
     const again = () => this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
     if (((await this.ctx.storage.get("reopenSeq")) ?? 0) !== seqAtSnapshot) { await again(); return undefined; }
+    // A retarget since the snapshot: the review is of the old base, so decide
+    // again (it then finds no complete review of this head and says pending).
+    if (((await this.state()).baseEpoch ?? 0) !== epoch0) { await again(); return undefined; }
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
@@ -1403,17 +1488,40 @@ export class PrState {
     // finishes after it never moves lastReviewed back. If two runs read the
     // head in the other order, a few commits are reviewed again: harmless.
     const at = job.claimedAt ?? 0;
-    if (/^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
+    // A job made before the base branch changed reviewed the old base: its
+    // commit is not a reviewed one for the new base.
+    const sameBase = (job.baseEpoch ?? 0) === (st.baseEpoch ?? 0);
+    if (sameBase && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
       st.lastReviewed = reviewedSha;
       st.lastClaimedAt = at;
     }
-    if (fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
+    if (sameBase && fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
       st.lastCompleteReviewed = reviewedSha;
       st.lastCompleteClaimedAt = at;
     }
+    // CodeRabbit's auto-pause: after N reviewed commits, reviews wait for a
+    // `resume`. Reviews asked for by hand do not count.
+    const limit = autoPauseAfter(this.env);
+    let pauseNote = job.pauseNote ?? null;
+    // Counted once per job, and only for the base it was made for: a retry of
+    // this call (the job stays until the end) finds the mark and does not count
+    // again. The state and the mark go in one write.
+    const counts = Boolean(limit) && !job.requestedBy && sameBase && !job.counted;
+    if (counts) {
+      st.autoReviewed = (st.autoReviewed ?? 0) + 1;
+      if (st.autoReviewed >= limit && !st.paused) {
+        st.paused = true;
+        pauseNote = limit;
+      }
+    }
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
-    await this.ctx.storage.put("state", st);
+    await this.ctx.storage.put({ state: st, [`job:${jobId}`]: { ...job, counted: job.counted || counts, ...(pauseNote ? { pauseNote } : {}) } });
+    // A retry after a failure past this point still says why reviews paused,
+    // and says it once.
+    if (pauseNote && !((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.type === "comment" && x.template === "auto_paused")) {
+      await this.outbox({ type: "comment", template: "auto_paused", limit: pauseNote });
+    }
     // The edit is queued before the job goes: a retry after a failure in
     // between finds the job and queues nothing twice (queueAck).
     await this.queueAck(job.ackId, actionPerformed("Review finished."));
