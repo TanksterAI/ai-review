@@ -228,7 +228,7 @@ export function buildPrompt({ repository, title, body, prepared, tag, pass = nul
     "Quote a line distinctive enough to find in the file. When the cited line is generic (a lone brace, \"return null;\", \"} else {\"),",
     "add a neighbouring line that is not.",
     "Give \"claim\": one sentence saying what is wrong, and \"symbols\": the identifiers (functions, variables, fields) the finding depends on,",
-    "spelled exactly as in the code. Name nothing the diff, the title or the description does not contain.",
+    "spelled exactly as in the code. Name nothing the diff, the title or the description does not contain (when context is given, it counts too).",
     "An independent reviewer checks every finding against the code shown, and drops any it cannot confirm.",
     'Example finding: {"path": "src/a.js", "line": 3, "severity": "major", "type": "issue", "category": "bug", "title": "Division by zero",',
     '  "evidence": "const y = x / 0;", "claim": "y divides x by the constant 0, so it is always Infinity or NaN.", "symbols": ["x", "y"],',
