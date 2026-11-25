@@ -34,13 +34,14 @@ export const SKIP = [
   /\.lock$/,
   /\.min\.(js|css|mjs)$/,
   // Bundles with a content hash in the name, such as app.3f9a1c7e.js.
-  /\.[0-9a-f]{8,}\.(js|css|mjs)$/,
+  /\.(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\.(js|css|mjs)$/,
   /\.map$/,
   // build/, vendor/, coverage/ and out/ are reviewed, as CodeRabbit does.
   /(^|\/)(dist|node_modules|\.next)\//,
   // Generated folders, small tables and logs. SVG is still reviewed, unlike
   // CodeRabbit: an SVG can carry script.
-  /(^|\/)(gen|generated)\//,
+  /^gen\//,
+  /(^|\/)generated\//,
   /\.(csv|log)$/i,
   /(^|\/)__snapshots__\//,
   /\.snap$/,

@@ -317,6 +317,7 @@ No model text reaches a review unless it has passed a deterministic grounding ch
 | `ESCALATE_CHAIN` | `anthropic:claude-sonnet-5-5` | The second verifier critical and major findings need |
 | `VERIFY_FALLBACK` | `gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash` | Used only when no `VERIFY_CHAIN` provider can run |
 | `REVIEW_PROFILE` | `chill` | `chill`, `assertive` or `quiet` (above) |
+| *(merge queue)* | — | Subscribe the App to the `merge_group` event (App settings, Subscribe to events; new Apps made by the setup flow already are). Its queue commit then passes at once, as the PR was reviewed before it joined. |
 | `BASE_BRANCHES` | empty (every base branch) | Comma-separated names or `*` patterns (`main, release/*`). A PR into any other branch is not reviewed automatically: its status passes, saying so; `@… review` still works. Leave it empty where the status is required |
 | `AUTO_PAUSE_AFTER` | `0` (never) | CodeRabbit's auto-pause: after this many automatically reviewed commits, reviews pause with a notice until `@… resume` (CodeRabbit's default is 5). Reviews asked for by hand do not count. Leave it at 0 where the status is required, or a paused PR's new commits wait for someone to resume |
 | `VERIFY_BUDGET_MS` | `150000` | Verification's time limit, in milliseconds from the review's start |

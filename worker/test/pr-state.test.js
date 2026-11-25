@@ -2040,3 +2040,19 @@ test("base branches: a PR into another branch is not reviewed automatically, and
   assert.equal((await all.obj.onEvent({ delivery: "1", ev: review({ baseRef: "anything" }) })).action, "job");
   assert.ok(storage);
 });
+
+test("a push to a paused PR leaves a pending status, so the required check never sits empty", async () => {
+  const { obj, fx } = make();
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", head: { sha: "e".repeat(40) } }) })).action, "paused");
+  await drain(obj);
+  const s = fx.calls.filter((c) => c[0] === "setStatus").at(-1);
+  assert.deepEqual([s[2], s[3]], ["e".repeat(40), "pending"]);
+});
+
+test("a retarget to a reviewed base reviews a PR that was skipped for its old base", async () => {
+  const { obj } = makeWith({ BASE_BRANCHES: "main" });
+  assert.equal((await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) })).action, "base_branch_skipped");
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "main" }) })).action, "debounced");
+});

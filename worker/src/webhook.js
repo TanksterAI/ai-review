@@ -73,6 +73,8 @@ export function normalise(event, p, { ownerId, slug = DEFAULT_SLUG } = {}) {
       author: { login: String(pr.user?.login ?? ""), association: String(pr.author_association ?? "NONE"), bot: pr.user?.type === "Bot" },
     };
     if (p.action === "closed") return { kind: "closed", ...base, merged: Boolean(pr.merged) };
+    // A retarget can turn a PR skipped for its old base into one to review.
+    if (p.action === "edited" && p.changes?.base) return { kind: "review", action: "edited", ...base, before: null };
     if (REVIEW_ACTIONS.has(p.action)) return { kind: "review", action: p.action, ...base, before: p.before ?? null };
     return null;
   }

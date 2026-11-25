@@ -447,7 +447,11 @@ export class PrState {
         }
         return this.save(st, { action: "draft" });
       }
-      if (st.paused) return this.save(st, { action: "paused" });
+      if (st.paused) {
+        // The required status must not sit empty on a head nobody reviews.
+        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "pending", waiting: true });
+        return this.save(st, { action: "paused" });
+      }
       // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
       // status passes, saying why, so the required check does not wait forever;
       // a review asked for by hand still runs.

@@ -148,3 +148,11 @@ test("normalise: a merge queue's checks_requested names the repository and the q
   assert.equal(normalise("merge_group", { ...p, merge_group: { head_sha: "nothex" } }, { ownerId: OWNER_ID }), null);
   assert.equal(normalise("merge_group", { ...p, repository: { ...repository, owner: { id: 1 } } }, { ownerId: OWNER_ID }), null);
 });
+
+test("normalise: retargeting a PR (edited, base changed) is a push to review; other edits are not", () => {
+  const p = prPayload({ action: "edited" });
+  assert.equal(normalise("pull_request", p, { ownerId: OWNER_ID }), null);
+  const ev = normalise("pull_request", { ...p, changes: { base: { ref: { from: "feature/x" } } } }, { ownerId: OWNER_ID });
+  assert.equal(ev.kind, "review");
+  assert.equal(ev.action, "edited");
+});

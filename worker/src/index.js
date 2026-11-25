@@ -329,7 +329,16 @@ export async function handleWebhook(request, env, deps = {}) {
   if (!ev) return json(202, { status: "ignored" });
   if (ev.kind === "merge_group") {
     const fx = deps.effects ?? createEffects(env, { config: app });
-    const ok = await fx.setStatus(ev.repo.full, ev.sha, "success", "Reviewed before it joined the merge queue.");
+    // GitHub admits a PR to the queue only after the required checks passed on
+    // its head, so the queue's commit needs no review of its own. A failure is
+    // answered 502 and logged: GitHub shows it on the delivery for redelivery.
+    let ok;
+    try {
+      ok = await fx.setStatus(ev.repo.full, ev.sha, "success", "Reviewed before it joined the merge queue.");
+    } catch (e) {
+      log({ ev: "merge_group_failed", repository: ev.repo.full, error: String(e?.message ?? e).slice(0, 200) });
+      return json(502, { status: "failed", reason: "the status could not be written" });
+    }
     log({ ev: "webhook", event, kind: ev.kind, repository: ev.repo.full, passed: ok !== false });
     return json(202, { status: "accepted", action: ok === false ? "no-permission" : "passed" });
   }
