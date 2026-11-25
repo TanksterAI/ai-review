@@ -20,7 +20,7 @@ test("excerpt never returns a cut marker that does not fit, and the batch stays 
   assert.equal(excerpt("x", [1], 0).text, "");
   const data = { files: new Map([["src/a.js", "const a = 1;\nconst b = 2;\nconst c = 3;"]]), tests: new Map(), callers: new Map() };
   const prepared = { included: ["src/a.js"], shown: new Map([["src/a.js", new Set([2])]]) };
-  for (const cap of [1, 50, 200]) assert.ok(batchContext(data, prepared, cap).text.length <= cap + 4, `batch cap ${cap}`);
+  for (const cap of [1, 50, 200]) assert.ok(batchContext(data, prepared, cap).text.length <= cap, `batch cap ${cap}`);
 });
 
 test("guidelines and tests too big to be worth fetching are not picked", () => {

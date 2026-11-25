@@ -32,7 +32,7 @@ export const MAX_CONTEXT_FILES = 60;
 export const MAX_CONTEXT_FILE_CHARS = 100_000;
 export const MAX_TESTS = 6;
 // Blobs bigger than this (bytes, from the tree) are not fetched at all: only the first part of a guideline or a test is ever shown.
-export const MAX_GUIDE_BLOB_BYTES = 100_000;
+export const MAX_GUIDE_BLOB_BYTES = 400_000;
 export const MAX_TEST_BLOB_BYTES = 400_000;
 export const TESTS_PER_FILE = 2;
 export const MAX_CALLER_SYMBOLS = 4;
