@@ -402,6 +402,7 @@ export class PrState {
       full,
       since: full ? null : st.lastReviewed,
       requestedBy,
+      baseEpoch: st.baseEpoch ?? 0,
       createdAt: this.now(),
       firstAt: this.now(),
       claimedBy: null,
@@ -443,6 +444,17 @@ export class PrState {
     if (ev.kind === "review") {
       st.closed = false;
       st.draft = Boolean(ev.draft);
+      // Retargeted (the base changed, the head did not): what was reviewed was
+      // reviewed against the old base. No commit counts as reviewed any more, so
+      // the head is reviewed in full against the new one, now.
+      const retargeted = ev.action === "edited";
+      if (retargeted) {
+        st.lastReviewed = null;
+        st.lastCompleteReviewed = null;
+        // A review that was already running for the old base must not put its
+        // commit back as reviewed when it finishes (complete()).
+        st.baseEpoch = (st.baseEpoch ?? 0) + 1;
+      }
       if (ev.draft) {
         // Converted to a draft, or a push to one: nothing waits for it.
         await this.ctx.storage.delete("debounce");
@@ -453,14 +465,6 @@ export class PrState {
           await this.outbox({ type: "comment", body: "Review skipped: this pull request is a draft. It is reviewed once it is marked ready for review." });
         }
         return this.save(st, { action: "draft" });
-      }
-      // Retargeted (the base changed, the head did not): what was reviewed was
-      // reviewed against the old base. No commit counts as reviewed any more, so
-      // the head is reviewed in full against the new one, now.
-      const retargeted = ev.action === "edited";
-      if (retargeted) {
-        st.lastReviewed = null;
-        st.lastCompleteReviewed = null;
       }
       // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
       // status passes, saying why, so the required check does not wait forever;
@@ -786,7 +790,12 @@ export class PrState {
     if (item.type === "author_check") {
       const st = await this.state();
       if (await fx.canWrite(item.repo.full, item.login)) {
-        if (st.paused || st.closed) return undefined;
+        if (st.closed) return undefined;
+        if (st.paused) {
+          // The required status must not sit empty on a head nobody reviews.
+          if (item.sha) await this.outbox({ type: "status", sha: item.sha, state: "pending", waiting: true });
+          return undefined;
+        }
         // A push waits for the quiet period, as a writer's own push does.
         if (!item.opening) {
           await this.debounce(item.sha);
@@ -1452,11 +1461,14 @@ export class PrState {
     // finishes after it never moves lastReviewed back. If two runs read the
     // head in the other order, a few commits are reviewed again: harmless.
     const at = job.claimedAt ?? 0;
-    if (/^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
+    // A job made before the base branch changed reviewed the old base: its
+    // commit is not a reviewed one for the new base.
+    const sameBase = (job.baseEpoch ?? 0) === (st.baseEpoch ?? 0);
+    if (sameBase && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastClaimedAt ?? 0)) {
       st.lastReviewed = reviewedSha;
       st.lastClaimedAt = at;
     }
-    if (fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
+    if (sameBase && fullCoverage && /^[0-9a-f]{40}$/.test(String(reviewedSha)) && at >= (st.lastCompleteClaimedAt ?? 0)) {
       st.lastCompleteReviewed = reviewedSha;
       st.lastCompleteClaimedAt = at;
     }
