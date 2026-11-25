@@ -95,11 +95,11 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
     return token;
   }
 
-  async function call(method, path, { token, body } = {}) {
+  async function call(method, path, { token, body, accept } = {}) {
     const res = await fetcher(`${API}${path}`, {
       method,
       headers: {
-        accept: "application/vnd.github+json",
+        accept: accept ?? "application/vnd.github+json",
         "x-github-api-version": "2022-11-28",
         "user-agent": UA,
         authorization: `Bearer ${token}`,

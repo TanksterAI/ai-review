@@ -224,6 +224,9 @@ export function groundFindings(classified, prepared, { title = "", body = "" } =
   const knownWords = () => {
     if (!known) {
       known = addWords(prepared.text, new Set());
+      // A name the finding takes from the changed file's other lines, a test
+      // or a caller (context.js) is not invented.
+      addWords(prepared.context?.text, known);
       addWords(title, known);
       addWords(body, known);
     }
