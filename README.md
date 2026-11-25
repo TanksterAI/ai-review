@@ -257,6 +257,7 @@ Deploy only what is on `main`.
   - Add the Durable Object bindings `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}` and `{type: "durable_object_namespace", name: "APP_SECRETS", class_name: "AppSecrets"}`.
   - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
   - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState", "AppSecrets"]}`.
+
 ## Verified findings
 
 No model text reaches a review unless it has passed a deterministic grounding check and an independent model's attempt to refute it (TAN-299). That covers the comments, their suggestions and agent prompts, the body, and the findings record. Each finding passes four layers, in order:
