@@ -92,7 +92,8 @@ export function verifierPrompt({ title, body, diff, findings, tag, context = nul
     ...(context?.guide || context?.files
       ? [
         "PROJECT GUIDELINES and FILE CONTEXT are the rest of the changed files, their tests and their callers, and the project's own rules. Check every claim against them too:",
-        "a claim the context contradicts (the check exists elsewhere in the file, the caller already handles it, a test covers it, the project's rules allow it) is refuted.",
+        "a claim the context contradicts (the check exists elsewhere in the file, the caller already handles it, a test asserts the opposite of the claim, the project's rules allow it) is refuted.",
+        "A test that only runs the code, or that asserts the faulty result, does not refute a claim.",
         "A claim is confirmed only by code you can see, and the context never makes an unseen claim true.",
       ]
       : []),
