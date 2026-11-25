@@ -341,7 +341,7 @@ A model shown only a diff cannot tell a missing check from one that sits a few l
 - **Related tests:** the test files that belong to a changed file, found by name.
 - **Callers:** where a changed exported name is used elsewhere (GitHub code search of the default branch).
 
-The verifier sees the same context as the drafter, so a finding that the surrounding code answers is dropped rather than posted. Everything is fenced as data (the model is told never to follow it), files that are secrets by name (`.env`, keys, credentials) are never read, and anything shaped like a credential is blanked before it is sent.
+The verifier sees the same context as the drafter, so a finding that the surrounding code answers is dropped rather than posted. Everything is fenced as data (the model is told never to follow it). Files that are secrets by name (`.env*`, `.dev.vars`, keys and certificates, `credentials`, Terraform state and variables, service-account files, anything under a `secrets/` folder) are never read, and the common forms of a credential (private keys, cloud and API tokens, `password = "…"` style assignments with any prefix, URL passwords, bearer tokens) are blanked before it is sent. That blanking is a safety net, not a guarantee: keep secrets out of the repository.
 
 `CONTEXT_CHARS` (default 36,000) caps what one batch carries, a quarter of it at most for the guidelines; `CONTEXT=off` sends the diff alone. Context costs no extra model calls, only a few GitHub reads within the step's subrequest budget, and a read GitHub refuses is noted in the review's summary and skipped, so the review still runs on what was read.
 
