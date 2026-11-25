@@ -35,6 +35,7 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
+import { MAX_CALLER_SYMBOLS, MAX_CONTEXT_FILES, MAX_CONTEXT_FILE_CHARS, MAX_GUIDE_FILES, MAX_TESTS, GUIDE_FILE_CHARS, batchContext, callerHits, changedSymbols, contextLine, indexTests, isSecretPath, parseTree, pickGuidelines, redact, ruleScope, testsFor } from "./context.js";
 import { batchPrepared, coverageOf, onlyHidden, planReview, prLimitReason, skipReason, trimLongLines } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
@@ -135,7 +136,9 @@ const COMMITS_SHOWN = 20;
 const APPLIES_PER_STEP = 10;
 const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
-export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}`;
+// The base branch is part of the mark: a retarget leaves the head the same but
+// the diff (and so what was reviewed) different.
+export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}${run.baseRef ? `~${run.baseRef}` : ""}`;
 
 // A file's record holds its patch's length, never the patch: the patch is in
 // pieces of its own, so the plan can choose what fits the pull request's
@@ -248,6 +251,7 @@ export async function stepRun(ctx, id) {
     if (run.stage === "files") return await stageFiles(counted, run, save);
     if (run.stage === "content") return await stageContent(counted, run, save);
     if (run.stage === "plan") return await stagePlan(counted, run, save);
+    if (run.stage === "context") return await stageContext(counted, run, save);
     if (run.stage === "draft") return await stageDraft(counted, run, save);
     if (run.stage === "verify") return await stageVerify(counted, run, save);
     if (run.stage === "post") return await stagePost(counted, run, save);
@@ -323,6 +327,7 @@ async function stagePr(ctx, run, save) {
   if (pr?.state !== "open") return finish(ctx, run, save, {});
   run.headSha = pr.head.sha;
   run.baseSha = pr.base.sha;
+  run.baseRef = typeof pr.base?.ref === "string" ? pr.base.ref.slice(0, 255) : "";
   run.title = String(pr.title ?? "").slice(0, 300);
   run.body = String(pr.body ?? "").slice(0, 3000);
   run.changedFiles = Number(pr.changed_files) || 0;
@@ -491,9 +496,161 @@ async function stagePlan(ctx, run, save) {
   }
   const files_ = plan.files.length + plan.uncovered.length;
   await status(ctx, run, "pending", `Reviewing ${plural(files_, "file")} in ${passes(batches.length)}…`);
-  run.stage = "draft";
+  // The context (guidelines, whole files, tests, callers) is read first,
+  // unless it is switched off (CONTEXT=off).
+  run.stage = ctx.cfg.contextChars > 0 ? "context" : "draft";
   await save(run);
   return ctx.deps.now();
+}
+
+// --- context (context.js) --------------------------------------------------------
+//
+// Read once per run, kept under run:<id>:ctx:, and shown beside each batch's
+// diff. It is best effort: whatever GitHub will not give is named in the
+// review's About block, and the review goes on without it. Reads are counted
+// by hand (the effects do not go through the step's subrequest counter): at
+// most CONTEXT_CALLS_PER_STEP GitHub calls a step, inside Workers Free's 50.
+const CONTEXT_CALLS_PER_STEP = 36;
+const TEST_FILE_CHARS = 8_000;
+const ctxKey = (id, kind, path = "") => `${RUN}${id}:ctx:${kind}${path ? `:${path}` : ""}`;
+
+const decode = (b) => new TextDecoder().decode(b.bytes);
+const isBinary = (b) => b.bytes.subarray(0, 8000).includes(0);
+
+async function stageContext(ctx, run, save) {
+  const { storage, fx } = ctx;
+  const c = (run.context ??= { step: "tree", at: 0, notes: [], counts: { guidelines: 0, files: 0, tests: 0, callers: 0 } });
+  const note = (t) => { if (c.notes.length < 6 && !c.notes.includes(t)) c.notes.push(t); };
+  let calls = 0;
+  const room = () => calls < CONTEXT_CALLS_PER_STEP;
+  // One read that may fail without failing the review.
+  const soft = async (what, f) => {
+    calls++;
+    try {
+      return await f();
+    } catch (e) {
+      if (typeof e?.status !== "number") throw e;
+      note(`${what} could not be read (GitHub ${e.status})`);
+      return null;
+    }
+  };
+
+  if (c.step === "tree") {
+    const { plan } = await loadPlan(ctx, run);
+    const paths = plan.files.map((f) => f.path);
+    const shaOf = new Map();
+    const indexOf = new Map();
+    for (let i = 0; i < run.files; i++) {
+      const m = await getMeta(storage, run.id, i);
+      if (m && paths.includes(m.filename)) { shaOf.set(m.filename, m.sha); indexOf.set(m.filename, i); }
+    }
+    const baseTree = await soft("the base commit's file list", () => fx.tree(run.repo.full, run.baseSha));
+    const headTree = await soft("the file list", () => fx.tree(run.repo.full, run.headSha));
+    if (baseTree?.truncated || headTree?.truncated) note("the repository is too large to list whole: some guidelines and tests may be missing");
+    const baseEntries = parseTree(baseTree);
+    const headEntries = parseTree(headTree);
+    const sizes = new Map(headEntries.map((e) => [e.path, e.size]));
+    c.guides = baseEntries.length ? pickGuidelines(baseEntries.filter((e) => !isSecretPath(e.path)), paths) : [];
+    const index = indexTests(headEntries);
+    c.tests = [];
+    for (const p of paths) {
+      for (const t of testsFor(index, p)) if (c.tests.length < MAX_TESTS && !c.tests.some((x) => x.path === t.path && x.forPath === p)) c.tests.push({ forPath: p, path: t.path, sha: t.sha });
+    }
+    c.files = [];
+    for (const p of paths) {
+      if (c.files.length >= MAX_CONTEXT_FILES) { note(`only the first ${MAX_CONTEXT_FILES} files were read whole`); break; }
+      if (isSecretPath(p) || !shaOf.get(p)) continue;
+      if (headEntries.length && (sizes.get(p) ?? 0) > MAX_CONTEXT_FILE_CHARS * 2) continue;
+      c.files.push({ path: p, sha: shaOf.get(p) });
+    }
+    // The names to look for elsewhere: those the first files' patches add or
+    // remove, a few in all (code search is rationed).
+    c.symbols = [];
+    for (const p of paths.slice(0, 30)) {
+      if (c.symbols.length >= MAX_CALLER_SYMBOLS) break;
+      const f = await getFile(storage, run.id, indexOf.get(p));
+      for (const s of changedSymbols(f?.patch, MAX_CALLER_SYMBOLS - c.symbols.length)) c.symbols.push({ symbol: s, forPath: p });
+    }
+    c.step = "guides";
+    c.at = 0;
+  }
+
+  if (c.step === "guides") {
+    for (; c.at < c.guides.length && room(); c.at++) {
+      const g = c.guides[c.at];
+      const b = await soft(g.path, () => fx.blob(run.repo.full, g.sha));
+      if (!b || isBinary(b)) continue;
+      const text = redact(decode(b));
+      await storage.put(ctxKey(run.id, "g", String(c.at)), { path: g.path, dir: g.dir, scope: g.path.startsWith(".claude/rules/") ? ruleScope(text) : [], text: text.length > GUIDE_FILE_CHARS ? `${text.slice(0, GUIDE_FILE_CHARS)}\n[cut: the file is longer]` : text });
+      c.counts.guidelines++;
+    }
+    if (c.at >= c.guides.length) { c.step = "files"; c.at = 0; }
+  }
+
+  if (c.step === "files") {
+    for (; c.at < c.files.length && room(); c.at++) {
+      const f = c.files[c.at];
+      const b = await soft(f.path, () => fx.blob(run.repo.full, f.sha));
+      if (!b || isBinary(b) || b.bytes.length > MAX_CONTEXT_FILE_CHARS * 4) continue;
+      const text = redact(decode(b));
+      if (text.length > MAX_CONTEXT_FILE_CHARS) { note(`${f.path} is too large to read whole`); continue; }
+      await storage.put(ctxKey(run.id, "f", f.path), text);
+      c.counts.files++;
+    }
+    if (c.at >= c.files.length) { c.step = "tests"; c.at = 0; }
+  }
+
+  if (c.step === "tests") {
+    for (; c.at < c.tests.length && room(); c.at++) {
+      const t = c.tests[c.at];
+      const b = await soft(t.path, () => fx.blob(run.repo.full, t.sha));
+      if (!b || isBinary(b)) continue;
+      const have = (await storage.get(ctxKey(run.id, "t", t.forPath))) ?? [];
+      have.push({ path: t.path, text: redact(decode(b)).slice(0, TEST_FILE_CHARS) });
+      await storage.put(ctxKey(run.id, "t", t.forPath), have);
+      c.counts.tests++;
+    }
+    if (c.at >= c.tests.length) { c.step = "callers"; c.at = 0; }
+  }
+
+  if (c.step === "callers") {
+    const changed = new Set(c.files.map((f) => f.path));
+    for (; c.at < c.symbols.length && room(); c.at++) {
+      const { symbol, forPath } = c.symbols[c.at];
+      const items = await soft(`the search for ${symbol}`, () => fx.searchCode(run.repo.full, symbol));
+      const hits = callerHits(items, symbol, changed);
+      if (!hits.length) continue;
+      const have = (await storage.get(ctxKey(run.id, "c", forPath))) ?? [];
+      have.push({ symbol, hits });
+      await storage.put(ctxKey(run.id, "c", forPath), have);
+      c.counts.callers++;
+    }
+    if (c.at >= c.symbols.length) c.step = "done";
+  }
+
+  if (c.step === "done") {
+    run.contextSummary = { ...c.counts, notes: c.notes };
+    delete c.guides; delete c.tests; delete c.files; delete c.symbols;
+    run.stage = "draft";
+  }
+  await save(run);
+  return ctx.deps.now();
+}
+
+// A batch's context from what the stage kept, or null when there is none.
+async function contextOf(ctx, run, prepared) {
+  if (!(ctx.cfg.contextChars > 0) || run.context?.step !== "done") return null;
+  const { storage } = ctx;
+  const data = { guidelines: [], files: new Map(), tests: new Map(), callers: new Map() };
+  for (const g of (await storage.list({ prefix: ctxKey(run.id, "g") })).values()) data.guidelines.push(g);
+  for (const p of prepared.included) {
+    const [f, t, c] = await Promise.all([storage.get(ctxKey(run.id, "f", p)), storage.get(ctxKey(run.id, "t", p)), storage.get(ctxKey(run.id, "c", p))]);
+    if (typeof f === "string") data.files.set(p, f);
+    if (t) data.tests.set(p, t);
+    if (c) data.callers.set(p, c);
+  }
+  const bc = batchContext(data, prepared, ctx.cfg.contextChars);
+  return bc.text ? bc : null;
 }
 
 async function loadPlan(ctx, run) {
@@ -553,7 +710,8 @@ async function stageDraft(ctx, run, save) {
     const mine = { left: share };
     const bctx = countSubrequests(ctx, mine);
     const prepared = batchPrepared(asPlan(plan, batches), i);
-    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag: randomTag(), pass: { index: i + 1, total: batches.length } });
+    const context = await contextOf(ctx, run, prepared);
+    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag: randomTag(), pass: { index: i + 1, total: batches.length }, context });
     const chars = instructions.length + input.length;
     const providers = createProviders(bctx.env, ctx.cfg, rotatedChain(chain, i), bctx.deps);
     const d = await draftWithChain({ providers, instructions, modelInput: input, chars, cfg: ctx.cfg, deps: bctx.deps, started, repository: run.repo.full, pr: run.pr, budget: mine });
@@ -613,6 +771,7 @@ async function stageVerify(ctx, run, save) {
   for (const [i, b] of batches.entries()) {
     if (b.status !== "drafted" || b.waitUntil > now) continue;
     const prepared = batchPrepared(full, i);
+    prepared.context = await contextOf(ctx, run, prepared);
     const classified = classifyFindings({ findings: b.findings }, prepared.commentable, prepared.lineText);
     const grounded = groundFindings(classified, prepared, { title: run.title, body: run.body });
     const empty = !grounded.classified.inline.length && !grounded.classified.general.length;
@@ -716,7 +875,7 @@ async function stagePost(ctx, run, save) {
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextLine(run.contextSummary) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
