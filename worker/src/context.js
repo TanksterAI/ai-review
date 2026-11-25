@@ -39,7 +39,17 @@ const LINE_CHARS = 400;
 
 // --- what must never be read or sent ---------------------------------------
 
-const SECRET_PATH = /(^|\/)(\.env($|\.)|\.npmrc$|\.netrc$|\.pypirc$|\.git-credentials$|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$|credentials(\.[a-z]+)?$|secrets?\.(json|ya?ml|toml|env)$|[^/]*\.(pem|key|p12|pfx|jks|keystore|kdbx)$)/i;
+const SECRET_PATH = new RegExp(
+  "(^|/)(" + [
+    "\\.env(rc)?($|\\.[^/]*$)", "[^/]*\\.env$", "\\.dev\\.vars(\\.[^/]*)?$",
+    "\\.npmrc$", "\\.netrc$", "\\.pypirc$", "\\.htpasswd$", "\\.git-credentials$", "kubeconfig(\\.[^/]*)?$",
+    "id_(rsa|dsa|ecdsa|ed25519)(\\.pub)?$",
+    "credentials(\\.(json|ya?ml|toml|ini|txt|csv|xml))?$",
+    "secrets?\\.(json|ya?ml|toml|env|txt)$",
+    "service[-_]?account[^/]*\\.json$",
+    "[^/]*\\.(tfstate|tfstate\\.backup|tfvars|pem|key|p8|p12|pfx|pkcs12|jks|keystore|kdbx)$",
+    "\\.?secrets?/", "\\.(ssh|aws|gnupg)/",
+  ].join("|") + ")", "i");
 export const isSecretPath = (path) => SECRET_PATH.test(String(path));
 
 const REDACT = [
@@ -48,18 +58,33 @@ const REDACT = [
   /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{40,}\b/g,
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+  /\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+  /\bwhsec_[A-Za-z0-9]{16,}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
   /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
 ];
-const ASSIGNED = /\b((?:password|passwd|secret|token|api[_-]?key|private[_-]?key|client[_-]?secret)\w*\s*[:=]\s*)(["'])[^"'\n]{8,}\2/gi;
+const KEYWORD = "(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)";
+// A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key), then a quoted value.
+const ASSIGNED = new RegExp(`\\b(\\w*${KEYWORD}\\w*["']?\\s*[:=]\\s*)(["'\`])[^"'\`\\n]{8,}\\2`, "gi");
+// The same with no quotes (an .env style line, YAML): the value must look like a secret (12 or more characters with a digit in them).
+const ASSIGNED_BARE = new RegExp(`\\b(\\w*${KEYWORD}\\w*["']?\\s*[:=]\\s*)(?=[A-Za-z0-9+/_.~=-]*\\d)[A-Za-z0-9+/_.~=-]{12,}`, "gi");
+const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]{3,}(@)/gi;
+const BEARER = /\b(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/g;
 
-/** The text with anything that looks like a credential blanked out. */
+/** The text with the common forms of a credential blanked out (a safety net, not a guarantee). */
 export function redact(text) {
   let t = String(text ?? "");
   for (const re of REDACT) t = t.replace(re, "[redacted]");
-  return t.replace(ASSIGNED, "$1$2[redacted]$2");
+  return t
+    .replace(ASSIGNED, "$1$2[redacted]$2")
+    .replace(ASSIGNED_BARE, "$1[redacted]")
+    .replace(URL_PASSWORD, "$1[redacted]$2")
+    .replace(BEARER, "$1[redacted]");
 }
+
+/** The text with any half of a surrogate pair (a cut through an emoji) replaced, so it is well-formed. */
+export const wellFormed = (text) => String(text ?? "").replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "\ufffd");
 
 // --- the repository's tree ---------------------------------------------------
 
@@ -132,14 +157,19 @@ const reCache = new Map();
 export function globToRegExp(glob) {
   if (reCache.has(glob)) return reCache.get(glob);
   let re = "";
+  let depth = 0;
   const g = String(glob).slice(0, 200);
   for (let i = 0; i < g.length; i++) {
     const c = g[i];
     if (c === "*" && g[i + 1] === "*") { re += g[i + 2] === "/" ? "(?:.*/)?" : ".*"; i += g[i + 2] === "/" ? 2 : 1; }
     else if (c === "*") re += "[^/]*";
     else if (c === "?") re += "[^/]";
+    else if (c === "{") { depth++; re += "(?:"; }
+    else if (c === "}" && depth > 0) { depth--; re += ")"; }
+    else if (c === "," && depth > 0) re += "|";
     else re += c.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
   }
+  re += ")".repeat(depth);
   const out = new RegExp(`^${re}$`);
   reCache.set(glob, out);
   return out;
@@ -235,7 +265,7 @@ export function changedSymbols(patch, max = MAX_CALLER_SYMBOLS) {
       const m = re.exec(text);
       if (!m) continue;
       const name = m[1];
-      if (name.length >= 4 && !COMMON.has(name.toLowerCase()) && !found.includes(name)) found.push(name);
+      if (name.length >= 4 && /^[A-Za-z_$][\w$]{2,79}$/.test(name) && !COMMON.has(name.toLowerCase()) && !found.includes(name)) found.push(name);
       break;
     }
     if (found.length >= max) break;
@@ -339,11 +369,21 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
     if (relatedCap > 0) { counts.tests += tests.length; counts.callers += callers.filter((c) => c.hits.length).length; }
   }
   counts.guidelines = guide ? (guide.match(/^## /gm) ?? []).length : 0;
-  const files = new Map([...blocks].filter(([, v]) => v));
+  const files = new Map([...blocks].filter(([, v]) => v).map(([k, v]) => [k, wellFormed(v)]));
   const filesText = paths.filter((p) => files.has(p)).map((p) => files.get(p)).join("\n\n");
-  const text = [guide, filesText].filter(Boolean).join("\n\n");
-  return { text, guide, filesText, files, counts };
+  const guideOk = wellFormed(guide);
+  const text = [guideOk, filesText].filter(Boolean).join("\n\n");
+  return { text, guide: guideOk, filesText, files, counts };
 }
+
+const noteSpan = (n) => {
+  const t = wellFormed(String(n ?? "").replace(/\s+/g, " ").trim().slice(0, 200));
+  // Plain words, digits and the punctuation of a path or a sentence can do nothing in Markdown: shown as they are.
+  if (/^[A-Za-z0-9 ._,'()/-]*$/.test(t) && !/www\./i.test(t)) return t;
+  const run = Math.max(0, ...(t.match(/`+/g) ?? []).map((r) => r.length));
+  const fence = "`".repeat(run + 1);
+  return `${fence} ${t} ${fence}`;
+};
 
 /** One line for the review's About block: what context the models had. */
 export function contextLine(summary) {
@@ -354,6 +394,7 @@ export function contextLine(summary) {
   if (summary.files) bits.push(`${summary.files} changed file${summary.files === 1 ? "" : "s"} beyond the diff`);
   if (summary.tests) bits.push(`${summary.tests} test file${summary.tests === 1 ? "" : "s"}`);
   if (summary.callers) bits.push(`uses of ${summary.callers} changed name${summary.callers === 1 ? "" : "s"}`);
-  const notes = (summary.notes ?? []).slice(0, 3).join("; ");
+  // A note can carry a path the author chose: unless it is plain, it is shown as code, so no mention, link or reference in it can act.
+  const notes = (summary.notes ?? []).slice(0, 3).map((n) => noteSpan(n)).join("; ");
   return `- Context: ${bits.length ? bits.join(", ") : "none found"}${notes ? ` (${notes})` : ""}.`;
 }
