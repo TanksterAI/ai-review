@@ -75,3 +75,22 @@ test("the router sends /v1/bench to the benchmark", async () => {
   const res = await worker.fetch(new Request("https://x/v1/bench", { method: "GET" }), env(ai(answer)));
   assert.equal(res.status, 405);
 });
+
+test("with verification on, the verifier's verdicts decide what is shown, and its spend is reported", async () => {
+  const verdict = (v) => async (url, init) => {
+    if (String(url).endsWith("/user")) return new Response(JSON.stringify({ id: Number(OWNER_ID) }), { status: 200 });
+    const text = JSON.parse(init.body).messages[0].content;
+    const ids = [...text.matchAll(/"id":\s*"([^"]+)"/g)].map((m) => m[1]);
+    const out = ids.map((id) => ({ id, verdict: v, severity: "major", suggestion_ok: true, prompt_ok: true, reason: "checked" }));
+    return { ok: true, status: 200, headers: { get: () => null }, async json() { return { content: [{ type: "text", text: JSON.stringify({ verdicts: out }) }], stop_reason: "end_turn", usage: { input_tokens: 4000, output_tokens: 100 } }; } };
+  };
+  for (const [v, expected] of [["confirmed", 1], ["refuted", 0]]) {
+    const e = env(ai(answer), { VERIFY: undefined, ANTHROPIC_API_KEY: "sk", VERIFY_CHAIN: "anthropic:claude-haiku-5-5" });
+    const res = await handleBench(req(body), e, { ...deps(), fetch: verdict(v) });
+    const out = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(out));
+    assert.equal(out.shown.length, expected, v);
+    assert.equal(out.verified.hidden, 1 - expected);
+    assert.ok(out.verified.calls >= 1);
+  }
+});
