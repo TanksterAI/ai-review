@@ -1989,13 +1989,13 @@ function makeWith(envOver) {
 
 test("auto-pause: off unless set; once set, the Nth automatic review pauses the PR with a notice", async () => {
   const sha = (c) => c.repeat(40);
-  // Off by default: five reviews and it is still not paused.
+  // Off by default: five automatic reviews and it is still not paused.
   const off = makeWith({});
-  const o1 = await off.obj.onEvent({ delivery: "1", ev: review() });
-  await drain(off.obj);
   for (let i = 0; i < 5; i++) {
-    const j = i === 0 ? o1.jobId : (await off.obj.onEvent({ delivery: `x${i}`, ev: command("@tankster-ai-review review") }), null);
-    if (j) { await off.obj.claim({ jobId: j, runId: "1" }); await off.obj.complete({ jobId: j, runId: "1", reviewedSha: sha("c") }); }
+    const j = await off.obj.onEvent({ delivery: `o${i}`, ev: review({ action: "reopened" }) });
+    await drain(off.obj);
+    await off.obj.claim({ jobId: j.jobId, runId: `${i}` });
+    await off.obj.complete({ jobId: j.jobId, runId: `${i}`, reviewedSha: sha("c") });
   }
   assert.equal((await off.storage.get("state")).paused, false);
 
@@ -2055,4 +2055,25 @@ test("a retarget to a reviewed base reviews a PR that was skipped for its old ba
   const { obj } = makeWith({ BASE_BRANCHES: "main" });
   assert.equal((await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) })).action, "base_branch_skipped");
   assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "main" }) })).action, "debounced");
+});
+
+test("auto-pause counts a job once, even if its completion is repeated", async () => {
+  const { obj, storage } = makeWith({ AUTO_PAUSE_AFTER: "2" });
+  const j = await obj.onEvent({ delivery: "1", ev: review() });
+  await drain(obj);
+  await obj.claim({ jobId: j.jobId, runId: "1" });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  await obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  const st = await storage.get("state");
+  assert.equal(st.autoReviewed, 1);
+  assert.equal(st.paused, false);
+});
+
+test("base branches: a paused PR into an excluded base still gets the explaining status", async () => {
+  const { obj, fx } = makeWith({ BASE_BRANCHES: "main" });
+  await obj.onEvent({ delivery: "1", ev: command("@tankster-ai-review pause") });
+  await drain(obj);
+  assert.equal((await obj.onEvent({ delivery: "2", ev: review({ action: "synchronize", baseRef: "dev" }) })).action, "base_branch_skipped");
+  await drain(obj);
+  assert.equal(fx.calls.filter((c) => c[0] === "setStatus").at(-1)[3], "success");
 });

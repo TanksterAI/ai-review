@@ -447,11 +447,6 @@ export class PrState {
         }
         return this.save(st, { action: "draft" });
       }
-      if (st.paused) {
-        // The required status must not sit empty on a head nobody reviews.
-        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "pending", waiting: true });
-        return this.save(st, { action: "paused" });
-      }
       // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
       // status passes, saying why, so the required check does not wait forever;
       // a review asked for by hand still runs.
@@ -459,6 +454,11 @@ export class PrState {
         await this.ctx.storage.delete("debounce");
         if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "success", description: `Not reviewed automatically: base branch ${ev.baseRef} is not in the reviewed branches.` });
         return this.save(st, { action: "base_branch_skipped" });
+      }
+      if (st.paused) {
+        // The required status must not sit empty on a head nobody reviews.
+        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "pending", waiting: true });
+        return this.save(st, { action: "paused" });
       }
       const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
       // Forks wait for a writer, with a note and a pending status (the merge
