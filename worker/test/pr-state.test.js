@@ -2175,16 +2175,6 @@ test("a push by a checked author to a paused PR leaves a waiting status", async 
   assert.equal(s[3], "pending");
 });
 
-test("the job after a retarget skips the head's old 'reviewed in full' mark, once", async () => {
-  const { obj } = make();
-  const first = await obj.onEvent({ delivery: "1", ev: review({ action: "opened" }) });
-  assert.equal((await obj.ctx.storage.get(`job:${first.jobId}`)).force, undefined, "an ordinary job is not forced");
-  const r = await obj.onEvent({ delivery: "2", ev: review({ action: "edited", baseRef: "release" }) });
-  assert.equal((await obj.ctx.storage.get(`job:${r.jobId}`)).force, true, "the old base's mark is not reused");
-  const later = await obj.onEvent({ delivery: "3", ev: review({ action: "reopened" }) });
-  assert.equal((await obj.ctx.storage.get(`job:${later.jobId}`)).force, undefined, "only the one job");
-});
-
 test("a retarget to an excluded base drops automatic work already waiting", async () => {
   const { obj } = makeWith({ BASE_BRANCHES: "main" });
   const auto = await obj.onEvent({ delivery: "1", ev: review({ action: "opened" }) });

@@ -135,7 +135,9 @@ const COMMITS_SHOWN = 20;
 const APPLIES_PER_STEP = 10;
 const JUDGE_CHARS = 50_000;
 // A commit reviewed at full coverage. Not the single-prompt paths' done: key.
-export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}`;
+// The base branch is part of the mark: a retarget leaves the head the same but
+// the diff (and so what was reviewed) different.
+export const doneKeyOf = (run) => `donefull:${run.repo.full}#${run.pr}@${run.headSha}${run.baseRef ? `~${run.baseRef}` : ""}`;
 
 // A file's record holds its patch's length, never the patch: the patch is in
 // pieces of its own, so the plan can choose what fits the pull request's
@@ -323,6 +325,7 @@ async function stagePr(ctx, run, save) {
   if (pr?.state !== "open") return finish(ctx, run, save, {});
   run.headSha = pr.head.sha;
   run.baseSha = pr.base.sha;
+  run.baseRef = typeof pr.base?.ref === "string" ? pr.base.ref.slice(0, 255) : "";
   run.title = String(pr.title ?? "").slice(0, 300);
   run.body = String(pr.body ?? "").slice(0, 3000);
   run.changedFiles = Number(pr.changed_files) || 0;

@@ -416,13 +416,11 @@ export class PrState {
       since: full ? null : st.lastReviewed,
       requestedBy,
       baseEpoch: st.baseEpoch ?? 0,
-      ...(st.forceNext ? { force: true } : {}),
       createdAt: this.now(),
       firstAt: this.now(),
       claimedBy: null,
     };
     await this.ctx.storage.put(`job:${id}`, job);
-    if (st.forceNext) { delete st.forceNext; await this.ctx.storage.put("state", st); }
     if (queue) await this.outbox({ type: "dispatch", jobId: id });
     return job;
   }
@@ -469,9 +467,6 @@ export class PrState {
         // A review that was already running for the old base must not put its
         // commit back as reviewed when it finishes (complete()).
         st.baseEpoch = (st.baseEpoch ?? 0) + 1;
-        // The head's "reviewed in full" mark (in the ledger) is of the old base: the
-        // next job, whenever it is made (a paused PR waits for resume), skips it.
-        st.forceNext = true;
       }
       if (ev.draft) {
         // Converted to a draft, or a push to one: nothing waits for it.

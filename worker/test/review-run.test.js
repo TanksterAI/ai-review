@@ -280,6 +280,19 @@ test("a commit already reviewed is not reviewed again, unless someone asked", as
   assert.equal(asked.github.posted.length, 1);
 });
 
+test("a head reviewed in full against one base is not reviewed against another: the mark names the base", async () => {
+  const marked = (ref) => `donefull:TanksterAI/ai-review#9@${HEAD}~${ref}`;
+  const skipped = setup({ github: fakeGithub({ pr: { base: { sha: BASE, ref: "main" } } }) });
+  await skipped.env.LEDGER.put(marked("main"), "2026-11-14");
+  await runAll(skipped);
+  assert.equal(skipped.github.posted.length, 0, "same base: already reviewed");
+  const retargeted = setup({ github: fakeGithub({ pr: { base: { sha: BASE, ref: "release" } } }) });
+  await retargeted.env.LEDGER.put(marked("main"), "2026-11-14");
+  await runAll(retargeted);
+  assert.equal(retargeted.github.posted.length, 1, "another base: reviewed again");
+  assert.ok(retargeted.env.LEDGER.map.has(marked("release")), "and marked for that base");
+});
+
 test("an incremental review reads only the commits since the last review, and says so", async () => {
   const since = "d".repeat(40);
   const github = fakeGithub({ compare: (base) => (base === since ? { status: "ahead", files: [file("worker/src/m3.js", added(4, "inc_"))] } : null) });
