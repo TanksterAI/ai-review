@@ -6,7 +6,8 @@
 // review, a token or a repository name. No request, header, body, user or breadcrumb is ever added.
 // Off unless SENTRY_DSN (a Worker secret) is set. Reporting never throws and never waits long.
 
-const NAME = /^[A-Za-z][\w.]{0,60}$/;
+// Only built-in error names go out: a custom name can be built from data.
+const NAMES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError", "DOMException", "TimeoutError", "AbortError"]);
 const FRAME = /^\s*at (?:async )?(?:(.+?) \()?(.*?):(\d+):(\d+)\)?\s*$/;
 const FN = /^[A-Za-z_$][\w$.<>[\] ]{0,80}$/;
 const WHERE = /^[a-z][a-z0-9:_-]{0,40}$/;
@@ -29,12 +30,18 @@ export function parseDsn(dsn) {
 function pathOf(file) {
   const clean = String(file).replace(/^file:\/\//, "").split(/[?#]/)[0];
   const at = clean.lastIndexOf("worker/");
-  const tail = at >= 0 ? clean.slice(at) : clean.split("/").pop();
-  return /^[\w./-]{1,120}$/.test(tail) ? tail : "<unknown>";
+  const tail = at >= 0 ? clean.slice(at) : "";
+  return /^worker\/[\w./-]{1,110}$/.test(tail) ? tail : "<unknown>";
 }
 
 export function framesOf(e) {
-  const stack = e instanceof Error && typeof e.stack === "string" ? e.stack.split("\n") : [];
+  // V8 starts the stack with "Name: message", which can span lines and can imitate frames. Skip exactly
+  // that header; if the stack does not begin with it, parse nothing rather than guess.
+  let stack = [];
+  if (e instanceof Error && typeof e.stack === "string") {
+    const header = e.message ? `${e.name}: ${e.message}` : String(e.name);
+    if (e.stack.startsWith(header)) stack = e.stack.slice(header.length).split("\n");
+  }
   const frames = [];
   for (const line of stack) {
     const m = FRAME.exec(line);
@@ -45,7 +52,7 @@ export function framesOf(e) {
 }
 
 export function eventFor(env, e, where, { now = Date.now, id = () => crypto.randomUUID().replaceAll("-", "") } = {}) {
-  const name = e instanceof Error && NAME.test(e.name) ? e.name : "Error";
+  const name = e instanceof Error && NAMES.has(e.name) ? e.name : "Error";
   const label = WHERE.test(where) ? where : "worker";
   return {
     event_id: id(),

@@ -260,7 +260,7 @@ Deploy only what is on `main`.
 
 ## Errors to Sentry
 
-When the Worker secret `SENTRY_DSN` is set, an uncaught failure in the request handler or in a Durable Object alarm is sent to the `ai-review` project in the `tankster-ai` Sentry organisation. This Worker reads other people's diffs, so what leaves is built by hand in `worker/src/report.js` (no SDK, no dependency): the error's name, a fixed label (`fetch` or `alarm`) and stack frames (function, file inside this repository, line, column). Never the message, a request, a header, a diff, a token or a repository name. At most ten events a minute, two seconds to send, and a failure to report is swallowed. With no DSN nothing is sent. Add the DSN as a Worker secret in the Cloudflare dashboard, like the other secrets. `worker/test/report.test.js` pins all of this with canaries.
+When the Worker secret `SENTRY_DSN` is set, an uncaught failure in the request handler or in a Durable Object alarm is sent to the `ai-review` project in the `tankster-ai` Sentry organisation. This Worker reads other people's diffs, so what leaves is built by hand in `worker/src/report.js` (no SDK, no dependency): the error's name (built-in names only), a fixed label (`fetch` or `alarm`) and stack frames (function, file inside this repository, line, column). Never the message, a request, a header, a diff, a token or a repository name. At most ten events a minute per isolate, two seconds to send, and a failure to report is swallowed. With no DSN nothing is sent. Add the DSN as a Worker secret in the Cloudflare dashboard, like the other secrets. `worker/test/report.test.js` pins all of this with canaries.
 
 ## Verified findings
 

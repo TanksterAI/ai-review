@@ -54,13 +54,43 @@ test("a hostile name or label is replaced, not sent", () => {
 
 test("frames carry a function, a repository path, a line and a column only", () => {
   const e = new Error("m");
-  e.stack = `Error: ${message}\n    at handle (file:///opt/build/worker/src/index.js?v=${CANARY.token}:10:5)\n    at async Object.fetch (/x/node_modules/pkg/a.js:3:9)\n    at ${CANARY.review}`;
+  e.stack = `Error: m\n    at handle (file:///opt/build/worker/src/index.js?v=${CANARY.token}:10:5)\n    at async Object.fetch (/x/node_modules/pkg/a.js:3:9)\n    at ${CANARY.review}`;
   const frames = framesOf(e);
   assert.deepEqual(frames.map((f) => [f.function, f.filename, f.lineno, f.colno, f.in_app]), [
-    ["Object.fetch", "a.js", 3, 9, false],
+    ["Object.fetch", "<unknown>", 3, 9, false],
     ["handle", "worker/src/index.js", 10, 5, true],
   ]);
   noLeak(JSON.stringify(frames));
+});
+
+test("a message that imitates stack frames adds no frames", () => {
+  const e = new Error(`x\n    at ${CANARY.token} (worker/src/a.js:1:2)\n    at /p/${CANARY.repo}.js:3:4`);
+  const frames = framesOf(e);
+  noLeak(JSON.stringify(frames));
+  assert.ok(frames.every((f) => !JSON.stringify(f).includes("canary")));
+  // A stack that does not start with its own header is not parsed at all.
+  const odd = new Error("m");
+  odd.stack = `something else\n    at handle (worker/src/index.js:1:1)`;
+  assert.deepEqual(framesOf(odd), []);
+  // Paths outside this repository are not named.
+  const far = new Error("m");
+  far.stack = `Error: m\n    at f (/srv/${CANARY.repo}/secret.js:1:1)`;
+  assert.equal(framesOf(far)[0].filename, "<unknown>");
+});
+
+test("a custom error name built from data is replaced", () => {
+  const e = new Error("x");
+  e.name = CANARY.token;
+  assert.equal(eventFor({}, e, "fetch").exception.values[0].type, "Error");
+});
+
+test("nothing from the environment goes out except the DSN's public key and the allowed fields", async () => {
+  const s = sink();
+  await report({ SENTRY_DSN: DSN, SENTRY_ENVIRONMENT: "staging", SECRET_OTHER: CANARY.token, GITHUB_APP_PRIVATE_KEY: CANARY.diff }, new Error("x"), "fetch", { fetch: s.fetch });
+  const text = allText(s.calls);
+  noLeak(text);
+  assert.ok(!text.includes("o1.ingest.de.sentry.io/42\"") && !text.includes(DSN), "the DSN itself is not in the payload");
+  assert.match(text, /"environment":"staging"/);
 });
 
 test("with no DSN nothing is sent, and a bad DSN is ignored", async () => {
