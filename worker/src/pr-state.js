@@ -188,10 +188,23 @@ const ACTIONS_BOT = /^github-actions(\[bot\])?$/i;
 // Settings (Worker variables; per-repository configuration comes later).
 // BASE_BRANCHES: comma-separated names or patterns ("main, release/*"). Empty
 // means every base branch is reviewed, which the org's required status needs.
+// A glob (only * is special) matched without a regular expression: the usual
+// two-pointer walk that remembers the last star, never exponential.
+function globMatch(pat, text) {
+  let p = 0, t = 0, star = -1, mark = 0;
+  while (t < text.length) {
+    if (p < pat.length && pat[p] === "*") { star = p++; mark = t; }
+    else if (p < pat.length && pat[p] === text[t]) { p++; t++; }
+    else if (star >= 0) { p = star + 1; t = ++mark; }
+    else return false;
+  }
+  while (p < pat.length && pat[p] === "*") p++;
+  return p === pat.length;
+}
 export function reviewsBase(env, baseRef) {
   const list = String(env?.BASE_BRANCHES ?? "").split(",").map((x) => x.trim()).filter(Boolean);
   if (!list.length || !baseRef) return true;
-  return list.some((pat) => new RegExp(`^${pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(baseRef));
+  return list.some((pat) => globMatch(pat, String(baseRef)));
 }
 // AUTO_PAUSE_AFTER: pause automatic reviews after this many reviewed commits
 // (CodeRabbit's default is 5; ours is 0, never, because our status is required).
@@ -1494,8 +1507,12 @@ export class PrState {
     // CodeRabbit's auto-pause: after N reviewed commits, reviews wait for a
     // `resume`. Reviews asked for by hand do not count.
     const limit = autoPauseAfter(this.env);
-    let pauseNote = null;
-    if (limit && !job.requestedBy) {
+    let pauseNote = job.pauseNote ?? null;
+    // Counted once per job, and only for the base it was made for: a retry of
+    // this call (the job stays until the end) finds the mark and does not count
+    // again. The state and the mark go in one write.
+    const counts = Boolean(limit) && !job.requestedBy && sameBase && !job.counted;
+    if (counts) {
       st.autoReviewed = (st.autoReviewed ?? 0) + 1;
       if (st.autoReviewed >= limit && !st.paused) {
         st.paused = true;
@@ -1504,8 +1521,10 @@ export class PrState {
     }
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
-    await this.ctx.storage.put("state", st);
-    if (pauseNote) {
+    await this.ctx.storage.put({ state: st, [`job:${jobId}`]: { ...job, counted: job.counted || counts, ...(pauseNote ? { pauseNote } : {}) } });
+    // A retry after a failure past this point still says why reviews paused,
+    // and says it once.
+    if (pauseNote && !((await this.ctx.storage.get("outbox")) ?? []).some((x) => x.type === "comment" && x.template === "auto_paused")) {
       await this.outbox({ type: "comment", template: "auto_paused", limit: pauseNote });
     }
     // The edit is queued before the job goes: a retry after a failure in

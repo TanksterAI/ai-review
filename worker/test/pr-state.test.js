@@ -2192,3 +2192,40 @@ test("a retarget to an excluded base drops automatic work already waiting", asyn
   assert.equal(await obj.ctx.storage.get(`job:${auto.jobId}`), undefined, "the automatic job is gone");
   assert.equal(((await obj.ctx.storage.get("outbox")) ?? []).some((x) => x.type === "dispatch" && x.jobId === auto.jobId), false);
 });
+
+test("auto-pause: a retried completion counts its job once and says why reviews paused, once", async () => {
+  const m = makeWith({ AUTO_PAUSE_AFTER: "2" });
+  const a = await m.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(m.obj);
+  await m.obj.claim({ jobId: a.jobId, runId: "1" });
+  const ack = m.obj.queueAck.bind(m.obj);
+  let fail = true;
+  m.obj.queueAck = async (...x) => { if (fail) { fail = false; throw new Error("boom"); } return ack(...x); };
+  await assert.rejects(m.obj.complete({ jobId: a.jobId, runId: "1", reviewedSha: "c".repeat(40) }));
+  await m.obj.complete({ jobId: a.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  assert.equal((await m.storage.get("state")).autoReviewed, 1, "one job, one count");
+  assert.equal((await m.storage.get("state")).paused, false, "one review is not the limit of two");
+
+  // At the limit: the failure comes after the pause is stored; the retry still
+  // leaves one notice and one count.
+  const n = makeWith({ AUTO_PAUSE_AFTER: "1" });
+  const j = await n.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(n.obj);
+  await n.obj.claim({ jobId: j.jobId, runId: "1" });
+  const ack2 = n.obj.queueAck.bind(n.obj);
+  let fail2 = true;
+  n.obj.queueAck = async (...x) => { if (fail2) { fail2 = false; throw new Error("boom"); } return ack2(...x); };
+  await assert.rejects(n.obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) }));
+  await n.obj.complete({ jobId: j.jobId, runId: "1", reviewedSha: "c".repeat(40) });
+  await drain(n.obj);
+  assert.equal((await n.storage.get("state")).autoReviewed, 1);
+  assert.equal(n.fx.calls.filter((c) => c[0] === "comment" && /paused/i.test(c[3])).length, 1, "the notice, once");
+});
+
+test("a base pattern with many stars is matched without runaway backtracking", async () => {
+  const { obj } = makeWith({ BASE_BRANCHES: "*a*a*a*a*a*a*a*a*b" });
+  const t = Date.now();
+  const r = await obj.onEvent({ delivery: "1", ev: review({ baseRef: "a".repeat(250) }) });
+  assert.equal(r.action, "base_branch_skipped");
+  assert.ok(Date.now() - t < 1000);
+});
