@@ -216,7 +216,7 @@ Source is in `worker/src`, as plain ES modules with no dependencies and no build
 | Name | `tankster-ai-review` |
 | URL | https://tankster-ai-review.rishi-tank.workers.dev |
 | Bindings | `AI` (Workers AI); `LEDGER` (KV `ai-review-ledger`: daily spend, reviewed commits for 30 days, and used token ids until they expire); `PR_STATE` (Durable Object class `PrState`, SQLite-backed: one per pull request); `APP_SECRETS` (Durable Object class `AppSecrets`: the GitHub App's credentials, from the manifest flow) |
-| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `REVIEW_MODE`, `BATCH_CHARS`, `MAX_PR_CHARS`, `DRAFT_CHAIN`, `VERIFY_CHAIN`, `ESCALATE_CHAIN`, `VERIFY_FALLBACK`, `REVIEW_PROFILE`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) `VERIFY_BUDGET_MS` (verification's time limit, 150,000 ms by default) and `REVIEW_DEADLINE_MS` (the whole review's, 270,000 ms) |
+| Settings | `OWNER_ID`, `AUDIENCE`, `WORKFLOW_REFS`, `RUNNER_REFS`, `REVIEW_MODE`, `BATCH_CHARS`, `MAX_PR_CHARS`, `DRAFT_CHAIN`, `VERIFY_CHAIN`, `ESCALATE_CHAIN`, `VERIFY_FALLBACK`, `REVIEW_PROFILE`, `MODEL`, `REASONING_EFFORT`, `DAILY_NEURON_CAP`, `ANTHROPIC_DAILY_USD_CAP`, `MAX_DIFF_CHARS`, `MAX_OUTPUT_TOKENS` (see `worker/wrangler.jsonc`); optionally `BASE_BRANCHES` and `AUTO_PAUSE_AFTER` (below), `REVIEW_DEBOUNCE_S` and `REVIEW_DEBOUNCE_MAX_S` (v2's quiet period after a push, 180 and 900 seconds by default) `VERIFY_BUDGET_MS` (verification's time limit, 150,000 ms by default) and `REVIEW_DEADLINE_MS` (the whole review's, 270,000 ms) |
 | Secrets | None needed. Optional: `GEMINI_API_KEY` and `ANTHROPIC_API_KEY` add those providers (see below); `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `GITHUB_APP_SLUG` override the stored App |
 
 `GET /healthz` shows today's neuron spend and each provider: whether it is set up and, if it is out of quota, until when. It never shows a key.
@@ -257,7 +257,6 @@ Deploy only what is on `main`.
   - Add the Durable Object bindings `{type: "durable_object_namespace", name: "PR_STATE", class_name: "PrState"}` and `{type: "durable_object_namespace", name: "APP_SECRETS", class_name: "AppSecrets"}`.
   - Keep the dashboard secrets with `keep_bindings: ["secret_text"]`.
   - On the first deploy only, send the migration `migrations: {new_tag: "v1", new_sqlite_classes: ["PrState", "AppSecrets"]}`.
-
 ## Verified findings
 
 No model text reaches a review unless it has passed a deterministic grounding check and an independent model's attempt to refute it (TAN-299). That covers the comments, their suggestions and agent prompts, the body, and the findings record. Each finding passes four layers, in order:
@@ -317,6 +316,9 @@ No model text reaches a review unless it has passed a deterministic grounding ch
 | `ESCALATE_CHAIN` | `anthropic:claude-sonnet-5-5` | The second verifier critical and major findings need |
 | `VERIFY_FALLBACK` | `gemini:gemini-3.5-flash-lite,workers-ai:@cf/openai/gpt-oss-120b,workers-ai:@cf/zai-org/glm-4.7-flash` | Used only when no `VERIFY_CHAIN` provider can run |
 | `REVIEW_PROFILE` | `chill` | `chill`, `assertive` or `quiet` (above) |
+| *(merge queue)* | — | Subscribe the App to the `merge_group` event (App settings, Subscribe to events; new Apps made by the setup flow already are). Its queue commit then passes at once, as the PR was reviewed before it joined. |
+| `BASE_BRANCHES` | empty (every base branch) | Comma-separated names or `*` patterns (`main, release/*`). A PR into any other branch is not reviewed automatically: its status passes, saying so; `@… review` still works. Leave it empty where the status is required |
+| `AUTO_PAUSE_AFTER` | `0` (never) | CodeRabbit's auto-pause: after this many automatically reviewed commits, reviews pause with a notice until `@… resume` (CodeRabbit's default is 5). Reviews asked for by hand do not count. Leave it at 0 where the status is required, or a paused PR's new commits wait for someone to resume |
 | `VERIFY_BUDGET_MS` | `150000` | Verification's time limit, in milliseconds from the review's start |
 | `REVIEW_DEADLINE_MS` | `270000` | The whole review's time limit, in milliseconds; drafting stops a minute before it |
 | `VERIFY` | unset | `off` confirms every finding unchecked. For tests and emergencies only: `wrangler.jsonc` never sets it, and the footer says when it is off |
@@ -328,6 +330,19 @@ These are Worker settings for now; a per-repository key (`reviews.profile` in `.
 - **Verifying:** a file's findings take about 6,000–8,000 input tokens and a few hundred output on Haiku, about $0.001. The one escalation call to Sonnet costs about $0.02.
 - **A typical review:** 6–8 findings, 2 of them escalated, comes to about $0.03–0.05, paid from the plan's monthly API credit, in at most 5 verifier calls.
 - **Limits:** `ANTHROPIC_DAILY_USD_CAP` ($5) bounds any one day. Past it, the free fallback verifiers take over. Workers AI verification counts against `DAILY_NEURON_CAP` like drafting.
+
+## Review context
+
+A model shown only a diff cannot tell a missing check from one that sits a few lines above the hunk, in the caller, or in the project's own rules. So each batch is shown, as read-only data beside its diff:
+
+- **Guidelines:** `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md` and `.claude/rules/*.md`, read from the pull request's *base* commit, so a pull request cannot rewrite the rules it is judged by.
+- **Changed files, after the change, with line numbers:** whole when they fit, otherwise the parts around the diff.
+- **Related tests:** the test files that belong to a changed file, found by name.
+- **Callers:** where a changed exported name is used elsewhere (GitHub code search of the default branch).
+
+The verifier sees the same context as the drafter, so a finding that the surrounding code answers is dropped rather than posted. Everything is fenced as data (the model is told never to follow it), files that are secrets by name (`.env`, keys, credentials) are never read, and anything shaped like a credential is blanked before it is sent.
+
+`CONTEXT_CHARS` (default 36,000) caps what one batch carries, a quarter of it at most for the guidelines; `CONTEXT=off` sends the diff alone. Context costs no extra model calls, only a few GitHub reads within the step's subrequest budget, and a read GitHub refuses is noted in the review's summary and skipped, so the review still runs on what was read.
 
 ## Limits worth knowing
 
@@ -363,6 +378,7 @@ This runs the following, against stand-ins:
 - webhook signatures and normalisation;
 - the PR Durable Object, including outbox retries, rate limits and job claims;
 - full coverage: batching and splitting (`coverage.test.js`), the line diff (`linediff.test.js`, against random edits), the review in steps (`review-run.test.js`: PR #9's shape at 100%, quota hand-over, waiting only when everything is out, files without a patch, the 50-subrequest bound, incremental reviews) and the PR object running it (`worker-mode.test.js`, including a PR closed mid-step);
+- review context: what is read and what is never read, redaction, the budget and the fencing (`context.test.js`);
 - the GitHub side effects;
 - the workflows' own `github-script` steps, exactly as written in `review.yml`, `release-v1.yml` and `runner.yml`.
 
