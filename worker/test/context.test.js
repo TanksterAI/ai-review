@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   CONTEXT_CHARS, MAX_GUIDE_FILES, batchContext, callerHits, changedSymbols, contextLine, excerpt, globToRegExp, guideText,
-  indexTests, isSecretPath, isTestPath, parseTree, pickGuidelines, redact, ruleScope, testsFor,
+  indexTests, isSecretPath, isTestPath, parseTree, pickGuidelines, redact, ruleScope, testsFor, wellFormed,
 } from "../src/context.js";
 import { buildPrompt } from "../src/review.js";
 import { verifierPrompt } from "../src/verify.js";
@@ -229,4 +229,59 @@ test("contextLine says what the models saw, or that they saw the diff only", () 
   assert.equal(contextLine({ off: true }), "- Context: off; models saw the diff only.");
   assert.equal(contextLine({ guidelines: 2, files: 5, tests: 1, callers: 2, notes: [] }), "- Context: 2 guideline files, 5 changed files beyond the diff, 1 test file, uses of 2 changed names.");
   assert.equal(contextLine({ guidelines: 0, files: 0, tests: 0, callers: 0, notes: ["the file list could not be read (GitHub 403)"] }), "- Context: none found (the file list could not be read (GitHub 403)).");
+});
+
+test("redact blanks prefixed names, JSON keys, bare values, URL passwords and bearer tokens", () => {
+  const cases = [
+    ['const DB_PASSWORD = "hunter2hunter2";', "hunter2hunter2"],
+    ['AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"', "wJalrXUtnFEMI"],
+    ['{"password": "hunter2hunter2"}', "hunter2hunter2"],
+    ["password: hunter2hunter2", "hunter2hunter2"],
+    ["API_KEY=abcdef1234567890abcd", "abcdef1234567890abcd"],
+    ["postgres://user:p4ssw0rd@host/db", "p4ssw0rd"],
+    ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", "abcdefghijklmnopqrstuvwxyz123456"],
+    [`const k = "sk_live_${"A1b2".repeat(6)}";`, "sk_live_A1b2"],
+  ];
+  for (const [text, secret] of cases) assert.ok(!redact(text).includes(secret), `${secret} was left in ${text}`);
+  // Code that only names a credential is left as it is.
+  for (const keep of ["token: string", "const token = getTokenFromRequest", "const answer = compute(42);", "https://example.com/docs"]) assert.equal(redact(keep), keep);
+  assert.equal(redact('const DB_PASSWORD = "hunter2hunter2";'), 'const DB_PASSWORD = "[redacted]";');
+});
+
+test("isSecretPath covers the usual secret files and leaves source files alone", () => {
+  for (const p of [".envrc", ".env.local", "config/prod.env", ".dev.vars", "k.p8", "service-account.json", "serviceAccountKey.json", "terraform.tfstate", "a.tfvars", ".htpasswd", "kubeconfig", "secrets/prod.json", "a.pkcs12", ".aws/credentials", "id_rsa", "deploy/KEY.PEM"]) {
+    assert.equal(isSecretPath(p), true, p);
+  }
+  for (const p of ["src/credentials.ts", "src/environment.ts", "README.md", "src/secret-santa.js", "docs/keys.md", "worker/src/context.js"]) assert.equal(isSecretPath(p), false, p);
+});
+
+test("a rule scoped with a brace glob applies to the files it names", () => {
+  const re = globToRegExp("src/**/*.{ts,tsx}");
+  assert.ok(re.test("src/a/b.ts") && re.test("src/b.tsx") && !re.test("src/b.js"));
+  const text = "---\npaths:\n  - \"src/**/*.{ts,tsx}\"\n---\nUse strict types.";
+  const scope = ruleScope(text);
+  assert.ok(guideText([{ path: ".claude/rules/ts.md", dir: "", scope, text }], ["src/a/b.ts"], 5000).includes("Use strict types"));
+  assert.equal(guideText([{ path: ".claude/rules/ts.md", dir: "", scope, text }], ["src/a/b.py"], 5000), "");
+});
+
+test("a changed name too long to search for is not picked, so the callers step cannot fail on it", () => {
+  const long = "x".repeat(100);
+  const patch = `+export function ${long}() {}\n+def test_${"y".repeat(159)}(client):\n+export function okName() {}`;
+  assert.deepEqual(changedSymbols(patch), ["okName"]);
+});
+
+test("a note with a path the author chose cannot ping, link or reference from the review", () => {
+  const line = contextLine({ notes: ["@octocat/docs/[x](http://evil.example)#12.md is too large to read whole", "a`b``c.md could not be read"] });
+  assert.equal(contextLine({ notes: ["docs/a b.md is too large to read whole"] }), "- Context: none found (docs/a b.md is too large to read whole).");
+  assert.match(contextLine({ notes: ["www.evil.example/x.md could not be read"] }), /\(` www\.evil\.example\/x\.md could not be read `\)\.$/);
+  assert.match(line, /\(` @octocat\/docs\/\[x\]\(http:\/\/evil\.example\)#12\.md is too large to read whole `; ``` a`b``c\.md could not be read ```\)\.$/);
+});
+
+test("text cut through a surrogate pair is made well-formed before it is sent", () => {
+  assert.equal(wellFormed("a\ud83d"), "a�");
+  assert.equal(wellFormed("\ude00b"), "�b");
+  assert.equal(wellFormed("ok 😀"), "ok 😀");
+  const line = `${"a".repeat(399)}😀 tail`;
+  const out = batchContext({ files: new Map([["a.js", line]]) }, { included: ["a.js"], shown: new Map([["a.js", [1]]]) }, 5000);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(out.text), "a lone high surrogate was left");
 });
