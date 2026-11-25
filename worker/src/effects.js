@@ -179,6 +179,24 @@ export function createEffects(env, deps = {}) {
       }
     },
 
+    // Every file of a commit (a tree, recursive), for the review's context.
+    // GitHub cuts a very large tree and says so (truncated).
+    async tree(repoFull, sha) {
+      const name = nameOf(repoFull);
+      if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error("not a commit id");
+      return app.call("GET", `/repos/${ORG}/${name}/git/trees/${sha}?recursive=1`, { token: await app.installationToken([name], READ_SCOPE) });
+    },
+
+    // Where a name is used in the repository (code search of its default
+    // branch), with the matching fragments. Needs no more than contents:read.
+    async searchCode(repoFull, symbol) {
+      const name = nameOf(repoFull);
+      if (!/^[A-Za-z_$][\w$]{2,79}$/.test(String(symbol))) throw new Error("not a name to search for");
+      const q = encodeURIComponent(`"${symbol}" repo:${ORG}/${name}`);
+      const out = await app.call("GET", `/search/code?q=${q}&per_page=10`, { token: await app.installationToken([name], READ_SCOPE), accept: "application/vnd.github.text-match+json" });
+      return Array.isArray(out?.items) ? out.items : [];
+    },
+
     // The commit status the merge gate reads (needs the App's statuses:write).
     // state: pending, success, failure or error. Returns false when the App
     // does not have that permission yet, rather than failing the review.
