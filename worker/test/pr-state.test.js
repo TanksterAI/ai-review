@@ -1979,3 +1979,64 @@ test("review fixes 7: a gate reset that setStatus reports as not written stays q
   assert.ok(!left.some((x) => x.type === "status"));
   assert.ok(left.some((x) => x.type === "comment" && x.template === "gave_up" && /not reviewed/.test(x.reason)), JSON.stringify(left));
 });
+
+function makeWith(envOver) {
+  const storage = memoryStorage();
+  const fx = fakeEffects({ writers: ["rishitank"] });
+  const obj = new PrState(doCtx(storage), { ...RUNNER, ...envOver }, { now: () => NOW, effects: fx });
+  return { obj, storage, fx };
+}
+
+test("auto-pause: off unless set; once set, the Nth automatic review pauses the PR with a notice", async () => {
+  const sha = (c) => c.repeat(40);
+  // Off by default: five reviews and it is still not paused.
+  const off = makeWith({});
+  const o1 = await off.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(off.obj);
+  for (let i = 0; i < 5; i++) {
+    const j = i === 0 ? o1.jobId : (await off.obj.onEvent({ delivery: `x${i}`, ev: command("@tankster-ai-review review") }), null);
+    if (j) { await off.obj.claim({ jobId: j, runId: "1" }); await off.obj.complete({ jobId: j, runId: "1", reviewedSha: sha("c") }); }
+  }
+  assert.equal((await off.storage.get("state")).paused, false);
+
+  // AUTO_PAUSE_AFTER=1: the opening review is the first, so it pauses.
+  const on = makeWith({ AUTO_PAUSE_AFTER: "1" });
+  const first = await on.obj.onEvent({ delivery: "1", ev: review() });
+  await drain(on.obj);
+  await on.obj.claim({ jobId: first.jobId, runId: "1" });
+  await on.obj.complete({ jobId: first.jobId, runId: "1", reviewedSha: sha("c") });
+  await drain(on.obj);
+  assert.equal((await on.storage.get("state")).paused, true);
+  const note = on.fx.calls.filter((c) => c[0] === "comment").at(-1)[3];
+  assert.match(note, /paused/i);
+  assert.match(note, /1 reviewed commit/);
+  assert.match(note, /@tankster-ai-review resume/);
+  assert.equal((await on.obj.onEvent({ delivery: "2", ev: review({ action: "synchronize" }) })).action, "paused");
+  // resume starts the count again.
+  await on.obj.onEvent({ delivery: "3", ev: command("@tankster-ai-review resume") });
+  await drain(on.obj);
+  const st = await on.storage.get("state");
+  assert.equal(st.paused, false);
+  assert.equal(st.autoReviewed ?? 0, 0);
+});
+
+test("base branches: a PR into another branch is not reviewed automatically, and says so in its status", async () => {
+  const { obj, fx, storage } = makeWith({ BASE_BRANCHES: "main, release/*" });
+  const skipped = await obj.onEvent({ delivery: "1", ev: review({ baseRef: "feature/x" }) });
+  assert.equal(skipped.action, "base_branch_skipped");
+  await drain(obj);
+  const s = fx.calls.find((c) => c[0] === "setStatus");
+  assert.deepEqual([s[2], s[3]], ["a".repeat(40), "success"]);
+  assert.match(s[4], /feature\/x/);
+  assert.ok(!fx.calls.some((c) => c[0] === "dispatch"));
+  // Listed branches, and patterns, are reviewed.
+  for (const [i, baseRef] of ["main", "release/1.2"].entries()) {
+    const m = makeWith({ BASE_BRANCHES: "main, release/*" });
+    const r = await m.obj.onEvent({ delivery: `${i}`, ev: review({ baseRef }) });
+    assert.equal(r.action, "job", baseRef);
+  }
+  // Not set: every base is reviewed (our status is required org-wide).
+  const all = makeWith({});
+  assert.equal((await all.obj.onEvent({ delivery: "1", ev: review({ baseRef: "anything" }) })).action, "job");
+  assert.ok(storage);
+});

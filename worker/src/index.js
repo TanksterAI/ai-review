@@ -306,7 +306,7 @@ function jobStub(env, jobId) {
 
 // POST /v1/github/webhook: verify, describe, hand to the PR's Durable Object,
 // acknowledge. All work happens later, in the object's alarm.
-export async function handleWebhook(request, env) {
+export async function handleWebhook(request, env, deps = {}) {
   const app = await appConfig(env);
   if (!app?.webhookSecret) return json(503, { status: "unavailable", reason: "the GitHub App is not set up yet" });
   const len = Number(request.headers.get("content-length") || 0);
@@ -327,6 +327,12 @@ export async function handleWebhook(request, env) {
   }
   const ev = normalise(event, payload, { ownerId: env.OWNER_ID, slug: app.slug });
   if (!ev) return json(202, { status: "ignored" });
+  if (ev.kind === "merge_group") {
+    const fx = deps.effects ?? createEffects(env, { config: app });
+    const ok = await fx.setStatus(ev.repo.full, ev.sha, "success", "Reviewed before it joined the merge queue.");
+    log({ ev: "webhook", event, kind: ev.kind, repository: ev.repo.full, passed: ok !== false });
+    return json(202, { status: "accepted", action: ok === false ? "no-permission" : "passed" });
+  }
   const out = await askPr(env, prKey(ev.repo.full, ev.pr), { op: "event", delivery, ev });
   log({ ev: "webhook", event, kind: ev.kind, repository: ev.repo.full, pr: ev.pr, action: out.action });
   return json(202, { status: "accepted", action: out.action });

@@ -185,6 +185,21 @@ export function needsApproval(slug = DEFAULT_SLUG) {
 // GitHub keeps 140 characters of a description.
 const ACTIONS_BOT = /^github-actions(\[bot\])?$/i;
 
+// Settings (Worker variables; per-repository configuration comes later).
+// BASE_BRANCHES: comma-separated names or patterns ("main, release/*"). Empty
+// means every base branch is reviewed, which the org's required status needs.
+export function reviewsBase(env, baseRef) {
+  const list = String(env?.BASE_BRANCHES ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (!list.length || !baseRef) return true;
+  return list.some((pat) => new RegExp(`^${pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(baseRef));
+}
+// AUTO_PAUSE_AFTER: pause automatic reviews after this many reviewed commits
+// (CodeRabbit's default is 5; ours is 0, never, because our status is required).
+export function autoPauseAfter(env) {
+  const n = Number.parseInt(String(env?.AUTO_PAUSE_AFTER ?? ""), 10);
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
 export function waitingStatus(slug = DEFAULT_SLUG) {
   return `Waiting: someone with write access must comment @${slug} review`;
 }
@@ -433,6 +448,14 @@ export class PrState {
         return this.save(st, { action: "draft" });
       }
       if (st.paused) return this.save(st, { action: "paused" });
+      // A base branch outside BASE_BRANCHES is not reviewed automatically. Its
+      // status passes, saying why, so the required check does not wait forever;
+      // a review asked for by hand still runs.
+      if (!reviewsBase(this.env, ev.baseRef)) {
+        await this.ctx.storage.delete("debounce");
+        if (ev.head?.sha) await this.outbox({ type: "status", sha: ev.head.sha, state: "success", description: `Not reviewed automatically: base branch ${ev.baseRef} is not in the reviewed branches.` });
+        return this.save(st, { action: "base_branch_skipped" });
+      }
       const opening = ["opened", "reopened", "ready_for_review"].includes(ev.action);
       // Forks wait for a writer, with a note and a pending status (the merge
       // gate requires one), whoever opened them: a bot included.
@@ -729,6 +752,8 @@ export class PrState {
       // Re-checked here: several may have been queued before the first posted.
       if (item.replyTo && !(await this.mayReply(item.replyTo.login, item.replyTo.kind))) return undefined;
       const text = item.template === "needs_approval" ? needsApproval(slug)
+        : item.template === "auto_paused"
+          ? `Automatic reviews are paused after ${item.limit} reviewed commit${item.limit === 1 ? "" : "s"}. Comment \`@${slug} resume\` to start them again and review what was pushed meanwhile, or \`@${slug} review\` to review the latest commit once.`
         : item.template === "gave_up"
           ? (item.waited
             ? `The AI review of this pull request waited three days for a model provider (${item.reason}), so it has stopped trying. Comment \`@${slug} review\` to try again.`
@@ -771,6 +796,10 @@ export class PrState {
 
     if (item.type === "status") {
       if (!key || !item.sha) return undefined;
+      if (item.state && item.description) {
+        if ((await fx.setStatus(key.repo, item.sha, item.state, item.description)) === false) throw new Error("the commit status could not be written");
+        return undefined;
+      }
       if (item.waiting) {
         const written = await this.waitingFor(fx, key.repo, item.sha, slug);
         // A gate reset that did not land is retried (the item is kept), not lost.
@@ -801,6 +830,7 @@ export class PrState {
       }
       if (item.cmd === "resume") {
         st.paused = false;
+        st.autoReviewed = 0;
         await this.ctx.storage.put("state", st);
         // As CodeRabbit's: the commits pushed while paused are reviewed now.
         // Not a draft's, nor a closed PR's: those wait to be ready or reopened.
@@ -1411,9 +1441,23 @@ export class PrState {
       st.lastCompleteReviewed = reviewedSha;
       st.lastCompleteClaimedAt = at;
     }
+    // CodeRabbit's auto-pause: after N reviewed commits, reviews wait for a
+    // `resume`. Reviews asked for by hand do not count.
+    const limit = autoPauseAfter(this.env);
+    let pauseNote = null;
+    if (limit && !job.requestedBy) {
+      st.autoReviewed = (st.autoReviewed ?? 0) + 1;
+      if (st.autoReviewed >= limit && !st.paused) {
+        st.paused = true;
+        pauseNote = limit;
+      }
+    }
     // Pushes made before this run claimed its job are covered (see fireDebounce).
     if (job.claimedAt !== undefined) st.lastDoneClaimAt = Math.max(st.lastDoneClaimAt ?? -Infinity, job.claimedAt);
     await this.ctx.storage.put("state", st);
+    if (pauseNote) {
+      await this.outbox({ type: "comment", template: "auto_paused", limit: pauseNote });
+    }
     // The edit is queued before the job goes: a retry after a failure in
     // between finds the job and queues nothing twice (queueAck).
     await this.queueAck(job.ackId, actionPerformed("Review finished."));

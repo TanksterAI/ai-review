@@ -135,3 +135,16 @@ test("a body cut at 8,000 characters keeps a visible mark, so a whole-comment co
   assert.equal(parseCommand(ev.text), null);
   assert.equal(parseCommand(normalise("issue_comment", commentPayload("@tankster-ai-review approve"), { ownerId: OWNER_ID }).text), "approve");
 });
+
+test("normalise: a merge queue's checks_requested names the repository and the queued commit, nothing else", () => {
+  const repository = { full_name: "TanksterAI/x", name: "x", owner: { id: OWNER_ID } };
+  const sha = "c".repeat(40);
+  const p = { action: "checks_requested", repository, sender: { login: "rishitank", type: "User" }, merge_group: { head_sha: sha, base_ref: "refs/heads/main" } };
+  const ev = normalise("merge_group", p, { ownerId: OWNER_ID });
+  assert.equal(ev.kind, "merge_group");
+  assert.equal(ev.sha, sha);
+  assert.equal(ev.repo.full, "TanksterAI/x");
+  assert.equal(normalise("merge_group", { ...p, action: "destroyed" }, { ownerId: OWNER_ID }), null);
+  assert.equal(normalise("merge_group", { ...p, merge_group: { head_sha: "nothex" } }, { ownerId: OWNER_ID }), null);
+  assert.equal(normalise("merge_group", { ...p, repository: { ...repository, owner: { id: 1 } } }, { ownerId: OWNER_ID }), null);
+});

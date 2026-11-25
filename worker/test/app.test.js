@@ -406,3 +406,20 @@ test("webhook: a thread of the App's own resolved by hand reaches the PR's objec
   const theirs = body.replace("tankster-ai-review[bot]", "coderabbitai[bot]");
   assert.equal((await (await handleWebhook(hook(theirs, { event: "pull_request_review_thread" }), e)).json()).status, "ignored");
 });
+
+test("webhook: a merge queue's commit passes at once, with no review and no per-PR state", async () => {
+  const e = env();
+  const sha = "d".repeat(40);
+  const body = JSON.stringify({
+    action: "checks_requested",
+    repository: { full_name: "TanksterAI/browser-relay", name: "browser-relay", owner: { id: 259206056 } },
+    sender: { login: "rishitank", type: "User" },
+    merge_group: { head_sha: sha, base_ref: "refs/heads/main" },
+  });
+  const res = await handleWebhook(hook(body, { event: "merge_group" }), e, { effects: e.fx });
+  assert.equal(res.status, 202);
+  assert.equal(e.PR_STATE.objects.size, 0);
+  const call = e.fx.calls.find((c) => c[0] === "setStatus");
+  assert.deepEqual([call[1], call[2], call[3]], ["TanksterAI/browser-relay", sha, "success"]);
+  assert.match(call[4], /merge queue/i);
+});

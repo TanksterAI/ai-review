@@ -29,10 +29,19 @@ export const ZWSP = String.fromCharCode(0x200b);
 // Files that are generated, vendored or lockfiles: noise for a reviewer and
 // expensive in tokens.
 export const SKIP = [
-  /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|go\.sum|flake\.lock)$/,
+  /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|bun\.lockb?|go\.sum)$/,
+  // Any other lockfile, as CodeRabbit skips them.
+  /\.lock$/,
   /\.min\.(js|css|mjs)$/,
+  // Bundles with a content hash in the name, such as app.3f9a1c7e.js.
+  /\.[0-9a-f]{8,}\.(js|css|mjs)$/,
   /\.map$/,
-  /(^|\/)(dist|build|vendor|node_modules|coverage|\.next|out)\//,
+  // build/, vendor/, coverage/ and out/ are reviewed, as CodeRabbit does.
+  /(^|\/)(dist|node_modules|\.next)\//,
+  // Generated folders, small tables and logs. SVG is still reviewed, unlike
+  // CodeRabbit: an SVG can carry script.
+  /(^|\/)(gen|generated)\//,
+  /\.(csv|log)$/i,
   /(^|\/)__snapshots__\//,
   /\.snap$/,
   /(\.pb\.go|_pb2\.pyi?|\.generated\.\w+)$/,
