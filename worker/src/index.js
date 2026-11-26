@@ -37,6 +37,7 @@ import { objectOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
 import { handleMcp } from "./mcp.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
+import { report } from "./report.js";
 
 export { PrState } from "./pr-state.js";
 export { placeComments, titleLine } from "./review.js";
@@ -448,34 +449,46 @@ export async function handleRunnerReview(request, env, deps = {}) {
 }
 
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.pathname === "/healthz" && request.method === "GET") {
-      const cfg = config(env);
-      const now = () => Date.now();
-      const spent = await createLedger(env.LEDGER).spent();
-      // Which providers are set up and which are out of quota; never a key.
-      const providers = [];
-      for (const p of createProviders(env, cfg, draftChain(env, cfg), { now, sleep: async () => {}, fetch: () => Promise.reject(new Error("no calls")), log })) {
-        const until = p.configured ? await p.exhausted() : null;
-        providers.push({ id: p.id, configured: p.configured, exhausted_until: until ? new Date(until).toISOString() : null });
-      }
-      const lead = draftChain(env, cfg).find((x) => providers.find((p) => p.id === `${x.kind}:${x.model}`)?.configured);
-      return json(200, { ok: true, model: lead?.model ?? cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) }, providers });
+  async fetch(request, env, ctx) {
+    try {
+      return await route(request, env);
+    } catch (e) {
+      // What broke, never what it said (report.js); the runtime still sees the error.
+      const sent = report(env, e, "fetch");
+      if (ctx?.waitUntil) ctx.waitUntil(sent);
+      else await sent;
+      throw e;
     }
-    if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
-    if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
-    if (url.pathname === "/v1/setup/github-app/callback" && request.method === "GET") return handleSetupCallback(request, env);
-    if (url.pathname === "/mcp") {
-      const app = await appConfig(env);
-      return handleMcp(request, env, { fetch: (...a) => fetch(...a), slug: app?.slug, ask: (repo, pr, msg) => askPr(env, prKey(repo, pr), msg) });
-    }
-    if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
-    if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
-    if (url.pathname === "/v1/review") {
-      if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
-      return handleReview(request, env);
-    }
-    return json(404, { status: "not_found" });
   },
 };
+
+async function route(request, env) {
+  const url = new URL(request.url);
+  if (url.pathname === "/healthz" && request.method === "GET") {
+    const cfg = config(env);
+    const now = () => Date.now();
+    const spent = await createLedger(env.LEDGER).spent();
+    // Which providers are set up and which are out of quota; never a key.
+    const providers = [];
+    for (const p of createProviders(env, cfg, draftChain(env, cfg), { now, sleep: async () => {}, fetch: () => Promise.reject(new Error("no calls")), log })) {
+      const until = p.configured ? await p.exhausted() : null;
+      providers.push({ id: p.id, configured: p.configured, exhausted_until: until ? new Date(until).toISOString() : null });
+    }
+    const lead = draftChain(env, cfg).find((x) => providers.find((p) => p.id === `${x.kind}:${x.model}`)?.configured);
+    return json(200, { ok: true, model: lead?.model ?? cfg.model, budget: { day: utcDay(), cap: cfg.cap, spent: Math.round(spent) }, providers });
+  }
+  if (url.pathname === "/v1/github/webhook" && request.method === "POST") return handleWebhook(request, env);
+  if (url.pathname === "/v1/setup/github-app" && request.method === "GET") return handleSetupStart(request, env);
+  if (url.pathname === "/v1/setup/github-app/callback" && request.method === "GET") return handleSetupCallback(request, env);
+  if (url.pathname === "/mcp") {
+    const app = await appConfig(env);
+    return handleMcp(request, env, { fetch: (...a) => fetch(...a), slug: app?.slug, ask: (repo, pr, msg) => askPr(env, prKey(repo, pr), msg) });
+  }
+  if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
+  if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
+  if (url.pathname === "/v1/review") {
+    if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
+    return handleReview(request, env);
+  }
+  return json(404, { status: "not_found" });
+}

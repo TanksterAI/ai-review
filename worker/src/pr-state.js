@@ -11,6 +11,7 @@ import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
 import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
 import { config } from "./config.js";
+import { report } from "./report.js";
 import { capacity, draftChain } from "./providers.js";
 import { findingIdOf, nitpickFinding } from "./addressed.js";
 import { parseHeader } from "./labels.js";
@@ -593,6 +594,15 @@ export class PrState {
   // throw); after MAX_ATTEMPTS it is dropped. A repeated dispatch is harmless:
   // a job can be claimed by one run only.
   async alarm() {
+    try {
+      return await this.runAlarm();
+    } catch (e) {
+      await report(this.env, e, "alarm");
+      throw e;
+    }
+  }
+
+  async runAlarm() {
     // A quiet period that is over becomes a job (and a dispatch in the outbox).
     await this.fireDebounce();
     // One step of the review in progress, if any (review-run.js). A step that

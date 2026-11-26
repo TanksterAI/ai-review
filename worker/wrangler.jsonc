@@ -6,6 +6,8 @@
   "compatibility_date": "2026-11-01",
   "workers_dev": true,
   "ai": { "binding": "AI" },
+  // The deployed version id, sent as the Sentry release (src/report.js).
+  "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "kv_namespaces": [
     // ai-review-ledger: daily neuron spend and reviewed commits.
     { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
