@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-import { createGithubApp, pemToPkcs8, GithubAppError } from "../src/github-app.js";
+import { createGithubApp, pemToPkcs8, GithubAppError, TOKEN_TIMEOUT_MS } from "../src/github-app.js";
 
 const { publicKey, privateKey } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -119,4 +119,48 @@ test("the App JWT is reused for 7 minutes, then re-signed", async () => {
   const b = await app.appJwt();
   assert.notEqual(b, a);
   verifyJwt(b);
+});
+
+// A call with a deadline is cut off when GitHub gives no answer: the abort reaches the fetcher as a signal, and the call throws an error with no status, which readers of optional context take for no answer.
+const hangs = (log) => (url, init) => new Promise((_resolve, reject) => {
+  log.push({ url, signal: init.signal });
+  init.signal?.addEventListener("abort", () => reject(init.signal.reason));
+});
+
+test("a call with timeoutMs is aborted when GitHub gives no answer, and one without has no deadline of its own", async () => {
+  const log = [];
+  const app = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: hangs(log), now: () => NOW });
+  // A timeout signal's own timer does not keep the process alive, so a timer of the test's own does, and makes a call that is never cut off fail at once and clearly.
+  let giveUp;
+  const never = new Promise((_resolve, reject) => { giveUp = setTimeout(() => reject(new Error("the call was never cut off")), 2000); });
+  const at = Date.now();
+  try {
+    await Promise.race([assert.rejects(app.call("GET", "/repos/TanksterAI/x/git/trees/abc", { token: "t", timeoutMs: 30 }), (e) => e.name === "TimeoutError" && e.status === undefined), never]);
+  } finally {
+    clearTimeout(giveUp);
+  }
+  assert.ok(Date.now() - at < 2000, "it did not wait for GitHub");
+  assert.ok(log[0].signal instanceof AbortSignal);
+  // With no timeoutMs there is no signal at all.
+  const seen = [];
+  const quick = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: async (url, init) => { seen.push(init); return Response.json({}); }, now: () => NOW });
+  await quick.call("GET", "/x", { token: "t" });
+  assert.equal(seen[0].signal, undefined);
+});
+
+test("minting a token has a deadline too, so a hung mint is cut off", async () => {
+  const seen = [];
+  const app = createGithubApp({
+    appId: 1, privateKeyPem: privateKey, now: () => NOW,
+    fetcher: async (url, init) => {
+      seen.push({ url, signal: init.signal });
+      if (url.endsWith("/orgs/TanksterAI/installation")) return Response.json({ id: 77 });
+      return Response.json({ token: "ghs_1", expires_at: new Date(NOW + 3600_000).toISOString() }, { status: 201 });
+    },
+  });
+  await app.installationToken(["x"], { contents: "read" });
+  // Both calls of a mint (finding the installation, then the token) carry a signal that is not yet aborted.
+  assert.equal(seen.length, 2);
+  for (const c of seen) { assert.ok(c.signal instanceof AbortSignal, c.url); assert.equal(c.signal.aborted, false); }
+  assert.ok(TOKEN_TIMEOUT_MS > 0 && TOKEN_TIMEOUT_MS <= 60_000);
 });
