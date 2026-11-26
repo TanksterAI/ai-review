@@ -336,6 +336,19 @@ These are Worker settings for now; a per-repository key (`reviews.profile` in `.
 - **A typical review:** 6–8 findings, 2 of them escalated, comes to about $0.03–0.05, paid from the plan's monthly API credit, in at most 5 verifier calls.
 - **Limits:** `ANTHROPIC_DAILY_USD_CAP` ($5) bounds any one day. Past it, the free fallback verifiers take over. Workers AI verification counts against `DAILY_NEURON_CAP` like drafting.
 
+## Review context
+
+A model shown only a diff cannot tell a missing check from one that sits a few lines above the hunk, in the caller, or in the project's own rules. So each batch is shown, as read-only data beside its diff:
+
+- **Guidelines:** `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md` and `.claude/rules/*.md`, read from the pull request's *base* commit, so a pull request cannot rewrite the rules it is judged by.
+- **Changed files, after the change, with line numbers:** whole when they fit, otherwise the parts around the diff.
+- **Related tests:** the test files that belong to a changed file, found by name.
+- **Callers:** where a changed exported name is used elsewhere (GitHub code search of the default branch).
+
+The verifier sees the same guidelines as the drafter and, for the file a finding is about, that file's context (the file, its tests and its callers), so a finding that the surrounding code answers is dropped rather than posted. It is not given the other files' context: each verifier call is paid for out of small free quotas. Everything is fenced as data (the model is told never to follow it). Files that are secrets by name (`.env*`, `.dev.vars`, keys and certificates, `credentials`, Terraform state and variables, service-account files, anything under a `secrets/` folder) are never read, and the common forms of a credential (private keys, cloud and API tokens, `password = "…"` style assignments with any prefix, URL passwords, bearer tokens) are blanked before it is sent. That blanking is a safety net, not a guarantee: keep secrets out of the repository.
+
+`CONTEXT_CHARS` (default 36,000) caps what one batch carries, a quarter of it at most for the guidelines; `CONTEXT=off` sends the diff alone. A `.claude/rules` file may scope its rule with `paths:` or `globs:`; a scope with more than three runs of `*`, or with runs of `*` and brace alternatives past a small total, applies to every file, and a path over 200 characters matches no scope. The review's About block says what the models were shown, and when something was read but none of it fit the allowance. Context costs no extra model calls, only a few GitHub reads within the step's subrequest budget, and a read GitHub refuses is noted in the review's summary and skipped, and one that gets no answer at all is tried once more and then skipped the same way, so the review still runs on what was read.
+
 ## Limits worth knowing
 
 - **What it reads.** It sees the diff, not the whole repository, so it can miss problems that need wider context. The App's review (REVIEW_MODE=worker) reads every reviewable file, in batches (see "Full coverage"). The single-prompt paths (v1's `review.yml`, and REVIEW_MODE=runner) still read at most 90,000 characters of diff, 20,000 per file, and list what they did not read; they set no coverage status, so they never satisfy the merge gate.
@@ -343,7 +356,7 @@ These are Worker settings for now; a per-repository key (`reviews.profile` in `.
 - **CPU.** Workers Free allows 10 ms of CPU per request, so the single-prompt paths' workflows send at most 20,000 characters per file and 120,000 in total, and the Worker cuts each patch to the room left before it does any work on it. A Durable Object alarm has 30 s, which is why the full-coverage review runs there. The grounding gate collects the diff's words once and reads only a few lines per finding.
 - **Verification narrows errors; it cannot end them.**
   - Two models can agree on a wrong finding.
-  - The verifier sees the diff, not the whole file, so it can miss context that lies elsewhere (full files come with the Worker-side review, PR C).
+  - The verifier sees the diff, and the context of the file a finding is about (see "Review context"), not the rest of the batch's context, so it can miss context that lies elsewhere.
   - A verifier's verdict on a suggestion or a prompt is a judgement, not a test run: nothing executes the code.
 - **A review can still wait for a verifier after it has drafted.** The check before a runner is dispatched needs a drafter and a different verifier, both able to run. But a verifier can run out while the review runs, and with no verifier set up at all the check lets the review run so the fault shows. Then the review drafts, waits in the queue until a verifier resets, and drafts again when it runs.
 - **Budget accuracy.** The ledger is in KV, which is eventually consistent and not atomic. Within one review, additions go in turn on the review's own queue and the verifier's calls are checked together (see "Verified findings"). Reviews that run at the same moment can each miss the others' spend, so a burst can overshoot the cap by several reviews. The check reserves each review's whole output allowance, which absorbs some of that. Past the cap, Cloudflare's own 10,000-neuron limit stops everything, never bills, and becomes a deferral. Replay protection is also only as strong as KV: a simultaneous replay is not stopped, but the cap bounds what it can cost.
@@ -370,6 +383,7 @@ This runs the following, against stand-ins:
 - webhook signatures and normalisation;
 - the PR Durable Object, including outbox retries, rate limits and job claims;
 - full coverage: batching and splitting (`coverage.test.js`), the line diff (`linediff.test.js`, against random edits), the review in steps (`review-run.test.js`: PR #9's shape at 100%, quota hand-over, waiting only when everything is out, files without a patch, the 50-subrequest bound, incremental reviews) and the PR object running it (`worker-mode.test.js`, including a PR closed mid-step);
+- review context: what is read and what is never read, redaction, the budget and the fencing (`context.test.js`);
 - the GitHub side effects;
 - the workflows' own `github-script` steps, exactly as written in `review.yml`, `release-v1.yml` and `runner.yml`.
 

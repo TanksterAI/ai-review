@@ -26,6 +26,8 @@ function world({ files, head = sha("a") } = {}) {
     async compare(_r, base, headSha) { calls.push(["compare", base, headSha]); return state.compare?.(base, headSha) ?? { status: "diverged", merge_base_commit: { sha: sha("c") }, files: [] }; },
     async blob() { return null; },
     async fileSha() { return null; },
+    async tree() { return { tree: [] }; },
+    async searchCode() { return []; },
     async setStatus(_r, s, st, d) { fx.statuses.push({ sha: s, state: st, description: d }); return true; },
     async postReview(_r, _p, review) { fx.posted.push(review); return { inline: review.comments.length }; },
     summaries: [],

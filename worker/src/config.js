@@ -14,6 +14,10 @@ export function config(env) {
     // covered (and the commit status fails) rather than reviewed.
     maxPrChars: num(env.MAX_PR_CHARS, 5_000_000),
     maxOutput: num(env.MAX_OUTPUT_TOKENS, 12_000),
+    // Context beside each batch's diff (context.js): the project's guidelines,
+    // the changed files whole, their tests and callers. At most this many
+    // characters a batch; CONTEXT=off sends the diff alone.
+    contextChars: String(env.CONTEXT ?? "").toLowerCase() === "off" ? 0 : num(env.CONTEXT_CHARS, 36_000),
     // The whole review's time limit, drafting and verifying (milliseconds).
     reviewDeadlineMs: num(env.REVIEW_DEADLINE_MS, 270_000),
     // Where confirmed findings go: chill, assertive or quiet. Findings that

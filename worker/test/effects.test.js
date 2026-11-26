@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { commentIdOf, createEffects, MARKER } from "../src/effects.js";
+import { READ_TIMEOUT_MS, commentIdOf, createEffects, MARKER } from "../src/effects.js";
 
 function fakeApp(respond = () => ({})) {
   const log = { tokens: [], calls: [] };
@@ -316,4 +316,17 @@ test("ownThreads never returns a partial list: past its page limit it fails", as
   const app = fakeApp(() => page);
   await assert.rejects(createEffects({}, { app }).ownThreads("TanksterAI/x", 3, "tankster-ai-review"), /too many review threads/);
   assert.equal(app.log.calls.length, 20);
+});
+
+test("the context reads (file list, file text, code search) each have a deadline, and the other reads keep none of their own", async () => {
+  const app = fakeApp((m, path) => (path.includes("/git/blobs/") ? { content: btoa("hi\n"), size: 3 } : path.includes("/search/") ? { items: [] } : { tree: [] }));
+  const fx = createEffects({}, { app });
+  await fx.tree("TanksterAI/x", "a".repeat(40));
+  await fx.blob("TanksterAI/x", "b".repeat(40));
+  await fx.searchCode("TanksterAI/x", "checkToken");
+  assert.equal(app.log.calls.length, 3);
+  for (const c of app.log.calls) assert.equal(c.timeoutMs, READ_TIMEOUT_MS, c.path);
+  assert.ok(READ_TIMEOUT_MS > 0 && READ_TIMEOUT_MS <= 60_000);
+  await fx.pullRequest("TanksterAI/x", 7);
+  assert.equal(app.log.calls[3].timeoutMs, undefined);
 });

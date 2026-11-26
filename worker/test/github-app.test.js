@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, createVerify } from "node:crypto";
-import { createGithubApp, pemToPkcs8, GithubAppError } from "../src/github-app.js";
+import { createGithubApp, pemToPkcs8, GithubAppError, TOKEN_TIMEOUT_MS } from "../src/github-app.js";
 
 const { publicKey, privateKey } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
@@ -119,4 +119,83 @@ test("the App JWT is reused for 7 minutes, then re-signed", async () => {
   const b = await app.appJwt();
   assert.notEqual(b, a);
   verifyJwt(b);
+});
+
+// A call with a deadline is cut off when GitHub gives no answer: the abort reaches the fetcher as a signal, and the call throws an error with no status, which readers of optional context take for no answer.
+const hangs = (log) => (url, init) => new Promise((_resolve, reject) => {
+  log.push({ url, signal: init.signal });
+  init.signal?.addEventListener("abort", () => reject(init.signal.reason));
+});
+
+test("a call with timeoutMs is aborted when GitHub gives no answer, and one without has no deadline of its own", async () => {
+  const log = [];
+  const app = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: hangs(log), now: () => NOW });
+  // A timeout signal's own timer does not keep the process alive, so a timer of the test's own does, and makes a call that is never cut off fail at once and clearly.
+  let giveUp;
+  const never = new Promise((_resolve, reject) => { giveUp = setTimeout(() => reject(new Error("the call was never cut off")), 2000); });
+  const at = Date.now();
+  try {
+    await Promise.race([assert.rejects(app.call("GET", "/repos/TanksterAI/x/git/trees/abc", { token: "t", timeoutMs: 30 }), (e) => e.name === "TimeoutError" && e.status === undefined), never]);
+  } finally {
+    clearTimeout(giveUp);
+  }
+  assert.ok(Date.now() - at < 2000, "it did not wait for GitHub");
+  assert.ok(log[0].signal instanceof AbortSignal);
+  // With no timeoutMs there is no signal at all.
+  const seen = [];
+  const quick = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: async (url, init) => { seen.push(init); return Response.json({}); }, now: () => NOW });
+  await quick.call("GET", "/x", { token: "t" });
+  assert.equal(seen[0].signal, undefined);
+});
+
+test("minting a token has a deadline too, so a hung mint is cut off", async () => {
+  const seen = [];
+  const app = createGithubApp({
+    appId: 1, privateKeyPem: privateKey, now: () => NOW,
+    fetcher: async (url, init) => {
+      seen.push({ url, signal: init.signal });
+      if (url.endsWith("/orgs/TanksterAI/installation")) return Response.json({ id: 77 });
+      return Response.json({ token: "ghs_1", expires_at: new Date(NOW + 3600_000).toISOString() }, { status: 201 });
+    },
+  });
+  await app.installationToken(["x"], { contents: "read" });
+  // Both calls of a mint (finding the installation, then the token) carry a signal that is not yet aborted.
+  assert.equal(seen.length, 2);
+  for (const c of seen) { assert.ok(c.signal instanceof AbortSignal, c.url); assert.equal(c.signal.aborted, false); }
+  assert.ok(TOKEN_TIMEOUT_MS > 0 && TOKEN_TIMEOUT_MS <= 60_000);
+});
+
+test("a call with maxBytes reads the answer as it arrives and stops at the limit, however much more is coming", async () => {
+  const enc = new TextEncoder();
+  // A body that hands out its parts one by one, and records how many were asked for and whether it was cancelled.
+  const stream = (parts, headers = {}) => {
+    const log = { pulled: 0, cancelled: false };
+    const body = new ReadableStream({
+      pull(ctrl) { if (log.pulled >= parts.length) return ctrl.close(); ctrl.enqueue(enc.encode(parts[log.pulled++])); },
+      cancel() { log.cancelled = true; },
+    });
+    return { log, res: new Response(body, { headers }) };
+  };
+  const clientFor = (res) => createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: async () => res, now: () => NOW });
+  // Under the limit the answer is the JSON, as without a limit.
+  const small = stream(['{"a":"', "x".repeat(1000), '"}']);
+  assert.deepEqual(await clientFor(small.res).call("GET", "/x", { token: "t", maxBytes: 5000 }), { a: "x".repeat(1000) });
+  // A body of 100,000 bytes with a limit of 5,000: stopped and cancelled after a few parts, with an error marked tooLarge and no status.
+  const big = stream(['{"a":"', ...Array.from({ length: 100 }, () => "x".repeat(1000)), '"}']);
+  await assert.rejects(clientFor(big.res).call("GET", "/repos/TanksterAI/x/git/blobs/abc?q=1", { token: "t", maxBytes: 5000 }), (e) => e instanceof GithubAppError && e.tooLarge === true && e.status === undefined && !e.message.includes("?q=1"));
+  assert.equal(big.log.cancelled, true);
+  assert.ok(big.log.pulled < 20, `${big.log.pulled} parts were read of 102`);
+  // An answer that declares more than the limit is not read at all.
+  const declared = stream(['{"a":"1"}'], { "content-length": "50000000" });
+  await assert.rejects(clientFor(declared.res).call("GET", "/x", { token: "t", maxBytes: 5000 }), (e) => e.tooLarge === true);
+  assert.equal(declared.log.cancelled, true);
+  assert.ok(declared.log.pulled <= 1);
+  // A stand-in answer with no stream is read as text and held to the same limit.
+  const plain = (text) => ({ ok: true, status: 200, headers: { get: () => null }, async text() { return text; } });
+  assert.deepEqual(await clientFor(plain('{"b":2}')).call("GET", "/x", { token: "t", maxBytes: 100 }), { b: 2 });
+  await assert.rejects(clientFor(plain(`{"b":"${"y".repeat(200)}"}`)).call("GET", "/x", { token: "t", maxBytes: 100 }), (e) => e.tooLarge === true);
+  // No limit: read whole, as before. An error status and a 204 are as before too.
+  assert.deepEqual(await clientFor(Response.json({ c: 3 })).call("GET", "/x", { token: "t" }), { c: 3 });
+  assert.equal(await clientFor(new Response(null, { status: 204 })).call("DELETE", "/x", { token: "t", maxBytes: 100 }), null);
+  await assert.rejects(clientFor(new Response("no", { status: 404 })).call("GET", "/x", { token: "t", maxBytes: 100 }), (e) => e.status === 404 && e.tooLarge === undefined);
 });

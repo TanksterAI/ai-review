@@ -35,6 +35,7 @@
 // State lives in the Durable Object's storage under run:<job id>, so a step
 // that fails (the alarm throws and is retried) repeats only itself.
 
+import { MAX_CALLER_SYMBOLS, MAX_CONTEXT_FILES, MAX_CONTEXT_FILE_CHARS, MAX_GUIDE_FILES, MAX_TESTS, GUIDE_FILE_CHARS, batchContext, callerHits, changedSymbols, contextLine, indexTests, isSecretPath, parseTree, pickGuidelines, redact, ruleScope, testsFor } from "./context.js";
 import { batchPrepared, coverageOf, onlyHidden, planReview, prLimitReason, skipReason, trimLongLines } from "./coverage.js";
 import { unifiedDiff } from "./linediff.js";
 import { createSerial, nextUtcMidnight, utcDay } from "./budget.js";
@@ -250,6 +251,7 @@ export async function stepRun(ctx, id) {
     if (run.stage === "files") return await stageFiles(counted, run, save);
     if (run.stage === "content") return await stageContent(counted, run, save);
     if (run.stage === "plan") return await stagePlan(counted, run, save);
+    if (run.stage === "context") return await stageContext(counted, run, save);
     if (run.stage === "draft") return await stageDraft(counted, run, save);
     if (run.stage === "verify") return await stageVerify(counted, run, save);
     if (run.stage === "post") return await stagePost(counted, run, save);
@@ -410,12 +412,13 @@ async function stageContent(ctx, run, save) {
     // long unchanged line is cut by trimLongLines, never taken for the file.
     const left = ctx.cfg.maxPrChars - run.patchChars;
     try {
-      const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
+      // The limit goes with the read, so a blob over it is cut off as it arrives and never held whole in memory (a tooLarge result stands for it).
+      const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha, { maxBytes: MAX_FETCH_BYTES }) : null;
       const oldPath = f.previous_filename ?? f.filename;
       const baseSha = f.status === "added" ? null : await ctx.fx.fileSha(run.repo.full, oldPath, run.mergeBase);
-      const base = baseSha ? await ctx.fx.blob(run.repo.full, baseSha) : null;
+      const base = baseSha ? await ctx.fx.blob(run.repo.full, baseSha, { maxBytes: MAX_FETCH_BYTES }) : null;
       if (!head) f.unfetched = "its new text could not be fetched";
-      else if (head.bytes.length > MAX_FETCH_BYTES || (base?.bytes.length ?? 0) > MAX_FETCH_BYTES) f.unfetched = `it is over the reviewer's limit of ${MAX_FETCH_BYTES / 1024 / 1024} MB a file`;
+      else if (head.tooLarge || base?.tooLarge || head.bytes.length > MAX_FETCH_BYTES || (base?.bytes.length ?? 0) > MAX_FETCH_BYTES) f.unfetched = `it is over the reviewer's limit of ${MAX_FETCH_BYTES / 1024 / 1024} MB a file`;
       else if (NUL(head.bytes) || (base && NUL(base.bytes))) f.binary = true;
       else {
         const dec = new TextDecoder();
@@ -494,9 +497,221 @@ async function stagePlan(ctx, run, save) {
   }
   const files_ = plan.files.length + plan.uncovered.length;
   await status(ctx, run, "pending", `Reviewing ${plural(files_, "file")} in ${passes(batches.length)}…`);
-  run.stage = "draft";
+  // The context (guidelines, whole files, tests, callers) is read first,
+  // unless it is switched off (CONTEXT=off).
+  run.stage = ctx.cfg.contextChars > 0 ? "context" : "draft";
   await save(run);
   return ctx.deps.now();
+}
+
+// --- context (context.js) --------------------------------------------------------
+//
+// Read once per run, kept under run:<id>:ctx:, and shown beside each batch's
+// diff. It is best effort: whatever GitHub will not give is named in the
+// review's About block, and the review goes on without it. Reads are counted
+// by hand (the effects do not go through the step's subrequest counter): at
+// most CONTEXT_CALLS_PER_STEP GitHub calls a step, inside Workers Free's 50.
+const CONTEXT_CALLS_PER_STEP = 36;
+// And at most this long: each read has a deadline of its own (effects.js), so a GitHub that answers nothing could otherwise take a step past the alarm's wall-clock limit. What is left is read in the next step.
+export const CONTEXT_STEP_MS = 5 * 60_000;
+const TEST_FILE_CHARS = 8_000;
+const ctxKey = (id, kind, path = "") => `${RUN}${id}:ctx:${kind}${path ? `:${path}` : ""}`;
+
+// A request that got no answer at all (a dropped connection, a timeout), as opposed to a bug of ours: only the first is skipped as optional context. A TypeError counts only when its whole message is one a runtime gives for a failed request (fetch's own, workerd's, undici's), never when it merely mentions one of those words: "fetcher is not a function" is a bug.
+const NETWORK_MESSAGE = /^(fetch failed|failed to fetch|load failed|network connection lost|the network connection was lost|networkerror when attempting to fetch resource|terminated|socket hang up|the operation (timed out|was aborted)|connection (closed|reset|refused|timed out))\.?$/i;
+const noAnswer = (e) => e?.name === "AbortError" || e?.name === "TimeoutError" || (e instanceof TypeError && NETWORK_MESSAGE.test(String(e.message).trim()));
+// Reads that may get no answer once each before the rest are skipped without a second try: each such first failure throws, and the step's own failure handling gives a run up after six in a row.
+const MAX_FIRST_FAILURES = 3;
+
+const decode = (b) => new TextDecoder().decode(b.bytes);
+const isBinary = (b) => b.bytes.subarray(0, 8000).includes(0);
+
+async function stageContext(ctx, run, save) {
+  const { storage, fx } = ctx;
+  const c = (run.context ??= { step: "tree", at: 0, notes: [], counts: { guidelines: 0, files: 0, tests: 0, callers: 0 } });
+  const note = (t) => { if (c.notes.length < 6 && !c.notes.includes(t)) c.notes.push(t); };
+  let calls = 0;
+  const began = ctx.deps.now();
+  const room = () => calls < CONTEXT_CALLS_PER_STEP && ctx.deps.now() - began < CONTEXT_STEP_MS;
+  // One read that may fail without failing the review.
+  const soft = async (what, f) => {
+    calls++;
+    try {
+      return await f();
+    } catch (e) {
+      if (typeof e?.status === "number") {
+        note(`${what} could not be read (GitHub ${e.status})`);
+        return null;
+      }
+      // Not a lost connection: a bug of ours is never skipped as if GitHub had not answered.
+      if (!noAnswer(e)) throw e;
+      // No answer from GitHub at all (the connection): the first such failure throws, so the step is tried again (the step's own failure handling keeps these marks). The same read failing again is skipped, and so is every read once a few have failed (MAX_FIRST_FAILURES), so context, which is optional, never stops a review.
+      const at = `${c.step}:${c.at}:${what}`;
+      c.failed ??= {};
+      if (c.degraded || c.failed[at] || Object.keys(c.failed).length >= MAX_FIRST_FAILURES) {
+        c.degraded = true;
+        note(`${what} could not be read (no answer from GitHub)`);
+        return null;
+      }
+      c.failed[at] = true;
+      throw e;
+    }
+  };
+
+  if (c.step === "tree") {
+    const { plan } = await loadPlan(ctx, run);
+    const paths = plan.files.map((f) => f.path);
+    const shaOf = new Map();
+    const indexOf = new Map();
+    for (let i = 0; i < run.files; i++) {
+      const m = await getMeta(storage, run.id, i);
+      if (m && paths.includes(m.filename)) { shaOf.set(m.filename, m.sha); indexOf.set(m.filename, i); }
+    }
+    const baseTree = await soft("the base commit's file list", () => fx.tree(run.repo.full, run.baseSha));
+    const headTree = await soft("the file list", () => fx.tree(run.repo.full, run.headSha));
+    if (baseTree?.truncated || headTree?.truncated) note("the repository is too large to list whole: some guidelines and tests may be missing");
+    const baseEntries = parseTree(baseTree);
+    const headEntries = parseTree(headTree);
+    const sizes = new Map(headEntries.map((e) => [e.path, e.size]));
+    c.guides = baseEntries.length ? pickGuidelines(baseEntries.filter((e) => !isSecretPath(e.path)), paths) : [];
+    const index = indexTests(headEntries);
+    c.tests = [];
+    for (const p of paths) {
+      for (const t of testsFor(index, p)) if (c.tests.length < MAX_TESTS && !c.tests.some((x) => x.path === t.path && x.forPath === p)) c.tests.push({ forPath: p, path: t.path, sha: t.sha });
+    }
+    c.files = [];
+    for (const p of paths) {
+      if (c.files.length >= MAX_CONTEXT_FILES) { note(`only the first ${MAX_CONTEXT_FILES} files were read whole`); break; }
+      if (isSecretPath(p) || !shaOf.get(p)) continue;
+      if (headEntries.length && (sizes.get(p) ?? 0) > MAX_CONTEXT_FILE_CHARS * 2) continue;
+      c.files.push({ path: p, sha: shaOf.get(p) });
+    }
+    // The names to look for elsewhere: those the first files' patches add or
+    // remove, a few in all (code search is rationed).
+    c.symbols = [];
+    for (const p of paths.slice(0, 30)) {
+      if (c.symbols.length >= MAX_CALLER_SYMBOLS) break;
+      const f = await getFile(storage, run.id, indexOf.get(p));
+      for (const s of changedSymbols(f?.patch, MAX_CALLER_SYMBOLS - c.symbols.length)) c.symbols.push({ symbol: s, forPath: p });
+    }
+    c.step = "guides";
+    c.at = 0;
+  }
+
+  if (c.step === "guides") {
+    for (; c.at < c.guides.length && room(); c.at++) {
+      const g = c.guides[c.at];
+      const b = await soft(g.path, () => fx.blob(run.repo.full, g.sha));
+      if (!b || isBinary(b)) continue;
+      const text = redact(decode(b));
+      await storage.put(ctxKey(run.id, "g", String(c.at)), { path: g.path, dir: g.dir, scope: g.path.startsWith(".claude/rules/") ? ruleScope(text) : [], text: text.length > GUIDE_FILE_CHARS ? `${text.slice(0, GUIDE_FILE_CHARS)}\n[cut: the file is longer]` : text });
+      c.counts.guidelines++;
+    }
+    if (c.at >= c.guides.length) { c.step = "files"; c.at = 0; }
+  }
+
+  if (c.step === "files") {
+    for (; c.at < c.files.length && room(); c.at++) {
+      const f = c.files[c.at];
+      // The size limit goes with the read: when the file list could not be read the size of a changed file is not known, and a blob of tens of megabytes must not be held in memory to find that out.
+      const b = await soft(f.path, () => fx.blob(run.repo.full, f.sha, { maxBytes: MAX_CONTEXT_FILE_CHARS * 4 }));
+      if (b?.tooLarge) { note(`${f.path} is too large to read whole`); continue; }
+      if (!b || isBinary(b) || b.bytes.length > MAX_CONTEXT_FILE_CHARS * 4) continue;
+      const text = redact(decode(b));
+      if (text.length > MAX_CONTEXT_FILE_CHARS) { note(`${f.path} is too large to read whole`); continue; }
+      await storage.put(ctxKey(run.id, "f", f.path), text);
+      c.counts.files++;
+    }
+    if (c.at >= c.files.length) { c.step = "tests"; c.at = 0; }
+  }
+
+  if (c.step === "tests") {
+    for (; c.at < c.tests.length && room(); c.at++) {
+      const t = c.tests[c.at];
+      const b = await soft(t.path, () => fx.blob(run.repo.full, t.sha));
+      if (!b || isBinary(b)) continue;
+      const have = (await storage.get(ctxKey(run.id, "t", t.forPath))) ?? [];
+      have.push({ path: t.path, text: redact(decode(b)).slice(0, TEST_FILE_CHARS) });
+      await storage.put(ctxKey(run.id, "t", t.forPath), have);
+      c.counts.tests++;
+    }
+    if (c.at >= c.tests.length) { c.step = "callers"; c.at = 0; }
+  }
+
+  if (c.step === "callers") {
+    // An incremental review stored only the files changed since the last reviewed commit, so the rest of the pull request's files are listed here (a page a call, kept under :ctx:e:): a caller the pull request changed in an earlier commit is not a caller "elsewhere in the repository" either. A list that cannot be read is noted and the review goes on with the files it has.
+    if (run.since && c.symbols.length) {
+      while (!c.listed && room()) {
+        c.listPage ??= 1;
+        const page = await soft(`the pull request's file list (page ${c.listPage})`, () => fx.listFiles(run.repo.full, run.pr, c.listPage));
+        if (!Array.isArray(page)) { c.listed = true; break; }
+        await storage.put(ctxKey(run.id, "e", String(c.listPage)), page.flatMap((f) => [f?.filename, f?.previous_filename]).filter((n) => typeof n === "string" && n));
+        c.listed = page.length < 100 || c.listPage >= MAX_PAGES;
+        c.listPage++;
+      }
+    }
+    // Every path the pull request changes (and the old names of renamed ones), not only the files read whole: a changed file that was not read, because only some are or it was too large, is in the diff already and is no caller "elsewhere in the repository".
+    const changed = new Set();
+    for (let i = 0; i < run.files; i++) {
+      const m = await getMeta(storage, run.id, i);
+      if (m?.filename) changed.add(m.filename);
+      if (m?.previous_filename) changed.add(m.previous_filename);
+    }
+    if (run.since) for (const names of (await storage.list({ prefix: ctxKey(run.id, "e") })).values()) for (const n of names) changed.add(n);
+    for (; c.at < c.symbols.length && room(); c.at++) {
+      const { symbol, forPath } = c.symbols[c.at];
+      const items = await soft(`the search for ${symbol}`, () => fx.searchCode(run.repo.full, symbol));
+      const hits = callerHits(items, symbol, changed);
+      if (!hits.length) continue;
+      const have = (await storage.get(ctxKey(run.id, "c", forPath))) ?? [];
+      have.push({ symbol, hits });
+      await storage.put(ctxKey(run.id, "c", forPath), have);
+      c.counts.callers++;
+    }
+    if (c.at >= c.symbols.length) c.step = "done";
+  }
+
+  if (c.step === "done") {
+    // `names`: this review's batches keep the names of what they were shown (see contextShown).
+    run.contextSummary = { ...c.counts, notes: c.notes, names: true };
+    delete c.guides; delete c.tests; delete c.files; delete c.symbols;
+    run.stage = "draft";
+  }
+  await save(run);
+  return ctx.deps.now();
+}
+
+// What the models were shown, from the names each batch kept: a guideline may be shown in several batches and a file split across batches is in each of them, so each is counted once. A run begun before batches kept their names reports what was read.
+function contextShown(run, batches) {
+  const read = run.contextSummary;
+  if (!read) return null;
+  const seen = batches.filter((b) => b.shown);
+  // A batch no model was called for (every drafter turned the prompt down) never kept its names: in a review that keeps names, nothing was shown. Only a run begun before batches kept names reports what was read.
+  if (!seen.length) return read.names ? { guidelines: 0, files: 0, tests: 0, callers: 0, unused: true, notes: read.notes } : read;
+  const count = (k) => new Set(seen.flatMap((b) => b.shown[k] ?? [])).size;
+  return {
+    guidelines: count("guidelines"), files: count("files"), tests: count("tests"), callers: count("callers"),
+    gathered: read.guidelines + read.files + read.tests + read.callers > 0, notes: read.notes,
+  };
+}
+
+// The About line for what was shown: when no batch reached a model, it says so rather than "none found".
+const contextAbout = (shown) => (shown?.unused ? "- Context: none shown; no model reviewed a batch." : contextLine(shown));
+
+// A batch's context from what the stage kept, or null when there is none.
+async function contextOf(ctx, run, prepared) {
+  if (!(ctx.cfg.contextChars > 0) || run.context?.step !== "done") return null;
+  const { storage } = ctx;
+  const data = { guidelines: [], files: new Map(), tests: new Map(), callers: new Map() };
+  for (const g of (await storage.list({ prefix: ctxKey(run.id, "g") })).values()) data.guidelines.push(g);
+  for (const p of prepared.included) {
+    const [f, t, c] = await Promise.all([storage.get(ctxKey(run.id, "f", p)), storage.get(ctxKey(run.id, "t", p)), storage.get(ctxKey(run.id, "c", p))]);
+    if (typeof f === "string") data.files.set(p, f);
+    if (t) data.tests.set(p, t);
+    if (c) data.callers.set(p, c);
+  }
+  const bc = batchContext(data, prepared, ctx.cfg.contextChars);
+  return bc.text ? bc : null;
 }
 
 async function loadPlan(ctx, run) {
@@ -556,7 +771,8 @@ async function stageDraft(ctx, run, save) {
     const mine = { left: share };
     const bctx = countSubrequests(ctx, mine);
     const prepared = batchPrepared(asPlan(plan, batches), i);
-    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag: randomTag(), pass: { index: i + 1, total: batches.length } });
+    const context = await contextOf(ctx, run, prepared);
+    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag: randomTag(), pass: { index: i + 1, total: batches.length }, context });
     const chars = instructions.length + input.length;
     const providers = createProviders(bctx.env, ctx.cfg, rotatedChain(chain, i), bctx.deps);
     const d = await draftWithChain({ providers, instructions, modelInput: input, chars, cfg: ctx.cfg, deps: bctx.deps, started, repository: run.repo.full, pr: run.pr, budget: mine });
@@ -616,6 +832,10 @@ async function stageVerify(ctx, run, save) {
   for (const [i, b] of batches.entries()) {
     if (b.status !== "drafted" || b.waitUntil > now) continue;
     const prepared = batchPrepared(full, i);
+    prepared.context = await contextOf(ctx, run, prepared);
+    // What this batch's models were shown, by name, for the review's About block (the run's own counts are what was read).
+    const seen = prepared.context?.names;
+    b.shown = { guidelines: seen?.guidelines ?? [], files: seen?.files ?? [], tests: seen?.tests ?? [], callers: seen?.callers ?? [] };
     const classified = classifyFindings({ findings: b.findings }, prepared.commentable, prepared.lineText);
     const grounded = groundFindings(classified, prepared, { title: run.title, body: run.body });
     const empty = !grounded.classified.inline.length && !grounded.classified.general.length;
@@ -719,7 +939,7 @@ async function stagePost(ctx, run, save) {
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextAbout(contextShown(run, batches)) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
