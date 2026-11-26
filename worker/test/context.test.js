@@ -313,3 +313,34 @@ test("notes: a bare issue number, a commit-like word and an empty note do not ge
   assert.match(contextLine({ notes: ["docs/_a_/b.md could not be read"] }), /\(` docs\/_a_\/b\.md could not be read `\)\.$/);
   assert.equal(contextLine({ notes: ["", "  ", "docs/a.md could not be read"] }), "- Context: none found (docs/a.md could not be read).");
 });
+
+test("redact blanks Basic credentials after an Authorization name, and leaves the word in prose and paths", () => {
+  const b64 = "dXNlcjpwYXNzd29yZA==";
+  for (const text of [`curl -H "Authorization: Basic ${b64}" https://x`, `authorization = 'basic ${b64}'`, `Authorization: Basic ${b64}`, `headers: { "Authorization": "Basic ${b64}" }`, `res.headers.set("Authorization", "Basic ${b64}")`, `Proxy-Authorization: Basic ${b64}`, "Authorization: Basic dXNlcjpwYXNzd29yZA-_"]) {
+    const out = redact(text);
+    assert.ok(!out.includes("dXNlcjpwYXNz"), `${text} -> ${out}`);
+    assert.match(out, /Basic \[redacted\]/i);
+  }
+  assert.equal(redact(`curl -H "Authorization: Basic ${b64}" https://x`), 'curl -H "Authorization: Basic [redacted]" https://x');
+  for (const keep of ["Basic setup is easy", "Basic authentication is used here", "// Basic implementation of the parser", "the Basic option", "// Basic src/components/Button2.tsx handles it", "Basic infrastructure/config1 notes", "Basic configurationManagement2024"]) assert.equal(redact(keep), keep);
+});
+
+test("redact finds a JSON Web Token of any length, even after a failed first try in the same run", () => {
+  const jwt = (n) => `eyJhbGciOiJIUzI1NiJ9.${"eyJzdWIiOiIx".repeat(n)}.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U`;
+  for (const n of [1, 50, 5000]) assert.equal(redact(`const jwt = "${jwt(n)}";`), 'const jwt = "[redacted]";');
+  assert.equal(redact(`see ${jwt(1)}.`), "see [redacted].");
+  assert.equal(redact(`see ${jwt(1)}...`), "see [redacted]...");
+  for (const keep of ["eyJ.short.x", "eyJabcdefghijk.only.two", "eyJabcdefghijk", "eyJ...", "x.eyJabcdefghijk.b.c"]) assert.equal(redact(keep), keep);
+  // A first try that fails does not hide a real token later in the same run.
+  assert.ok(!redact(`eyJfoo.${jwt(1)}`).includes("c3ViIiOiIx"), "token after a failed start was left");
+  assert.ok(!redact(`eyJ-${jwt(1)}`).includes("c3ViIiOiIx"), "token after a dash was left");
+});
+
+test("redact takes time linear in the text for runs built to make a token search start again", () => {
+  const time = (text) => { const at = process.hrtime.bigint(); redact(text); return Number(process.hrtime.bigint() - at) / 1e6; };
+  // Quadratic code takes minutes on these; linear code takes milliseconds.
+  for (const text of ["eyJabcdefghijk-".repeat(80_000), `eyJ${".".repeat(400_000)}x`, "eyJabcdefghijk.".repeat(80_000), "eyJ.".repeat(300_000), `eyJabcdefghijk${".a".repeat(300_000)}`, "Authorization: Basic ".repeat(50_000), "Basic ".repeat(100_000)]) {
+    const ms = time(text);
+    assert.ok(ms < 3000, `redact took ${ms} ms for ${text.slice(0, 30)}...`);
+  }
+});

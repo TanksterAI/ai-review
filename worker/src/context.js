@@ -66,8 +66,26 @@ const REDACT = [
   /\bwhsec_[A-Za-z0-9]{16,}\b/g,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
   /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
 ];
+// A JSON Web Token is found as one run of token characters and dots and then checked, never by a pattern that can fail part-way and start again inside the same run (that grows with the square of the run's length). Each character is read a fixed number of times, whatever the length of the run or of the token.
+const JWT_RUN = /\beyJ[A-Za-z0-9_.-]*/g;
+const redactJwts = (text) => text.replace(JWT_RUN, (run) => {
+  // Dots at the end belong to the sentence, not the token.
+  let end = run.length;
+  while (end > 0 && run.charCodeAt(end - 1) === 46) end--;
+  const dots = [];
+  for (let i = 0; i < end; i++) if (run.charCodeAt(i) === 46) dots.push(i);
+  // A token is three parts of ten or more characters (the first starting "eyJ"). It may start at the run's start or after a "." or "-" inside it (a failed first try must not hide a real token after it), and a start is judged from the positions of the next three dots alone.
+  let k = 0;
+  for (let at = 0; at >= 0 && at < end; at = run.indexOf("eyJ", at + 1)) {
+    if (at > 0 && run[at - 1] !== "." && run[at - 1] !== "-") continue;
+    while (k < dots.length && dots[k] < at) k++;
+    if (k + 1 >= dots.length) break;
+    const third = k + 2 < dots.length ? dots[k + 2] : end;
+    if (dots[k] - at >= 13 && dots[k + 1] - dots[k] > 10 && third - dots[k + 1] > 10) return `${run.slice(0, at)}[redacted]${run.slice(end)}`;
+  }
+  return run;
+});
 const KEYWORD = "(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)";
 // Every quantifier below is bounded, so the time a file takes is linear in its size however it is written.
 // A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key, `password: string`), then a quoted value.
@@ -79,17 +97,20 @@ const ASSIGNED = new RegExp(`${NAME_THEN}(${QUOTED('"')}|${QUOTED("'")}|${QUOTED
 const ASSIGNED_BARE = new RegExp(`${NAME_THEN}(?=[A-Za-z0-9+/_~=-]{0,200}\\d)(?=[A-Za-z0-9+/_~=-]{0,200}[A-Za-z])[A-Za-z0-9+/_~=-]{12,200}(?![\\w(.])`, "gi");
 const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,64}:)[^\s@]{3,200}(@)/gi;
 const BEARER = /\b(Bearer\s{1,5})[A-Za-z0-9._~+/-]{20,2000}=*/gi;
+// Basic credentials (base64 of user:password) after an Authorization name: `Authorization: Basic ...`, `Authorization = 'Basic ...'`, `set("Authorization", "Basic ...")`. The word "Basic" in prose or a path is never taken for one.
+const BASIC_HEADER = /(\bAuthorization["'`]?\s{0,5}[:=,]\s{0,5}["'`]?Basic\s{1,5})[A-Za-z0-9+/_-]{8,2000}={0,2}/gi;
 
 /** The text with the common forms of a credential blanked out (a safety net, not a guarantee). */
 export function redact(text) {
   let t = String(text ?? "");
   // A blanked block keeps its line breaks, so the line numbers shown after it stay true.
   for (const re of REDACT) t = t.replace(re, (m) => `[redacted]${"\n".repeat(m.split("\n").length - 1)}`);
-  return t
+  return redactJwts(t)
     .replace(ASSIGNED, (_m, name, value) => `${name}${value[0]}[redacted]${value[0]}`)
     .replace(ASSIGNED_BARE, "$1[redacted]")
     .replace(URL_PASSWORD, "$1[redacted]$2")
-    .replace(BEARER, "$1[redacted]");
+    .replace(BEARER, "$1[redacted]")
+    .replace(BASIC_HEADER, "$1[redacted]");
 }
 
 /** The text with any half of a surrogate pair (a cut through an emoji) replaced, so it is well-formed. */
