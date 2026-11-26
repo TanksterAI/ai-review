@@ -352,7 +352,7 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
   const paths = prepared.included ?? [];
   const guide = guideText(data.guidelines ?? [], paths, Math.min(GUIDE_CHARS, Math.floor(cap / 4)));
   const want = paths.filter((p) => data.files?.has(p) || data.tests?.get(p)?.length || data.callers?.get(p)?.length);
-  // The blank lines that join the guidelines, the blocks and the files are part of the cap too.
+  // The blank lines that join the guidelines and the files are part of the cap too: they are taken here, once.
   let room = Math.max(0, cap - guide.length - 2 * (want.length + 1));
   // Files with the least to show are served first, so one big file cannot
   // starve the small ones: each gets an equal share of what is left.
@@ -381,9 +381,13 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
     const block = parts.join("\n\n");
     if (!block) continue;
     blocks.set(p, block);
-    room -= block.length + 2;
+    room -= block.length;
     if (body?.text) { counts.files++; if (body.whole) counts.whole++; }
-    if (relatedCap > 0 && relatedShown) { counts.tests += tests.length; counts.callers += callers.filter((c) => c.hits.length).length; }
+    // Counted from what is shown: a cut can drop the later entries.
+    if (relatedShown) {
+      counts.tests += tests.filter((t) => relatedShown.includes(`#### Test: ${t.path}\n`)).length;
+      counts.callers += callers.filter((c) => c.hits.length && relatedShown.includes(`#### Uses of ${c.symbol} elsewhere in the repository\n`)).length;
+    }
   }
   counts.guidelines = guide ? (guide.match(/^## /gm) ?? []).length : 0;
   const files = new Map([...blocks].filter(([, v]) => v).map(([k, v]) => [k, wellFormed(v)]));

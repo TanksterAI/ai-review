@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, changedSymbols, excerpt, indexTests, pickGuidelines, redact, testsFor } from "../src/context.js";
+import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, changedSymbols, excerpt, indexTests, parseTree, pickGuidelines, redact, testsFor } from "../src/context.js";
 import { buildPrompt } from "../src/review.js";
 import { verifierPrompt } from "../src/verify.js";
 
@@ -44,9 +44,12 @@ test("the drafter may name an identifier that is only in the context, and only w
   assert.doesNotMatch(buildPrompt(base).instructions, /appears only in the context/);
 });
 
-test("a test whose size is unknown is not fetched, and a name over the search limit is not searched for", () => {
-  const index = indexTests([{ type: "blob", path: "test/a.test.js", sha: "4".repeat(40) }, blob("test2/a.test.js", 1, "5")].map((e) => ({ ...e, size: Number(e.size) || 0 })));
-  assert.deepEqual(testsFor(index, "src/a.js").map((e) => e.path), ["test2/a.test.js"]);
+test("a test whose size is unknown is not fetched", () => {
+  const entries = parseTree({ tree: [{ type: "blob", path: "test/a.test.js", sha: "4".repeat(40) }, { type: "blob", path: "test2/a.test.js", sha: "5".repeat(40), size: 1 }] });
+  assert.deepEqual(testsFor(indexTests(entries), "src/a.js").map((e) => e.path), ["test2/a.test.js"]);
+});
+
+test("a name over the search limit is not searched for, and one at the limit is", () => {
   const patch = (n) => `@@ -0,0 +1 @@\n+export function ${"a".repeat(n)}() {}`;
   assert.deepEqual(changedSymbols(patch(80)), ["a".repeat(80)]);
   assert.deepEqual(changedSymbols(patch(81)), []);
@@ -65,4 +68,19 @@ test("the whole context, guidelines, files, tests and callers together, never go
   // The example that went over: only a test for one file, and a cap of 3.
   const only = { tests: new Map([["a.js", [{ path: "a.test.js", text: "x" }]]]) };
   for (const cap of [0, 1, 3, 6, 7, 8, 12]) assert.ok(batchContext(only, { included: ["a.js"] }, cap).text.length <= cap, `tests only, cap ${cap}`);
+});
+
+test("the counts of tests and callers are those shown, not those found", () => {
+  const data = {
+    tests: new Map([["a.js", [{ path: "one.test.js", text: "x".repeat(400) }, { path: "two.test.js", text: "y".repeat(400) }]]]),
+    callers: new Map([["a.js", [{ symbol: "useA", hits: [{ path: "c.js", fragment: "useA();" }] }]]]),
+  };
+  const prepared = { included: ["a.js"] };
+  for (let cap = 0; cap <= 3000; cap += 7) {
+    const { text, counts } = batchContext(data, prepared, cap);
+    // A heading cut in half is not an entry: only whole headings count.
+    const tests = ["one.test.js", "two.test.js"].filter((n) => text.includes(`#### Test: ${n}\n`)).length;
+    assert.equal(counts.tests, tests, `tests at cap ${cap}`);
+    assert.equal(counts.callers, text.includes("#### Uses of useA elsewhere in the repository\n") ? 1 : 0, `callers at cap ${cap}`);
+  }
 });
