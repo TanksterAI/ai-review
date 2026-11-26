@@ -262,12 +262,24 @@ test("context: reads that each fail once and then work, one after another, do no
 });
 
 test("context: a bug of ours is not taken for a lost connection, and is not skipped", async () => {
-  for (const err of [new Error("bug"), new TypeError("x is not a function")]) {
+  // The last three are TypeErrors that only mention a word a network error has.
+  for (const err of [new Error("bug"), new TypeError("x is not a function"), new TypeError("fetcher is not a function"), new TypeError("Cannot read properties of undefined (reading 'network')"), new TypeError("connection.close is not a function")]) {
     const s = contextScenario();
     s.github.searchCode = async () => { throw err; };
     await runAll(s);
     assert.equal(s.github.posted.length, 0, err.message);
     assert.equal(s.github.statuses.at(-1).state, "error", err.message);
     assert.match(s.github.statuses.at(-1).description, /context step kept failing/);
+  }
+});
+
+test("context: the messages runtimes give for a failed request are taken for a lost connection", async () => {
+  const lost = [new TypeError("fetch failed"), new TypeError("Network connection lost."), new TypeError("Failed to fetch"), new TypeError("terminated"), new DOMException("The operation was aborted", "AbortError"), new DOMException("signal timed out", "TimeoutError")];
+  for (const err of lost) {
+    const s = contextScenario();
+    s.github.searchCode = async () => { throw err; };
+    await runAll(s);
+    assert.equal(s.github.posted.length, 1, err.message);
+    assert.equal(s.github.statuses.at(-1).state, "success", err.message);
   }
 });

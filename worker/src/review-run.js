@@ -514,8 +514,9 @@ const CONTEXT_CALLS_PER_STEP = 36;
 const TEST_FILE_CHARS = 8_000;
 const ctxKey = (id, kind, path = "") => `${RUN}${id}:ctx:${kind}${path ? `:${path}` : ""}`;
 
-// A request that got no answer at all (a dropped connection, a timeout), as opposed to a bug of ours: only the first is skipped as optional context.
-const noAnswer = (e) => e?.name === "AbortError" || e?.name === "TimeoutError" || (e instanceof TypeError && /fetch|network|connect|socket|reset|terminated|time(d )?-?out|econn|etimedout|eai_again|closed|abort/i.test(String(e.message)));
+// A request that got no answer at all (a dropped connection, a timeout), as opposed to a bug of ours: only the first is skipped as optional context. A TypeError counts only when its whole message is one a runtime gives for a failed request (fetch's own, workerd's, undici's), never when it merely mentions one of those words: "fetcher is not a function" is a bug.
+const NETWORK_MESSAGE = /^(fetch failed|failed to fetch|load failed|network connection lost|the network connection was lost|networkerror when attempting to fetch resource|terminated|socket hang up|the operation (timed out|was aborted)|connection (closed|reset|refused|timed out))\.?$/i;
+const noAnswer = (e) => e?.name === "AbortError" || e?.name === "TimeoutError" || (e instanceof TypeError && NETWORK_MESSAGE.test(String(e.message).trim()));
 // Reads that may get no answer once each before the rest are skipped without a second try: each such first failure throws, and the step's own failure handling gives a run up after six in a row.
 const MAX_FIRST_FAILURES = 3;
 
