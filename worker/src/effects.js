@@ -154,15 +154,16 @@ export function createEffects(env, deps = {}) {
       return app.call("GET", `/repos/${ORG}/${name}/compare/${base}...${head}?per_page=100`, { token: await app.installationToken([name], READ_SCOPE) });
     },
 
-    // A blob's bytes (GitHub sends them base64-encoded), or null if it is gone.
-    async blob(repoFull, sha) {
+    // A blob's bytes (GitHub sends them base64-encoded), or null if it is gone. With maxBytes, a blob that cannot fit is never read whole: the answer is cut off at the size that many bytes make in GitHub's JSON (base64, a line break every 60 characters, a little else), and the result is {tooLarge: true, bytes: empty, size: Infinity}.
+    async blob(repoFull, sha, { maxBytes } = {}) {
       const name = nameOf(repoFull);
       if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error("not a blob id");
       try {
-        const out = await app.call("GET", `/repos/${ORG}/${name}/git/blobs/${sha}`, { token: await app.installationToken([name], READ_SCOPE), timeoutMs: READ_TIMEOUT_MS });
+        const out = await app.call("GET", `/repos/${ORG}/${name}/git/blobs/${sha}`, { token: await app.installationToken([name], READ_SCOPE), timeoutMs: READ_TIMEOUT_MS, ...(maxBytes > 0 ? { maxBytes: Math.ceil(maxBytes * 1.4) + 4096 } : {}) });
         return { bytes: base64Bytes(out?.content ?? ""), size: Number(out?.size) || 0 };
       } catch (e) {
         if (e.status === 404) return null;
+        if (e.tooLarge) return { bytes: new Uint8Array(0), size: Number.POSITIVE_INFINITY, tooLarge: true };
         throw e;
       }
     },
