@@ -529,9 +529,20 @@ async function stageContext(ctx, run, save) {
     try {
       return await f();
     } catch (e) {
-      if (typeof e?.status !== "number") throw e;
-      note(`${what} could not be read (GitHub ${e.status})`);
-      return null;
+      if (typeof e?.status === "number") {
+        note(`${what} could not be read (GitHub ${e.status})`);
+        return null;
+      }
+      // No answer from GitHub at all (the connection): the first such failure throws, so the step is tried again (the step's own failure handling keeps these marks). The same read failing again is skipped, and from then on every read that gets no answer is skipped at once, so context, which is optional, never stops a review.
+      const at = `${c.step}:${c.at}:${what}`;
+      c.failed ??= {};
+      if (c.degraded || c.failed[at]) {
+        c.degraded = true;
+        note(`${what} could not be read (no answer from GitHub)`);
+        return null;
+      }
+      c.failed[at] = true;
+      throw e;
     }
   };
 
@@ -635,6 +646,19 @@ async function stageContext(ctx, run, save) {
   }
   await save(run);
   return ctx.deps.now();
+}
+
+// What the models were shown, from the names each batch kept: a guideline may be shown in several batches and a file split across batches is in each of them, so each is counted once. A run begun before batches kept their names reports what was read.
+function contextShown(run, batches) {
+  const read = run.contextSummary;
+  if (!read) return null;
+  const seen = batches.filter((b) => b.shown);
+  if (!seen.length) return read;
+  const count = (k) => new Set(seen.flatMap((b) => b.shown[k] ?? [])).size;
+  return {
+    guidelines: count("guidelines"), files: count("files"), tests: count("tests"), callers: count("callers"),
+    gathered: read.guidelines + read.files + read.tests + read.callers > 0, notes: read.notes,
+  };
 }
 
 // A batch's context from what the stage kept, or null when there is none.
@@ -772,6 +796,9 @@ async function stageVerify(ctx, run, save) {
     if (b.status !== "drafted" || b.waitUntil > now) continue;
     const prepared = batchPrepared(full, i);
     prepared.context = await contextOf(ctx, run, prepared);
+    // What this batch's models were shown, by name, for the review's About block (the run's own counts are what was read).
+    const seen = prepared.context?.names;
+    b.shown = { guidelines: seen?.guidelines ?? [], files: seen?.files ?? [], tests: seen?.tests ?? [], callers: seen?.callers ?? [] };
     const classified = classifyFindings({ findings: b.findings }, prepared.commentable, prepared.lineText);
     const grounded = groundFindings(classified, prepared, { title: run.title, body: run.body });
     const empty = !grounded.classified.inline.length && !grounded.classified.general.length;
@@ -875,7 +902,7 @@ async function stagePost(ctx, run, save) {
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextLine(run.contextSummary) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextLine(contextShown(run, batches)) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
