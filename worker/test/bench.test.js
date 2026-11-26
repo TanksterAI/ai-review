@@ -11,8 +11,16 @@ const answer = JSON.stringify({
 });
 const ai = (text) => { const calls = []; return { calls, async run(model, input) { calls.push({ model, input }); return responsesResult(text); } }; };
 const env = (a, over = {}) => ({ OWNER_ID, DAILY_NEURON_CAP: "6000", VERIFY: "off", LEDGER: memoryKv(), AI: a, DRAFT_CHAIN: "workers-ai:@cf/openai/gpt-oss-120b", ...over });
-const github = (id) => async (url) => (String(url).endsWith("/user") ? new Response(JSON.stringify({ id }), { status: id ? 200 : 401 }) : new Response("{}", { status: 404 }));
-const deps = (id = Number(OWNER_ID)) => ({ now: () => NOW, sleep: (ms) => (ms >= 60_000 ? new Promise(() => {}) : Promise.resolve()), fetch: github(id) });
+// What GitHub says of the caller's token about the App's repository: "admin"
+// (an administrator of the owning organisation's repository), "read", "other-org"
+// (an administrator of someone else's repository), "none" (no access) or "bad" (rejected token).
+const github = (who) => async (url) => {
+  if (!String(url).endsWith("/repos/TanksterAI/ai-review")) return new Response("{}", { status: 404 });
+  if (who === "bad") return new Response("{}", { status: 401 });
+  if (who === "none") return new Response("{}", { status: 404 });
+  return new Response(JSON.stringify({ owner: { id: who === "other-org" ? 1 : Number(OWNER_ID) }, permissions: { admin: who !== "read" } }), { status: 200 });
+};
+const deps = (who = "admin") => ({ now: () => NOW, sleep: (ms) => (ms >= 60_000 ? new Promise(() => {}) : Promise.resolve()), fetch: github(who) });
 const body = { title: "t", files: [{ filename: "src/a.js", status: "modified", patch: GROUNDED_PATCH }] };
 const req = (b, token = "tok", method = "POST") => new Request("https://x/v1/bench", { method, headers: { authorization: token ? `Bearer ${token}` : "", "content-type": "application/json" }, body: method === "POST" ? JSON.stringify(b) : undefined });
 
@@ -25,9 +33,28 @@ test("cleanChain accepts known providers and plain model ids only", () => {
 test("no token, a bad token and another user's token never reach a model", async () => {
   const a = ai(answer);
   assert.equal((await handleBench(req(body, ""), env(a), deps())).status, 401);
-  assert.equal((await handleBench(req(body), env(a), deps(0))).status, 401);
-  assert.equal((await handleBench(req(body), env(a), deps(42))).status, 403);
+  assert.equal((await handleBench(req(body), env(a), deps("bad"))).status, 401);
+  assert.equal((await handleBench(req(body), env(a), deps("none"))).status, 403);
+  assert.equal((await handleBench(req(body), env(a), deps("read"))).status, 403);
+  assert.equal((await handleBench(req(body), env(a), deps("other-org"))).status, 403);
   assert.equal((await handleBench(req(body), env(a, { OWNER_ID: "" }), deps())).status, 403);
+  assert.equal(a.calls.length, 0);
+});
+
+test("OWNER_ID is the organisation's id: an administrator of its repository is let in, not compared by user id", async () => {
+  const a = ai(answer);
+  assert.equal((await handleBench(req(body), env(a), deps("admin"))).status, 200);
+  // A look-alike repository setting is ignored; the default repository is asked about.
+  assert.equal((await handleBench(req(body), env(a, { BENCH_REPO: "evil/x y" }), deps("admin"))).status, 200);
+});
+
+test("an oversized body is refused by the bytes that arrive, before parsing", async () => {
+  const a = ai(answer);
+  const big = "é".repeat(1_100_000); // 2.2 MB in UTF-8, only 1.1 M code units
+  const res = await handleBench(new Request("https://x/v1/bench", { method: "POST", headers: { authorization: "Bearer tok" }, body: JSON.stringify({ title: big, files: [] }) }), env(a), deps());
+  assert.equal(res.status, 413);
+  const declared = new Request("https://x/v1/bench", { method: "POST", headers: { authorization: "Bearer tok", "content-length": "9999999" }, body: "{}" });
+  assert.equal((await handleBench(declared, env(a), deps())).status, 413);
   assert.equal(a.calls.length, 0);
 });
 
@@ -65,6 +92,14 @@ test("an empty answer reports zero findings; nothing reviewable is a skip", asyn
   assert.equal(skipped.status, "skipped");
 });
 
+test("a draft that spent tokens and gave no usable answer still reports its spend", async () => {
+  const a = ai("this is not json");
+  const res = await handleBench(req(body), env(a), deps());
+  assert.equal(res.status, 502);
+  const out = await res.json();
+  assert.equal(out.usage.drafting.neurons, 66);
+});
+
 test("no configured model is a failure with the reason, not a crash", async () => {
   const res = await handleBench(req({ ...body, chain: "gemini:gemini-3.5-flash-lite" }), env(ai(answer)), deps());
   assert.equal(res.status, 502);
@@ -78,7 +113,7 @@ test("the router sends /v1/bench to the benchmark", async () => {
 
 test("with verification on, the verifier's verdicts decide what is shown, and its spend is reported", async () => {
   const verdict = (v) => async (url, init) => {
-    if (String(url).endsWith("/user")) return new Response(JSON.stringify({ id: Number(OWNER_ID) }), { status: 200 });
+    if (String(url).endsWith("/repos/TanksterAI/ai-review")) return github("admin")(url);
     const text = JSON.parse(init.body).messages[0].content;
     const ids = [...text.matchAll(/"id":\s*"([^"]+)"/g)].map((m) => m[1]);
     const out = ids.map((id) => ({ id, verdict: v, severity: "major", suggestion_ok: true, prompt_ok: true, reason: "checked" }));

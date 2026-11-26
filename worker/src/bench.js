@@ -7,8 +7,10 @@
 // says what each stage kept and dropped, so a chain can be scored against
 // known defects before it becomes the default.
 //
-// Auth: a GitHub token (Authorization: Bearer) that belongs to the App's owner
-// (OWNER_ID). The token is only used to read who it is. Spend goes through the
+// Auth: a GitHub token (Authorization: Bearer) of someone with admin rights on
+// the App's repository (BENCH_REPO, default TanksterAI/ai-review), which must
+// itself belong to the owning organisation (OWNER_ID is the organisation's id,
+// not a user's). The token is only used to read that permission. Spend goes through the
 // same daily ledger and caps as reviews, so a benchmark can never spend more
 // than a day's review budget.
 //
@@ -46,6 +48,27 @@ export function cleanChain(value) {
   return parts.join(",");
 }
 
+// The body as text, or null once it passes `max` bytes: counted as it arrives,
+// so an oversized body is never buffered whole.
+async function readLimited(request, max) {
+  if (Number(request.headers.get("content-length")) > max) return null;
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) { await reader.cancel().catch(() => {}); return null; }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const c of chunks) { all.set(c, at); at += c.byteLength; }
+  return new TextDecoder().decode(all);
+}
+
 const brief = (f) => ({ path: f.path, line: f.line ?? null, severity: f.severity, title: f.title });
 
 export async function handleBench(request, env, deps = {}) {
@@ -57,20 +80,25 @@ export async function handleBench(request, env, deps = {}) {
 
   const m = /^Bearer\s+(\S+)$/.exec(request.headers.get("authorization") ?? "");
   if (!m) return json(401, { status: "unauthorized", reason: "a GitHub token is needed" });
-  let who;
+  // Who may benchmark: an administrator of the App's own repository. The
+  // caller's token is asked what it can do there; a repository that does not
+  // belong to the owning organisation (OWNER_ID is its id) is never trusted.
+  const repo = typeof env.BENCH_REPO === "string" && /^[\w.-]+\/[\w.-]+$/.test(env.BENCH_REPO) ? env.BENCH_REPO : "TanksterAI/ai-review";
+  let info;
   try {
-    const r = await fetchImpl("https://api.github.com/user", { headers: { authorization: `Bearer ${m[1]}`, accept: "application/vnd.github+json", "user-agent": "tankster-ai-review" } });
-    if (!r.ok) return json(401, { status: "unauthorized", reason: "GitHub did not accept the token" });
-    who = await r.json();
+    const r = await fetchImpl(`https://api.github.com/repos/${repo}`, { headers: { authorization: `Bearer ${m[1]}`, accept: "application/vnd.github+json", "user-agent": "tankster-ai-review" } });
+    if (r.status === 401) return json(401, { status: "unauthorized", reason: "GitHub did not accept the token" });
+    if (!r.ok) return json(403, { status: "forbidden", reason: "the benchmark is for the App's administrators" });
+    info = await r.json();
   } catch {
     return json(502, { status: "failed", reason: "could not reach GitHub" });
   }
-  if (!env.OWNER_ID || String(who?.id) !== String(env.OWNER_ID)) return json(403, { status: "forbidden", reason: "the benchmark is for the App's owner" });
+  if (!env.OWNER_ID || String(info?.owner?.id) !== String(env.OWNER_ID) || info?.permissions?.admin !== true) return json(403, { status: "forbidden", reason: "the benchmark is for the App's administrators" });
 
   let input;
   try {
-    const text = await request.text();
-    if (text.length > MAX_BODY_BYTES) return json(413, { status: "rejected", reason: "request too large" });
+    const text = await readLimited(request, MAX_BODY_BYTES);
+    if (text === null) return json(413, { status: "rejected", reason: "request too large" });
     input = JSON.parse(text);
   } catch {
     return json(400, { status: "rejected", reason: "body is not JSON" });
@@ -95,7 +123,7 @@ export async function handleBench(request, env, deps = {}) {
   const drafted = await draftWithChain({ providers, instructions, modelInput, chars, cfg, deps: d, started, repository, pr: 0 });
   if (!drafted.answer) {
     const why = drafted.outcomes.map((o) => `${o.id ?? ""} ${o.kind}: ${o.reason ?? ""}`.trim());
-    return json(drafted.timedOut || drafted.late ? 503 : 502, { status: "failed", reason: "no model in the chain gave an answer", outcomes: why });
+    return json(drafted.timedOut || drafted.late ? 503 : 502, { status: "failed", reason: "no model in the chain gave an answer", outcomes: why, usage: { drafting: { usd: drafted.usd, neurons: drafted.neurons } } });
   }
   const { answer, used } = drafted;
   const raw = Array.isArray(answer.findings) ? answer.findings : [];
@@ -114,7 +142,7 @@ export async function handleBench(request, env, deps = {}) {
     return json(200, out);
   }
   const verified = await verifyFindings({ classified: grounded.classified, prepared, title: input.title, body: input.body, drafter: used, env: benchEnv, cfg, deps: d, started });
-  if (verified.outcome.kind !== "ok") return json(200, { ...out, verified: { stopped: verified.outcome.kind, reason: verified.outcome.reason ?? "" }, shown: [] });
+  if (verified.outcome.kind !== "ok") return json(200, { ...out, verified: { stopped: verified.outcome.kind, reason: verified.outcome.reason ?? "", calls: verified.calls, partial: true }, usage: { ...out.usage, verification: { usd: verified.usd, neurons: verified.neurons, partial: true } }, shown: [] });
   const { shown, hidden } = applyVerdicts(grounded.classified, grounded.dropped, verified.verdicts);
   out.shown = [...shown.inline, ...shown.general].map(brief);
   out.verified = { calls: verified.calls, hidden: hidden.length, off: !!verified.off };
