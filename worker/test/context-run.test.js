@@ -319,3 +319,45 @@ test("context: a step stops reading after its time, and the rest is read in the 
   const slow = await steps(true);
   assert.ok(slow > fast, `a slow GitHub spreads the reads over more steps (${slow} against ${fast})`);
 });
+
+test("context: an incremental review does not offer a file the pull request changed in an earlier commit as a caller elsewhere", async () => {
+  // The last review was at commit D. Since then only src/auth.js changed; src/caller.js was changed earlier in the same pull request.
+  const caller = file("src/caller.js", AUTH_PATCH.replace("checkToken", "earlierThing"), { status: "modified", sha: "4".repeat(40) });
+  const s = contextScenario({ extraFiles: [caller] });
+  s.job.since = "d".repeat(40);
+  const auth = file("src/auth.js", AUTH_PATCH, { status: "modified", sha: "5".repeat(40) });
+  s.github.compare = async (_r, base, head) => { s.github.calls.push(`compare:${base.slice(0, 1)}...${head.slice(0, 1)}`); return { status: "ahead", total_commits: 1, commits: [], files: [auth] }; };
+  s.github.searchCode = async (_r, symbol) => (symbol === "checkToken"
+    ? [{ path: "src/server.js", text_matches: [{ fragment: "if (!checkToken(req.token)) return 401;" }] }, { path: "src/caller.js", text_matches: [{ fragment: "checkToken(earlier)" }] }]
+    : []);
+  await runAll(s);
+  assert.ok(s.github.calls.includes("compare:d...a"), "the review was incremental");
+  assert.ok(s.github.calls.includes("listFiles:1"), "the pull request's whole file list was read for the exclusion");
+  const section = /#### Uses of checkToken elsewhere in the repository\n[\s\S]*?(?=\n#### |\n\n###|$)/.exec(draftOf(s))?.[0] ?? "";
+  assert.match(section, /src\/server\.js:/, "a real caller is still shown");
+  assert.doesNotMatch(section, /src\/caller\.js:/, "a file the pull request changed earlier is not a caller elsewhere");
+});
+
+test("context: a file list that cannot be read for an incremental review is noted, and the review goes on", async () => {
+  const s = contextScenario();
+  s.job.since = "d".repeat(40);
+  const auth = file("src/auth.js", AUTH_PATCH, { status: "modified", sha: "5".repeat(40) });
+  s.github.compare = async () => ({ status: "ahead", total_commits: 1, commits: [], files: [auth] });
+  s.github.listFiles = async () => { const e = new Error("forbidden"); e.status = 403; throw e; };
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.match(s.github.posted[0].body, /the pull request's file list \(page 1\) could not be read \(GitHub 403\)/);
+  assert.match(draftOf(s), /#### Uses of checkToken elsewhere in the repository/);
+});
+
+test("context: when no model reviewed a batch, the About line does not claim context was shown", async () => {
+  const bad = () => reply(400, { error: { message: "bad request" } });
+  const s = contextScenario({ env: { ANTHROPIC_API_KEY: "" } });
+  s.models = fakeModels({ gemini: { "gemini-3.5-flash-lite": bad, "gemma-4-31b-it": bad } });
+  s.ctx.deps.fetch = s.models;
+  await runAll(s);
+  const body = s.github.summaries.at(-1).body;
+  assert.match(body, /\n- Model: none/);
+  assert.match(body, /\n- Context: none shown; no model reviewed a batch\.\n/);
+  assert.doesNotMatch(body, /guideline file|changed file beyond the diff/);
+});
