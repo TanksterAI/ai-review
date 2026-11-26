@@ -636,6 +636,17 @@ async function stageContext(ctx, run, save) {
   }
 
   if (c.step === "callers") {
+    // An incremental review stored only the files changed since the last reviewed commit, so the rest of the pull request's files are listed here (a page a call, kept under :ctx:e:): a caller the pull request changed in an earlier commit is not a caller "elsewhere in the repository" either. A list that cannot be read is noted and the review goes on with the files it has.
+    if (run.since && c.symbols.length) {
+      while (!c.listed && room()) {
+        c.listPage ??= 1;
+        const page = await soft(`the pull request's file list (page ${c.listPage})`, () => fx.listFiles(run.repo.full, run.pr, c.listPage));
+        if (!Array.isArray(page)) { c.listed = true; break; }
+        await storage.put(ctxKey(run.id, "e", String(c.listPage)), page.flatMap((f) => [f?.filename, f?.previous_filename]).filter((n) => typeof n === "string" && n));
+        c.listed = page.length < 100 || c.listPage >= MAX_PAGES;
+        c.listPage++;
+      }
+    }
     // Every path the pull request changes (and the old names of renamed ones), not only the files read whole: a changed file that was not read, because only some are or it was too large, is in the diff already and is no caller "elsewhere in the repository".
     const changed = new Set();
     for (let i = 0; i < run.files; i++) {
@@ -643,6 +654,7 @@ async function stageContext(ctx, run, save) {
       if (m?.filename) changed.add(m.filename);
       if (m?.previous_filename) changed.add(m.previous_filename);
     }
+    if (run.since) for (const names of (await storage.list({ prefix: ctxKey(run.id, "e") })).values()) for (const n of names) changed.add(n);
     for (; c.at < c.symbols.length && room(); c.at++) {
       const { symbol, forPath } = c.symbols[c.at];
       const items = await soft(`the search for ${symbol}`, () => fx.searchCode(run.repo.full, symbol));
@@ -657,7 +669,8 @@ async function stageContext(ctx, run, save) {
   }
 
   if (c.step === "done") {
-    run.contextSummary = { ...c.counts, notes: c.notes };
+    // `names`: this review's batches keep the names of what they were shown (see contextShown).
+    run.contextSummary = { ...c.counts, notes: c.notes, names: true };
     delete c.guides; delete c.tests; delete c.files; delete c.symbols;
     run.stage = "draft";
   }
@@ -670,13 +683,17 @@ function contextShown(run, batches) {
   const read = run.contextSummary;
   if (!read) return null;
   const seen = batches.filter((b) => b.shown);
-  if (!seen.length) return read;
+  // A batch no model was called for (every drafter turned the prompt down) never kept its names: in a review that keeps names, nothing was shown. Only a run begun before batches kept names reports what was read.
+  if (!seen.length) return read.names ? { guidelines: 0, files: 0, tests: 0, callers: 0, unused: true, notes: read.notes } : read;
   const count = (k) => new Set(seen.flatMap((b) => b.shown[k] ?? [])).size;
   return {
     guidelines: count("guidelines"), files: count("files"), tests: count("tests"), callers: count("callers"),
     gathered: read.guidelines + read.files + read.tests + read.callers > 0, notes: read.notes,
   };
 }
+
+// The About line for what was shown: when no batch reached a model, it says so rather than "none found".
+const contextAbout = (shown) => (shown?.unused ? "- Context: none shown; no model reviewed a batch." : contextLine(shown));
 
 // A batch's context from what the stage kept, or null when there is none.
 async function contextOf(ctx, run, prepared) {
@@ -919,7 +936,7 @@ async function stagePost(ctx, run, save) {
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextLine(contextShown(run, batches)) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine: ctx.cfg.contextChars > 0 ? contextAbout(contextShown(run, batches)) : contextLine({ off: true }), again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
