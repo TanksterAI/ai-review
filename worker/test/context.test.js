@@ -368,6 +368,41 @@ test("redact blanks a quoted credential of any length, with escaped quotes insid
   }
 });
 
+test("redact blanks an unquoted credential, a bearer token, Basic credentials and a URL password of any length", () => {
+  const alnum = "x9".repeat(150);
+  // A base64 value with a "/" just before the old limit of 200: all of it goes, not the part before the limit.
+  const b64 = `${"aB3+".repeat(49)}aB3/${"Qz7=".repeat(25)}`;
+  assert.ok(b64.length > 250 && b64[199] === "/", "the value is built with a slash at 199");
+  assert.equal(redact(`API_KEY=${alnum}`), "API_KEY=[redacted]");
+  assert.equal(redact(`API_KEY=${b64}\nnext: line`), "API_KEY=[redacted]\nnext: line");
+  assert.equal(redact(`password: ${"p4".repeat(2000)} # kept`), "password: [redacted] # kept");
+  assert.equal(redact(`Authorization: Bearer ${"Ab1.".repeat(1500)}`), "Authorization: Bearer [redacted]");
+  assert.equal(redact(`curl -H "Authorization: Basic ${"dXNl".repeat(1500)}==" https://x`), 'curl -H "Authorization: Basic [redacted]" https://x');
+  assert.equal(redact(`postgres://user:${"pa/ss1".repeat(200)}@host/db`), "postgres://user:[redacted]@host/db");
+  // A call or a path into an object is not a credential, at any length; nor is a value with no digit or no letter.
+  for (const keep of [`token = ${"a1".repeat(300)}(x)`, `token = ${"a1".repeat(300)}.field`, `token = ${"a".repeat(300)}`, `token = ${"7".repeat(300)}`, `https://u:${"p".repeat(300)} no at sign`, `postgres://user:${"a".repeat(3000)}@host`]) assert.equal(redact(keep), keep);
+  // A credential with a sentence's full stop or a path after it still goes (the longest part before a "+/~=-"), and a `: type` that is really part of the value does not hide it.
+  assert.equal(redact("# set TOKEN=abc123def456ghi789==."), "# set TOKEN=[redacted]=.");
+  assert.equal(redact("API_KEY=abc123def456/path.ext"), "API_KEY=[redacted]/path.ext");
+  assert.equal(redact("token: ab12=cdefghijklmnop"), "token: [redacted]");
+  assert.equal(redact("const password: string = hunter2hunter2xx"), "const password: string = [redacted]");
+  // The text of a minified file with an address at its end, and no white space, is not a password.
+  const minified = `{"api":"http://localhost:3000/v1","rows":[${"1,".repeat(5000)}],"mail":"x@example.com"}`;
+  assert.equal(redact(minified), minified);
+  // Short URL passwords and a "@" after white space are as before.
+  assert.equal(redact("postgres://user:p4ssw0rd@host/db and a@b.c"), "postgres://user:[redacted]@host/db and a@b.c");
+  assert.equal(redact("see https://user:ab @host"), "see https://user:ab @host");
+  assert.equal(redact("a://u:x1y@h b://v:y22@h"), "a://u:[redacted]@h b://v:[redacted]@h");
+});
+
+test("redact takes time linear in the text for long values and many starts of a URL password", () => {
+  const time = (text) => { const at = process.hrtime.bigint(); redact(text); return Number(process.hrtime.bigint() - at) / 1e6; };
+  for (const text of [`API_KEY=${"a1".repeat(200_000)}`, "password=".repeat(60_000), `${"token=a1a1a1a1a1a1a1("}`.repeat(30_000), `token=${"a1-".repeat(150_000)}`, `token=${"a1-".repeat(150_000)}(`, `token: ${"ab12=".repeat(80_000)}`, "a://b:".repeat(100_000), `x://u:${"p".repeat(400_000)}`, `x://u:${"p".repeat(400_000)}@h`, "x://u:pp".repeat(60_000), "x://u:pp ".repeat(60_000), `Bearer ${"a".repeat(400_000)}`, `Authorization: Basic ${"A".repeat(400_000)}`, `${"Bearer ".repeat(10)}${"a1".repeat(200_000)}`]) {
+    const ms = time(text);
+    assert.ok(ms < 3000, `redact took ${ms} ms for ${text.slice(0, 30)}...`);
+  }
+});
+
 test("ruleScope: a comment after a value is not part of it, and a # inside a quoted path stays", () => {
   assert.deepEqual(ruleScope('---\npaths:\n  - "src/**" # source files\n  - \'lib/**\' # more\n  - tests/*.ts # unquoted\n---\nbody'), ["src/**", "lib/**", "tests/*.ts"]);
   assert.deepEqual(ruleScope('---\npaths: ["src/**", \'b/*.js\'] # an inline list\n---\nbody'), ["src/**", "b/*.js"]);
