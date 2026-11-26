@@ -283,3 +283,22 @@ test("context: the messages runtimes give for a failed request are taken for a l
     assert.equal(s.github.statuses.at(-1).state, "success", err.message);
   }
 });
+
+test("context: a changed file that was not read whole is not offered as a caller elsewhere in the repository", async () => {
+  // src/big.js is changed by the pull request but too large to read whole, so it is not among the files fetched.
+  const big = file("src/big.js", AUTH_PATCH.replace("checkToken", "bigThing"), { status: "modified", sha: "4".repeat(40) });
+  const s = contextScenario({ extraFiles: [big] });
+  const tree = s.github.tree;
+  s.github.tree = async (r, sha) => {
+    const t = await tree(r, sha);
+    if (sha !== BASE) t.tree.push({ type: "blob", path: "src/big.js", sha: "4".repeat(40), size: 300_000 });
+    return t;
+  };
+  s.github.searchCode = async (_r, symbol) => (symbol === "checkToken"
+    ? [{ path: "src/server.js", text_matches: [{ fragment: "if (!checkToken(req.token)) return 401;" }] }, { path: "src/big.js", text_matches: [{ fragment: "checkToken(big)" }] }]
+    : []);
+  await runAll(s);
+  const section = /#### Uses of checkToken elsewhere in the repository\n[\s\S]*?(?=\n#### |\n\n###|$)/.exec(draftOf(s))?.[0] ?? "";
+  assert.match(section, /src\/server\.js:/, "a real caller is still shown");
+  assert.doesNotMatch(section, /src\/big\.js:/, "a file the pull request changes is not a caller elsewhere");
+});

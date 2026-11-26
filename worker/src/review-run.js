@@ -633,7 +633,13 @@ async function stageContext(ctx, run, save) {
   }
 
   if (c.step === "callers") {
-    const changed = new Set(c.files.map((f) => f.path));
+    // Every path the pull request changes (and the old names of renamed ones), not only the files read whole: a changed file that was not read, because only some are or it was too large, is in the diff already and is no caller "elsewhere in the repository".
+    const changed = new Set();
+    for (let i = 0; i < run.files; i++) {
+      const m = await getMeta(storage, run.id, i);
+      if (m?.filename) changed.add(m.filename);
+      if (m?.previous_filename) changed.add(m.previous_filename);
+    }
     for (; c.at < c.symbols.length && room(); c.at++) {
       const { symbol, forPath } = c.symbols[c.at];
       const items = await soft(`the search for ${symbol}`, () => fx.searchCode(run.repo.full, symbol));
