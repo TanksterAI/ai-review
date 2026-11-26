@@ -26,6 +26,8 @@ const STATUS_SCOPE = { statuses: "write" };
 // Reading threads through GraphQL names each comment's commit: Commit
 // objects need contents:read as well.
 const THREAD_SCOPE = { contents: "read", pull_requests: "write" };
+// The review's context reads (the file list, a file's text, a code search) are optional, so each has a deadline: one that gets no answer is skipped (review-run.js), and never holds the review's step open.
+export const READ_TIMEOUT_MS = 30_000;
 export const STATUS_CONTEXT = "Tankster AI Review";
 export const MARKER = "<!-- tankster-ai-review -->";
 
@@ -157,7 +159,7 @@ export function createEffects(env, deps = {}) {
       const name = nameOf(repoFull);
       if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error("not a blob id");
       try {
-        const out = await app.call("GET", `/repos/${ORG}/${name}/git/blobs/${sha}`, { token: await app.installationToken([name], READ_SCOPE) });
+        const out = await app.call("GET", `/repos/${ORG}/${name}/git/blobs/${sha}`, { token: await app.installationToken([name], READ_SCOPE), timeoutMs: READ_TIMEOUT_MS });
         return { bytes: base64Bytes(out?.content ?? ""), size: Number(out?.size) || 0 };
       } catch (e) {
         if (e.status === 404) return null;
@@ -184,7 +186,7 @@ export function createEffects(env, deps = {}) {
     async tree(repoFull, sha) {
       const name = nameOf(repoFull);
       if (!/^[0-9a-f]{40}$/.test(String(sha))) throw new Error("not a commit id");
-      return app.call("GET", `/repos/${ORG}/${name}/git/trees/${sha}?recursive=1`, { token: await app.installationToken([name], READ_SCOPE) });
+      return app.call("GET", `/repos/${ORG}/${name}/git/trees/${sha}?recursive=1`, { token: await app.installationToken([name], READ_SCOPE), timeoutMs: READ_TIMEOUT_MS });
     },
 
     // Where a name is used in the repository (code search of its default
@@ -193,7 +195,7 @@ export function createEffects(env, deps = {}) {
       const name = nameOf(repoFull);
       if (!/^[A-Za-z_$][\w$]{2,79}$/.test(String(symbol))) throw new Error("not a name to search for");
       const q = encodeURIComponent(`"${symbol}" repo:${ORG}/${name}`);
-      const out = await app.call("GET", `/search/code?q=${q}&per_page=10`, { token: await app.installationToken([name], READ_SCOPE), accept: "application/vnd.github.text-match+json" });
+      const out = await app.call("GET", `/search/code?q=${q}&per_page=10`, { token: await app.installationToken([name], READ_SCOPE), accept: "application/vnd.github.text-match+json", timeoutMs: READ_TIMEOUT_MS });
       return Array.isArray(out?.items) ? out.items : [];
     },
 
