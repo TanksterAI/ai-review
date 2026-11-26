@@ -51,3 +51,18 @@ test("a test whose size is unknown is not fetched, and a name over the search li
   assert.deepEqual(changedSymbols(patch(80)), ["a".repeat(80)]);
   assert.deepEqual(changedSymbols(patch(81)), []);
 });
+
+test("the whole context, guidelines, files, tests and callers together, never goes over its cap, whatever the cap", () => {
+  const lines = (n, w) => Array.from({ length: n }, (_, i) => `const v${i} = ${w}${i};`).join("\n");
+  const data = {
+    guidelines: [{ path: "CLAUDE.md", dir: "", text: "Rule one.\n".repeat(60) }, { path: "src/AGENTS.md", dir: "src", text: "Rule two.\n".repeat(40) }],
+    files: new Map([["src/a.js", lines(80, "1")], ["src/b.js", lines(5, "2")]]),
+    tests: new Map([["src/a.js", [{ path: "test/a.test.js", text: "t".repeat(300) }]], ["a.js", [{ path: "a.test.js", text: "x" }]]]),
+    callers: new Map([["src/b.js", [{ symbol: "useB", hits: [{ path: "src/c.js", fragment: "useB();".repeat(30) }] }]]]),
+  };
+  const prepared = { included: ["src/a.js", "src/b.js", "a.js"], shown: new Map([["src/a.js", new Set([40])], ["src/b.js", new Set([2])]]) };
+  for (let cap = 0; cap <= 1500; cap++) assert.ok(batchContext(data, prepared, cap).text.length <= cap, `cap ${cap}`);
+  // The example that went over: only a test for one file, and a cap of 3.
+  const only = { tests: new Map([["a.js", [{ path: "a.test.js", text: "x" }]]]) };
+  for (const cap of [0, 1, 3, 6, 7, 8, 12]) assert.ok(batchContext(only, { included: ["a.js"] }, cap).text.length <= cap, `tests only, cap ${cap}`);
+});

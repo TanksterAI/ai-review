@@ -351,8 +351,9 @@ export function excerpt(text, near, cap) {
 export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
   const paths = prepared.included ?? [];
   const guide = guideText(data.guidelines ?? [], paths, Math.min(GUIDE_CHARS, Math.floor(cap / 4)));
-  let room = Math.max(0, cap - guide.length);
   const want = paths.filter((p) => data.files?.has(p) || data.tests?.get(p)?.length || data.callers?.get(p)?.length);
+  // The blank lines that join the guidelines, the blocks and the files are part of the cap too.
+  let room = Math.max(0, cap - guide.length - 2 * (want.length + 1));
   // Files with the least to show are served first, so one big file cannot
   // starve the small ones: each gets an equal share of what is left.
   const order = want.map((p, i) => ({ p, i, size: (data.files?.get(p) ?? "").length })).sort((a, b) => a.size - b.size || a.i - b.i);
@@ -374,13 +375,15 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
     const body = data.files?.has(p) ? excerpt(data.files.get(p), prepared.shown?.get(p) ?? [], Math.max(0, share - relatedCap - p.length - 80)) : null;
     const parts = [];
     if (body?.text) parts.push(`### ${p} (the file after the change${body.whole ? "" : ", the parts near the diff"})\n${body.text}`);
-    if (relatedCap > 0) parts.push(relatedText.length > relatedCap ? `${relatedText.slice(0, Math.max(0, relatedCap - 7))}\n[cut]` : relatedText);
+    // A cut marker that does not fit is left out, so a tiny cap gives nothing rather than a marker over the limit.
+    const relatedShown = relatedText.length <= relatedCap ? relatedText : relatedCap > 7 ? `${relatedText.slice(0, relatedCap - 7)}\n[cut]` : "";
+    if (relatedCap > 0 && relatedShown) parts.push(relatedShown);
     const block = parts.join("\n\n");
     if (!block) continue;
     blocks.set(p, block);
-    room -= block.length;
+    room -= block.length + 2;
     if (body?.text) { counts.files++; if (body.whole) counts.whole++; }
-    if (relatedCap > 0) { counts.tests += tests.length; counts.callers += callers.filter((c) => c.hits.length).length; }
+    if (relatedCap > 0 && relatedShown) { counts.tests += tests.length; counts.callers += callers.filter((c) => c.hits.length).length; }
   }
   counts.guidelines = guide ? (guide.match(/^## /gm) ?? []).length : 0;
   const files = new Map([...blocks].filter(([, v]) => v).map(([k, v]) => [k, wellFormed(v)]));
