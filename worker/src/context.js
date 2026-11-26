@@ -87,11 +87,11 @@ const redactJwts = (text) => text.replace(JWT_RUN, (run) => {
   return run;
 });
 const KEYWORD = "(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)";
-// Every quantifier below is bounded, so the time a file takes is linear in its size however it is written.
+// Every pattern below takes time linear in the file, however it is written: the quantifiers around a name are bounded, and a quoted value (QUOTED) is one character at a time up to the quote that closes it, with no choice between ways to match a character, so a failed try reads on to the end of its line at most once.
 // A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key, `password: string`), then a quoted value.
 const NAME_THEN = `(${KEYWORD}\\w{0,40}["']?(?:\\s{0,20}:\\s{0,20}[\\w<>|]{1,30})?\\s{0,20}[:=]\\s{0,20})`;
-// The value runs to the quote that opened it, so a quote of another kind inside it ("it's ...") does not end it early, and a backslash escapes the next character.
-const QUOTED = (q) => `${q}(?:[^${q}\\\\\\n]|\\\\.){8,500}${q}`;
+// The value runs to the quote that opened it, of any length (a credential is not safe because it is long), so a quote of another kind inside it ("it's ...") does not end it early, and a backslash escapes the next character. A character is either not a quote, backslash or line break, or a backslash and the character after it: never both, so a try that fails cannot start again part-way along.
+const QUOTED = (q) => `${q}(?:[^${q}\\\\\\n]|\\\\.){8,}${q}`;
 const ASSIGNED = new RegExp(`${NAME_THEN}(${QUOTED('"')}|${QUOTED("'")}|${QUOTED("`")})`, "gi");
 // The same with no quotes (an .env style line, YAML): a value that looks like a secret (12 or more characters with a digit and a letter, not a call or a path into an object).
 const ASSIGNED_BARE = new RegExp(`${NAME_THEN}(?=[A-Za-z0-9+/_~=-]{0,200}\\d)(?=[A-Za-z0-9+/_~=-]{0,200}[A-Za-z])[A-Za-z0-9+/_~=-]{12,200}(?![\\w(.])`, "gi");
@@ -178,6 +178,20 @@ function splitInline(text) {
   return out;
 }
 
+// A line of YAML without its comment: a "#" that starts a comment is the first one outside quotes with a space (or the line's start) before it, so `"src/**" # source files` is `"src/**"`, and the "#" of `"src/#x/**"` or `src/a#b/**` stays. A quote opens a quoted value only at the start of a value (after a space, "[", "," or ":"); a double-quoted value escapes with a backslash and a single-quoted one with a doubled quote.
+function stripComment(line) {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (quote) {
+      if (quote === '"' && c === "\\") i++;
+      else if (c === quote) { if (quote === "'" && line[i + 1] === "'") i++; else quote = ""; }
+    } else if ((c === '"' || c === "'") && (i === 0 || /[\s[,:]/.test(line[i - 1]))) quote = c;
+    else if (c === "#" && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i);
+  }
+  return line;
+}
+
 // A rule file may name the paths it applies to in its front matter
 // (`paths:` as a YAML list, or `globs:`); one without applies everywhere.
 export function ruleScope(text) {
@@ -186,7 +200,7 @@ export function ruleScope(text) {
   const globs = [];
   let inList = false;
   for (const raw of m[1].split(/\r?\n/)) {
-    const line = raw.trimEnd();
+    const line = stripComment(raw).trimEnd();
     const key = /^(paths|globs)\s*:\s*(.*)$/.exec(line);
     if (key) {
       inList = true;

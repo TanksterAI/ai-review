@@ -350,3 +350,31 @@ test("redact takes time linear in the text for runs built to make a token search
     assert.ok(ms < 3000, `redact took ${ms} ms for ${text.slice(0, 30)}...`);
   }
 });
+
+test("redact blanks a quoted credential of any length, with escaped quotes inside, and stays linear", () => {
+  const long = "x9".repeat(5000);
+  assert.equal(redact(`API_KEY = "${long}"`), 'API_KEY = "[redacted]"');
+  assert.equal(redact(`{"api_key": "${long}"}`), '{"api_key": "[redacted]"}');
+  assert.equal(redact(`password = '${long}' // kept`), "password = '[redacted]' // kept");
+  // A backslash escapes the quote after it: the value goes on to the quote that closes it.
+  assert.equal(redact('token = "abcd1234\\"efgh5678\\"ijkl" + rest'), 'token = "[redacted]" + rest');
+  // Code that only names a credential is left alone, at any length of what follows.
+  assert.equal(redact(`const secretCount = ${"9".repeat(5000)};`), `const secretCount = ${"9".repeat(5000)};`);
+  const time = (text) => { const at = process.hrtime.bigint(); redact(text); return Number(process.hrtime.bigint() - at) / 1e6; };
+  // Quotes never closed, closed late, escaped to the end, and many starts on one line.
+  for (const text of [`password="${"x".repeat(400_000)}`, 'password="x'.repeat(40_000), ("password=\"a" + "password='a").repeat(20_000), `password="${"\\\\".repeat(200_000)}`, `password="${"\\".repeat(400_000)}`, `secret="${"y".repeat(390_000)}"`, ("token=`" + "b".repeat(20)).repeat(20_000)]) {
+    const ms = time(text);
+    assert.ok(ms < 3000, `redact took ${ms} ms for ${text.slice(0, 30)}...`);
+  }
+});
+
+test("ruleScope: a comment after a value is not part of it, and a # inside a quoted path stays", () => {
+  assert.deepEqual(ruleScope('---\npaths:\n  - "src/**" # source files\n  - \'lib/**\' # more\n  - tests/*.ts # unquoted\n---\nbody'), ["src/**", "lib/**", "tests/*.ts"]);
+  assert.deepEqual(ruleScope('---\npaths: ["src/**", \'b/*.js\'] # an inline list\n---\nbody'), ["src/**", "b/*.js"]);
+  assert.deepEqual(ruleScope('---\nglobs: # the key has one too\n  # and a line of its own\n  - "src/#x/**"\n  - src/a#b/**\n---\nbody'), ["src/#x/**", "src/a#b/**"]);
+  // A comment at the start of a line does not end the list.
+  assert.deepEqual(ruleScope("---\npaths:\n  - a/*.ts\n# a note\n  - b/*.ts\nother: x\n  - c\n---\nbody"), ["a/*.ts", "b/*.ts"]);
+  // The rule then applies to the file the scope names.
+  const text = '---\npaths:\n  - "src/**" # source files\n---\nVerify tokens.';
+  assert.ok(guideText([{ path: ".claude/rules/a.md", dir: "", scope: ruleScope(text), text }], ["src/auth.js"], 5000).includes("Verify tokens."));
+});
