@@ -332,8 +332,14 @@ test("redact finds a JSON Web Token of any length, even after a failed first try
   assert.equal(redact(`see ${jwt(1)}...`), "see [redacted]...");
   for (const keep of ["eyJ.short.x", "eyJabcdefghijk.only.two", "eyJabcdefghijk", "eyJ...", "x.eyJabcdefghijk.b.c"]) assert.equal(redact(keep), keep);
   // A first try that fails does not hide a real token later in the same run.
-  assert.ok(!redact(`eyJfoo.${jwt(1)}`).includes("c3ViIiOiIx"), "token after a failed start was left");
-  assert.ok(!redact(`eyJ-${jwt(1)}`).includes("c3ViIiOiIx"), "token after a dash was left");
+  // Exact outputs: the real token's own parts (its header, payload and signature) are gone, and what came before it is kept.
+  assert.equal(redact(`eyJfoo.${jwt(1)}`), "eyJfoo.[redacted]", "token after a failed start was left");
+  assert.equal(redact(`eyJ-${jwt(1)}`), "[redacted]", "token after a dash was left");
+  for (const text of [`eyJfoo.${jwt(1)}`, `eyJ-${jwt(1)}`]) {
+    const out = redact(text);
+    assert.match(out, /\[redacted\]/);
+    for (const part of ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIx", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"]) assert.ok(!out.includes(part), `${part} was left in ${out}`);
+  }
 });
 
 test("redact takes time linear in the text for runs built to make a token search start again", () => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { startRun, stepRun } from "../src/review-run.js";
+import { CONTEXT_STEP_MS, startRun, stepRun } from "../src/review-run.js";
 import { config } from "../src/config.js";
 import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
 
@@ -301,4 +301,21 @@ test("context: a changed file that was not read whole is not offered as a caller
   const section = /#### Uses of checkToken elsewhere in the repository\n[\s\S]*?(?=\n#### |\n\n###|$)/.exec(draftOf(s))?.[0] ?? "";
   assert.match(section, /src\/server\.js:/, "a real caller is still shown");
   assert.doesNotMatch(section, /src\/big\.js:/, "a file the pull request changes is not a caller elsewhere");
+});
+
+test("context: a step stops reading after its time, and the rest is read in the next step", async () => {
+  const extra = Array.from({ length: 10 }, (_, i) => file(`src/t${i}.js`, AUTH_PATCH.replace("checkToken", `fn${i}z`), { status: "modified", sha: "5".repeat(40) }));
+  const steps = async (slow) => {
+    const s = contextScenario({ extraFiles: extra });
+    const blob = s.github.blob;
+    // Each file read takes longer than half the step's time (GitHub is slow to answer).
+    s.github.blob = async (...a) => { if (slow) s.setNow(s.getNow() + CONTEXT_STEP_MS / 2 + 1000); return blob.call(s.github, ...a); };
+    const n = await runAll(s);
+    assert.equal(s.github.posted.length, 1);
+    assert.equal(s.github.statuses.at(-1).state, "success");
+    return n;
+  };
+  const fast = await steps(false);
+  const slow = await steps(true);
+  assert.ok(slow > fast, `a slow GitHub spreads the reads over more steps (${slow} against ${fast})`);
 });
