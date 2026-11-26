@@ -93,22 +93,54 @@ const NAME_THEN = `(${KEYWORD}\\w{0,40}["']?(?:\\s{0,20}:\\s{0,20}[\\w<>|]{1,30}
 // The value runs to the quote that opened it, of any length (a credential is not safe because it is long), so a quote of another kind inside it ("it's ...") does not end it early, and a backslash escapes the next character. A character is either not a quote, backslash or line break, or a backslash and the character after it: never both, so a try that fails cannot start again part-way along.
 const QUOTED = (q) => `${q}(?:[^${q}\\\\\\n]|\\\\.){8,}${q}`;
 const ASSIGNED = new RegExp(`${NAME_THEN}(${QUOTED('"')}|${QUOTED("'")}|${QUOTED("`")})`, "gi");
-// The same with no quotes (an .env style line, YAML): a value that looks like a secret (12 or more characters with a digit and a letter, not a call or a path into an object).
-const ASSIGNED_BARE = new RegExp(`${NAME_THEN}(?=[A-Za-z0-9+/_~=-]{0,200}\\d)(?=[A-Za-z0-9+/_~=-]{0,200}[A-Za-z])[A-Za-z0-9+/_~=-]{12,200}(?![\\w(.])`, "gi");
-const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,64}:)[^\s@]{3,200}(@)/gi;
-const BEARER = /\b(Bearer\s{1,5})[A-Za-z0-9._~+/-]{20,2000}=*/gi;
+// The same with no quotes (an .env style line, YAML): a value that looks like a secret (12 or more characters with a digit and a letter, not a call or a path into an object). The whole run of value characters is taken, of any length, and then judged in blankBare, so a long value is never left whole or in part: each run is read once, and a run is never matched again from inside.
+const ASSIGNED_BARE = new RegExp(`${NAME_THEN}([A-Za-z0-9+/_~=-]{12,})([(.]?)`, "gi");
+// Followed by "(" or ".", a run may be a call or a path, but it may also be a credential with a sentence's full stop after it (`TOKEN=abc123...==.`): the credential is then the longest part of 12 or more characters before one of "+/~=-", as a search that backs up would find it, and what follows stays.
+const blankBare = (m, name, value, tail) => {
+  if (!/\d/.test(value) || !/[A-Za-z]/.test(value)) return m;
+  if (!tail) return `${name}[redacted]`;
+  for (let i = value.length - 1; i >= 12; i--) if ("+/~=-".includes(value[i])) return `${name}[redacted]${value.slice(i)}${tail}`;
+  return m;
+};
+// The same name without the optional `: type` part, run again after the first: `token: ab12=cdefghijklmnop` reads the first way as a type "ab12" and a value with no digit, and the second way as the value it is.
+const ASSIGNED_BARE_PLAIN = new RegExp(`(${KEYWORD}\\w{0,40}["']?\\s{0,20}[:=]\\s{0,20})([A-Za-z0-9+/_~=-]{12,})([(.]?)`, "gi");
+// A URL's password is found by its start (scheme, user name and the colon, all short) and then by the next "@" and the next white space after it, each looked for once however many starts there are, so a text of starts with no "@" cannot be read again and again from each. The password may hold any character but white space and "@", up to 2,000 of them: a text of that length with no white space before an "@" (a minified file with an address at its end) is not a password, and would otherwise lose everything up to the address.
+const MAX_URL_PASSWORD = 2000;
+const URL_START = /\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,64}:/gi;
+const WHITE = /\s/g;
+function redactUrlPasswords(text) {
+  let out = "";
+  let from = 0;
+  // The next "@" and the next white space at or after the position last asked about (Infinity: none left).
+  let at = -1;
+  let space = -1;
+  URL_START.lastIndex = 0;
+  for (let m; (m = URL_START.exec(text)); ) {
+    const start = m.index + m[0].length;
+    if (at < start && at !== Infinity) { at = text.indexOf("@", start); if (at < 0) at = Infinity; }
+    if (space < start && space !== Infinity) { WHITE.lastIndex = start; const w = WHITE.exec(text); space = w ? w.index : Infinity; }
+    if (at !== Infinity && at - start >= 3 && at - start <= MAX_URL_PASSWORD && space > at) {
+      out += `${text.slice(from, start)}[redacted]`;
+      from = at;
+      URL_START.lastIndex = at;
+    } else URL_START.lastIndex = m.index + 1;
+  }
+  return from === 0 ? text : out + text.slice(from);
+}
+// A bearer token or Basic credentials runs to the end of its characters, of any length: the part of a long one that a limit left would still be a credential.
+const BEARER = /\b(Bearer\s{1,5})[A-Za-z0-9._~+/-]{20,}=*/gi;
 // Basic credentials (base64 of user:password) after an Authorization name: `Authorization: Basic ...`, `Authorization = 'Basic ...'`, `set("Authorization", "Basic ...")`. The word "Basic" in prose or a path is never taken for one.
-const BASIC_HEADER = /(\bAuthorization["'`]?\s{0,5}[:=,]\s{0,5}["'`]?Basic\s{1,5})[A-Za-z0-9+/_-]{8,2000}={0,2}/gi;
+const BASIC_HEADER = /(\bAuthorization["'`]?\s{0,5}[:=,]\s{0,5}["'`]?Basic\s{1,5})[A-Za-z0-9+/_-]{8,}={0,2}/gi;
 
 /** The text with the common forms of a credential blanked out (a safety net, not a guarantee). */
 export function redact(text) {
   let t = String(text ?? "");
   // A blanked block keeps its line breaks, so the line numbers shown after it stay true.
   for (const re of REDACT) t = t.replace(re, (m) => `[redacted]${"\n".repeat(m.split("\n").length - 1)}`);
-  return redactJwts(t)
+  return redactUrlPasswords(redactJwts(t)
     .replace(ASSIGNED, (_m, name, value) => `${name}${value[0]}[redacted]${value[0]}`)
-    .replace(ASSIGNED_BARE, "$1[redacted]")
-    .replace(URL_PASSWORD, "$1[redacted]$2")
+    .replace(ASSIGNED_BARE, blankBare)
+    .replace(ASSIGNED_BARE_PLAIN, blankBare))
     .replace(BEARER, "$1[redacted]")
     .replace(BASIC_HEADER, "$1[redacted]");
 }
