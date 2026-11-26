@@ -164,3 +164,38 @@ test("minting a token has a deadline too, so a hung mint is cut off", async () =
   for (const c of seen) { assert.ok(c.signal instanceof AbortSignal, c.url); assert.equal(c.signal.aborted, false); }
   assert.ok(TOKEN_TIMEOUT_MS > 0 && TOKEN_TIMEOUT_MS <= 60_000);
 });
+
+test("a call with maxBytes reads the answer as it arrives and stops at the limit, however much more is coming", async () => {
+  const enc = new TextEncoder();
+  // A body that hands out its parts one by one, and records how many were asked for and whether it was cancelled.
+  const stream = (parts, headers = {}) => {
+    const log = { pulled: 0, cancelled: false };
+    const body = new ReadableStream({
+      pull(ctrl) { if (log.pulled >= parts.length) return ctrl.close(); ctrl.enqueue(enc.encode(parts[log.pulled++])); },
+      cancel() { log.cancelled = true; },
+    });
+    return { log, res: new Response(body, { headers }) };
+  };
+  const clientFor = (res) => createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: async () => res, now: () => NOW });
+  // Under the limit the answer is the JSON, as without a limit.
+  const small = stream(['{"a":"', "x".repeat(1000), '"}']);
+  assert.deepEqual(await clientFor(small.res).call("GET", "/x", { token: "t", maxBytes: 5000 }), { a: "x".repeat(1000) });
+  // A body of 100,000 bytes with a limit of 5,000: stopped and cancelled after a few parts, with an error marked tooLarge and no status.
+  const big = stream(['{"a":"', ...Array.from({ length: 100 }, () => "x".repeat(1000)), '"}']);
+  await assert.rejects(clientFor(big.res).call("GET", "/repos/TanksterAI/x/git/blobs/abc?q=1", { token: "t", maxBytes: 5000 }), (e) => e instanceof GithubAppError && e.tooLarge === true && e.status === undefined && !e.message.includes("?q=1"));
+  assert.equal(big.log.cancelled, true);
+  assert.ok(big.log.pulled < 20, `${big.log.pulled} parts were read of 102`);
+  // An answer that declares more than the limit is not read at all.
+  const declared = stream(['{"a":"1"}'], { "content-length": "50000000" });
+  await assert.rejects(clientFor(declared.res).call("GET", "/x", { token: "t", maxBytes: 5000 }), (e) => e.tooLarge === true);
+  assert.equal(declared.log.cancelled, true);
+  assert.ok(declared.log.pulled <= 1);
+  // A stand-in answer with no stream is read as text and held to the same limit.
+  const plain = (text) => ({ ok: true, status: 200, headers: { get: () => null }, async text() { return text; } });
+  assert.deepEqual(await clientFor(plain('{"b":2}')).call("GET", "/x", { token: "t", maxBytes: 100 }), { b: 2 });
+  await assert.rejects(clientFor(plain(`{"b":"${"y".repeat(200)}"}`)).call("GET", "/x", { token: "t", maxBytes: 100 }), (e) => e.tooLarge === true);
+  // No limit: read whole, as before. An error status and a 204 are as before too.
+  assert.deepEqual(await clientFor(Response.json({ c: 3 })).call("GET", "/x", { token: "t" }), { c: 3 });
+  assert.equal(await clientFor(new Response(null, { status: 204 })).call("DELETE", "/x", { token: "t", maxBytes: 100 }), null);
+  await assert.rejects(clientFor(new Response("no", { status: 404 })).call("GET", "/x", { token: "t", maxBytes: 100 }), (e) => e.status === 404 && e.tooLarge === undefined);
+});

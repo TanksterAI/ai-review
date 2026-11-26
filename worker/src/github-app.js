@@ -97,8 +97,41 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
     return token;
   }
 
+  // The answer's JSON, read as it arrives and never past maxBytes: an answer that declares more, or turns out to be more, is cancelled and throws an error marked tooLarge (no status), so a huge answer is never held in memory whole.
+  async function readBounded(res, maxBytes, what) {
+    const tooLarge = () => Object.assign(new GithubAppError(`${what} answered with more than ${maxBytes} bytes`), { tooLarge: true });
+    const declared = Number(res.headers?.get?.("content-length"));
+    if (declared > maxBytes) {
+      await res.body?.cancel?.().catch(() => {});
+      throw tooLarge();
+    }
+    if (!res.body?.getReader) {
+      const text = await res.text();
+      if (text.length > maxBytes) throw tooLarge();
+      return JSON.parse(text);
+    }
+    const reader = res.body.getReader();
+    const parts = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw tooLarge();
+      }
+      parts.push(value);
+    }
+    const all = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) { all.set(p, at); at += p.byteLength; }
+    return JSON.parse(new TextDecoder().decode(all));
+  }
+
   // timeoutMs: a deadline for the whole call, answer included. Past it the call is aborted and throws a TimeoutError (no status), which a caller that can do without the answer treats as no answer. Without it the call has no deadline of its own.
-  async function call(method, path, { token, body, accept, timeoutMs } = {}) {
+  // maxBytes: the most of the answer that is read (see readBounded); without it the answer is read whole.
+  async function call(method, path, { token, body, accept, timeoutMs, maxBytes } = {}) {
     const res = await fetcher(`${API}${path}`, {
       method,
       ...(timeoutMs > 0 ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
@@ -112,7 +145,8 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
       body: body ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) throw new GithubAppError(`GitHub ${method} ${path.split("?")[0]} failed: ${res.status}`, res.status);
-    return res.status === 204 ? null : res.json();
+    if (res.status === 204) return null;
+    return maxBytes > 0 ? readBounded(res, maxBytes, `GitHub ${method} ${path.split("?")[0]}`) : res.json();
   }
 
   async function installation() {
