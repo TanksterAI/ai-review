@@ -302,7 +302,8 @@ test("isSecretPath covers prefixed names and the usual config stores of credenti
 test("a glob with many alternatives cannot be made to take long", () => {
   const evil = `${"{*,*}".repeat(10)}Z`;
   const at = Date.now();
-  assert.equal(globToRegExp(evil).test("a".repeat(30)), false);
+  // Twenty runs of stars is more than a scope may have: the glob applies to every path.
+  assert.equal(globToRegExp(evil).test("a".repeat(30)), true);
   assert.ok(Date.now() - at < 500, `took ${Date.now() - at} ms`);
 });
 

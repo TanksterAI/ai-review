@@ -72,7 +72,9 @@ const KEYWORD = "(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|
 // Every quantifier below is bounded, so the time a file takes is linear in its size however it is written.
 // A name that holds a credential (DB_PASSWORD, "apiKey", aws_secret_access_key, `password: string`), then a quoted value.
 const NAME_THEN = `(${KEYWORD}\\w{0,40}["']?(?:\\s{0,20}:\\s{0,20}[\\w<>|]{1,30})?\\s{0,20}[:=]\\s{0,20})`;
-const ASSIGNED = new RegExp(`${NAME_THEN}(["'\`])[^"'\`\\n]{8,500}\\2`, "gi");
+// The value runs to the quote that opened it, so a quote of another kind inside it ("it's ...") does not end it early, and a backslash escapes the next character.
+const QUOTED = (q) => `${q}(?:[^${q}\\\\\\n]|\\\\.){8,500}${q}`;
+const ASSIGNED = new RegExp(`${NAME_THEN}(${QUOTED('"')}|${QUOTED("'")}|${QUOTED("`")})`, "gi");
 // The same with no quotes (an .env style line, YAML): a value that looks like a secret (12 or more characters with a digit and a letter, not a call or a path into an object).
 const ASSIGNED_BARE = new RegExp(`${NAME_THEN}(?=[A-Za-z0-9+/_~=-]{0,200}\\d)(?=[A-Za-z0-9+/_~=-]{0,200}[A-Za-z])[A-Za-z0-9+/_~=-]{12,200}(?![\\w(.])`, "gi");
 const URL_PASSWORD = /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,64}:)[^\s@]{3,200}(@)/gi;
@@ -84,7 +86,7 @@ export function redact(text) {
   // A blanked block keeps its line breaks, so the line numbers shown after it stay true.
   for (const re of REDACT) t = t.replace(re, (m) => `[redacted]${"\n".repeat(m.split("\n").length - 1)}`);
   return t
-    .replace(ASSIGNED, "$1$2[redacted]$2")
+    .replace(ASSIGNED, (_m, name, value) => `${name}${value[0]}[redacted]${value[0]}`)
     .replace(ASSIGNED_BARE, "$1[redacted]")
     .replace(URL_PASSWORD, "$1[redacted]$2")
     .replace(BEARER, "$1[redacted]");
@@ -137,6 +139,24 @@ export function pickGuidelines(entries, changedPaths) {
   return out.slice(0, MAX_GUIDE_FILES);
 }
 
+// The items of an inline list, split at the commas outside quotes and braces: `["src/*.{ts,tsx}", 'lib/**']` is two.
+function splitInline(text) {
+  const out = [];
+  let cur = "";
+  let quote = "";
+  let depth = 0;
+  for (const c of String(text)) {
+    if (quote) { if (c === quote) quote = ""; cur += c; continue; }
+    if (c === '"' || c === "'") quote = c;
+    else if (c === "{") depth++;
+    else if (c === "}" && depth > 0) depth--;
+    else if (c === "," && depth === 0) { out.push(cur); cur = ""; continue; }
+    cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
 // A rule file may name the paths it applies to in its front matter
 // (`paths:` as a YAML list, or `globs:`); one without applies everywhere.
 export function ruleScope(text) {
@@ -149,7 +169,7 @@ export function ruleScope(text) {
     const key = /^(paths|globs)\s*:\s*(.*)$/.exec(line);
     if (key) {
       inList = true;
-      for (const g of key[2].replace(/^\[|\]$/g, "").split(",")) if (g.trim()) globs.push(g.trim().replace(/^["']|["']$/g, ""));
+      for (const g of splitInline(key[2].replace(/^\[|\]$/g, ""))) if (g.trim()) globs.push(g.trim().replace(/^["']|["']$/g, ""));
       continue;
     }
     const item = /^\s*-\s*(.+)$/.exec(line);
@@ -159,6 +179,11 @@ export function ruleScope(text) {
   return globs.slice(0, 20);
 }
 
+// Each run of stars multiplies the work a failed match does. A glob with more than this many (or with stars and alternatives past MAX_GLOB_WORK together) is not compiled: it applies to every path (a rule shown too widely does no harm; one left out would), and paths longer than MAX_SCOPE_PATH do not match a scope at all.
+export const MAX_GLOB_STARS = 3;
+// Runs of stars plus commas (the alternatives of a brace) together: each multiplies the work of a failed match.
+export const MAX_GLOB_WORK = 5;
+export const MAX_SCOPE_PATH = 200;
 const reCache = new Map();
 /** A glob (`*`, `**`, `?`) as a regular expression on a whole path. */
 export function globToRegExp(glob) {
@@ -166,12 +191,19 @@ export function globToRegExp(glob) {
   let re = "";
   let depth = 0;
   const g = String(glob).slice(0, 200);
+  const stars = (g.match(/\*+/g) ?? []).length;
+  if (stars > MAX_GLOB_STARS || stars + (g.match(/,/g) ?? []).length > MAX_GLOB_WORK) { const any = /^/; reCache.set(glob, any); return any; }
   // Alternatives multiply the work a failed match does, so a glob with more than a few of them keeps its braces as plain characters.
   const braces = (g.match(/\{/g) ?? []).length <= 3 && (g.match(/,/g) ?? []).length <= 8;
   for (let i = 0; i < g.length; i++) {
     const c = g[i];
-    if (c === "*" && g[i + 1] === "*") { re += g[i + 2] === "/" ? "(?:.*/)?" : ".*"; i += g[i + 2] === "/" ? 2 : 1; }
-    else if (c === "*") re += "[^/]*";
+    if (c === "*") {
+      // A run of stars is one wildcard: two or more cross directories, one does not.
+      let j = i;
+      while (g[j] === "*") j++;
+      if (j - i >= 2) { re += g[j] === "/" ? "(?:.*/)?" : ".*"; i = g[j] === "/" ? j : j - 1; }
+      else re += "[^/]*";
+    }
     else if (c === "?") re += "[^/]";
     else if (c === "{" && braces) { depth++; re += "(?:"; }
     else if (c === "}" && braces && depth > 0) { depth--; re += ")"; }
@@ -184,13 +216,13 @@ export function globToRegExp(glob) {
   return out;
 }
 
-/** The guidelines that apply to the files of one batch, as text. */
-export function guideText(guidelines, paths, cap) {
+/** The guidelines that apply to the files of one batch, as text. `used` collects the paths of those shown. */
+export function guideText(guidelines, paths, cap, used = []) {
   const parts = [];
   let size = 0;
   for (const g of guidelines) {
     if (g.dir && !paths.some((p) => p.startsWith(`${g.dir}/`))) continue;
-    if (g.scope?.length && !paths.some((p) => g.scope.some((s) => globToRegExp(s).test(p)))) continue;
+    if (g.scope?.length && !paths.some((p) => p.length <= MAX_SCOPE_PATH && g.scope.some((s) => globToRegExp(s).test(p)))) continue;
     const block = `## ${g.path}\n${g.text}\n`;
     // The newline that joins a block to the one before it is part of the cap too.
     const join = parts.length ? 1 : 0;
@@ -199,10 +231,11 @@ export function guideText(guidelines, paths, cap) {
       const head = `## ${g.path}\n`;
       const tail = "\n[cut]\n";
       const room = cap - size - join - head.length - tail.length;
-      if (room > 200) parts.push(`${head}${g.text.slice(0, room)}${tail}`);
+      if (room > 200) { parts.push(`${head}${g.text.slice(0, room)}${tail}`); used.push(g.path); }
       break;
     }
     parts.push(block);
+    used.push(g.path);
     size += join + block.length;
   }
   return parts.join("\n");
@@ -352,7 +385,10 @@ export function excerpt(text, near, cap) {
  */
 export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
   const paths = prepared.included ?? [];
-  const guide = guideText(data.guidelines ?? [], paths, Math.min(GUIDE_CHARS, Math.floor(cap / 4)));
+  const usedGuides = [];
+  const guide = guideText(data.guidelines ?? [], paths, Math.min(GUIDE_CHARS, Math.floor(cap / 4)), usedGuides);
+  // What was shown, by name: a file split across batches is in each of them, and the review counts it once.
+  const names = { guidelines: usedGuides, files: [], tests: [], callers: [] };
   const want = paths.filter((p) => data.files?.has(p) || data.tests?.get(p)?.length || data.callers?.get(p)?.length);
   // The blank lines that join the guidelines and the files are part of the cap too: they are taken here, once.
   let room = Math.max(0, cap - guide.length - 2 * (want.length + 1));
@@ -384,19 +420,19 @@ export function batchContext(data, prepared, cap = CONTEXT_CHARS) {
     if (!block) continue;
     blocks.set(p, block);
     room -= block.length;
-    if (body?.text) { counts.files++; if (body.whole) counts.whole++; }
+    if (body?.text) { counts.files++; names.files.push(p); if (body.whole) counts.whole++; }
     // Counted from what is shown: a cut can drop the later entries.
     if (relatedShown) {
-      counts.tests += tests.filter((t) => relatedShown.includes(`#### Test: ${t.path}\n`)).length;
-      counts.callers += callers.filter((c) => c.hits.length && relatedShown.includes(`#### Uses of ${c.symbol} elsewhere in the repository\n`)).length;
+      for (const t of tests) if (relatedShown.includes(`#### Test: ${t.path}\n`)) { counts.tests++; names.tests.push(t.path); }
+      for (const c of callers) if (c.hits.length && relatedShown.includes(`#### Uses of ${c.symbol} elsewhere in the repository\n`)) { counts.callers++; names.callers.push(`${p}:${c.symbol}`); }
     }
   }
-  counts.guidelines = guide ? (guide.match(/^## /gm) ?? []).length : 0;
+  counts.guidelines = usedGuides.length;
   const files = new Map([...blocks].filter(([, v]) => v).map(([k, v]) => [k, wellFormed(v)]));
   const filesText = paths.filter((p) => files.has(p)).map((p) => files.get(p)).join("\n\n");
   const guideOk = wellFormed(guide);
   const text = [guideOk, filesText].filter(Boolean).join("\n\n");
-  return { text, guide: guideOk, filesText, files, counts };
+  return { text, guide: guideOk, filesText, files, counts, names };
 }
 
 const noteSpan = (n) => {
@@ -409,7 +445,7 @@ const noteSpan = (n) => {
   return `${fence} ${t} ${fence}`;
 };
 
-/** One line for the review's About block: what context the models had. */
+/** One line for the review's About block: what context the models were shown (summary.gathered: something was read but none of it fit). */
 export function contextLine(summary) {
   if (!summary) return null;
   if (summary.off) return "- Context: off; models saw the diff only.";
@@ -420,5 +456,5 @@ export function contextLine(summary) {
   if (summary.callers) bits.push(`uses of ${summary.callers} changed name${summary.callers === 1 ? "" : "s"}`);
   // A note can carry a path the author chose: unless it is plain, it is shown as code, so no mention, link or reference in it can act.
   const notes = (summary.notes ?? []).map((n) => noteSpan(n)).filter(Boolean).slice(0, 3).join("; ");
-  return `- Context: ${bits.length ? bits.join(", ") : "none found"}${notes ? ` (${notes})` : ""}.`;
+  return `- Context: ${bits.length ? bits.join(", ") : summary.gathered ? "none fit the allowance" : "none found"}${notes ? ` (${notes})` : ""}.`;
 }
