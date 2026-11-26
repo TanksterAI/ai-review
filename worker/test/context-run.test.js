@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTEXT_STEP_MS, startRun, stepRun } from "../src/review-run.js";
+import { CONTEXT_STEP_MS, MAX_FETCH_BYTES, startRun, stepRun } from "../src/review-run.js";
 import { config } from "../src/config.js";
+import { createEffects } from "../src/effects.js";
 import { askedFindings, memoryKv, memoryStorage, testSleep } from "./helpers.js";
 
 // Runs of the review with the context step (context.js), seen from outside:
@@ -360,4 +361,71 @@ test("context: when no model reviewed a batch, the About line does not claim con
   assert.match(body, /\n- Model: none/);
   assert.match(body, /\n- Context: none shown; no model reviewed a batch\.\n/);
   assert.doesNotMatch(body, /guideline file|changed file beyond the diff/);
+});
+
+test("context: when the file list cannot be read, a changed file too large to read is cut off at the limit and noted, and a small one is still read", async () => {
+  const small = file("src/small.js", AUTH_PATCH.replace("checkToken", "smallThing"), { status: "modified", sha: "4".repeat(40) });
+  const s = contextScenario({ extraFiles: [small] });
+  s.github.tree = async () => { const e = new Error("forbidden"); e.status = 403; throw e; };
+  s.github.blobs = new Map([["4".repeat(40), CTX_FILE.replace("verifySignature", "smallSig")]]);
+  const asked = [];
+  s.github.blob = async (_r, sha, opts) => {
+    asked.push({ sha: sha[0], maxBytes: opts?.maxBytes });
+    if (sha[0] === "5") return { bytes: new Uint8Array(0), size: Number.POSITIVE_INFINITY, tooLarge: true };
+    const t = s.github.blobs.get(sha);
+    return t === undefined ? null : { bytes: new TextEncoder().encode(t), size: t.length };
+  };
+  await runAll(s);
+  // Every changed file was asked for with the limit, so no answer can be buffered past it.
+  assert.deepEqual(asked.filter((a) => a.sha === "5" || a.sha === "4").map((a) => a.maxBytes), [400_000, 400_000]);
+  assert.equal(s.github.posted.length, 1);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+  assert.match(s.github.posted[0].body, /src\/auth\.js is too large to read whole/);
+  const draft = s.models.calls.find((c) => c.files?.includes("src/small.js")).text;
+  assert.match(draft, /### src\/small\.js \(the file after the change/);
+  assert.doesNotMatch(draft, /### src\/auth\.js \(the file after the change/);
+});
+
+test("a changed file's text is asked for with the reviewer's file limit, and a blob over it is named as not covered, never read whole", async () => {
+  const files = [file("data/huge.js", undefined, { sha: "1".repeat(40) }), file("data/modified.js", undefined, { sha: "2".repeat(40), status: "modified" }), file("src/a.js", added(5, "a_"))];
+  const github = fakeGithub({ files });
+  const asked = [];
+  github.blob = async (_r, sha, opts) => {
+    asked.push({ sha: sha[0], maxBytes: opts?.maxBytes });
+    // The first file's new text is over the limit; the second file's old text is.
+    if (sha[0] === "1" || sha[0] === "3") return { bytes: new Uint8Array(0), size: Number.POSITIVE_INFINITY, tooLarge: true };
+    return { bytes: new TextEncoder().encode("const x = 2;\n"), size: 13 };
+  };
+  github.fileSha = async (_r, path) => (path === "data/modified.js" ? "3".repeat(40) : null);
+  const s = setup({ github, env: { CONTEXT: "off" } });
+  await runAll(s);
+  assert.ok(asked.length >= 3 && asked.every((a) => a.maxBytes === MAX_FETCH_BYTES), JSON.stringify(asked));
+  const { body } = github.summaries.at(-1);
+  assert.match(body, /`data\/huge\.js` \(it is over the reviewer's limit of 5 MB a file\)/);
+  assert.match(body, /`data\/modified\.js` \(it is over the reviewer's limit of 5 MB a file\)/);
+  assert.notEqual(github.statuses.at(-1).state, "error", "the review finishes");
+});
+
+// A stand-in for the App client: records each call and answers with what respond gives (an Error is thrown).
+function fakeApp(respond) {
+  const calls = [];
+  return { calls, async installationToken() { return "tok"; }, async call(method, path, opts) { calls.push({ method, path, ...opts }); const out = respond(path); if (out instanceof Error) throw out; return out; } };
+}
+
+test("blob with maxBytes bounds the answer, a blob that cannot fit is tooLarge and not an error, and a blob that fits is never cut", async () => {
+  const tooBig = Object.assign(new Error("GitHub GET /git/blobs failed to fit"), { tooLarge: true });
+  const app = fakeApp(() => tooBig);
+  const out = await createEffects({}, { app }).blob("TanksterAI/x", "c".repeat(40), { maxBytes: 1000 });
+  assert.deepEqual([out.tooLarge, out.bytes.length, out.size], [true, 0, Number.POSITIVE_INFINITY]);
+  assert.equal(app.calls[0].maxBytes, Math.ceil(1000 * 1.4) + 4096);
+  // Without a limit asked for, none is passed on.
+  const plain = fakeApp(() => ({ content: btoa("hi"), size: 2 }));
+  assert.equal((await createEffects({}, { app: plain }).blob("TanksterAI/x", "c".repeat(40))).size, 2);
+  assert.equal("maxBytes" in plain.calls[0], false);
+  // GitHub's JSON for a blob of exactly the limit (base64 with a line break every 60 characters, escaped) is under the answer limit that is passed on.
+  for (const n of [1, 1000, 399_999, 400_000]) {
+    const b64 = Buffer.alloc(n, 7).toString("base64").replace(/(.{60})/g, "$1\n");
+    const json = JSON.stringify({ sha: "c".repeat(40), node_id: "B".repeat(60), size: n, url: `https://api.github.com/repos/TanksterAI/${"x".repeat(100)}/git/blobs/${"c".repeat(40)}`, content: b64, encoding: "base64" });
+    assert.ok(Buffer.byteLength(json) <= Math.ceil(n * 1.4) + 4096, `${n} bytes: ${Buffer.byteLength(json)}`);
+  }
 });
