@@ -511,6 +511,8 @@ async function stagePlan(ctx, run, save) {
 // by hand (the effects do not go through the step's subrequest counter): at
 // most CONTEXT_CALLS_PER_STEP GitHub calls a step, inside Workers Free's 50.
 const CONTEXT_CALLS_PER_STEP = 36;
+// And at most this long: each read has a deadline of its own (effects.js), so a GitHub that answers nothing could otherwise take a step past the alarm's wall-clock limit. What is left is read in the next step.
+export const CONTEXT_STEP_MS = 5 * 60_000;
 const TEST_FILE_CHARS = 8_000;
 const ctxKey = (id, kind, path = "") => `${RUN}${id}:ctx:${kind}${path ? `:${path}` : ""}`;
 
@@ -528,7 +530,8 @@ async function stageContext(ctx, run, save) {
   const c = (run.context ??= { step: "tree", at: 0, notes: [], counts: { guidelines: 0, files: 0, tests: 0, callers: 0 } });
   const note = (t) => { if (c.notes.length < 6 && !c.notes.includes(t)) c.notes.push(t); };
   let calls = 0;
-  const room = () => calls < CONTEXT_CALLS_PER_STEP;
+  const began = ctx.deps.now();
+  const room = () => calls < CONTEXT_CALLS_PER_STEP && ctx.deps.now() - began < CONTEXT_STEP_MS;
   // One read that may fail without failing the review.
   const soft = async (what, f) => {
     calls++;
