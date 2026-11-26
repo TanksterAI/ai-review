@@ -412,12 +412,13 @@ async function stageContent(ctx, run, save) {
     // long unchanged line is cut by trimLongLines, never taken for the file.
     const left = ctx.cfg.maxPrChars - run.patchChars;
     try {
-      const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha) : null;
+      // The limit goes with the read, so a blob over it is cut off as it arrives and never held whole in memory (a tooLarge result stands for it).
+      const head = f.sha ? await ctx.fx.blob(run.repo.full, f.sha, { maxBytes: MAX_FETCH_BYTES }) : null;
       const oldPath = f.previous_filename ?? f.filename;
       const baseSha = f.status === "added" ? null : await ctx.fx.fileSha(run.repo.full, oldPath, run.mergeBase);
-      const base = baseSha ? await ctx.fx.blob(run.repo.full, baseSha) : null;
+      const base = baseSha ? await ctx.fx.blob(run.repo.full, baseSha, { maxBytes: MAX_FETCH_BYTES }) : null;
       if (!head) f.unfetched = "its new text could not be fetched";
-      else if (head.bytes.length > MAX_FETCH_BYTES || (base?.bytes.length ?? 0) > MAX_FETCH_BYTES) f.unfetched = `it is over the reviewer's limit of ${MAX_FETCH_BYTES / 1024 / 1024} MB a file`;
+      else if (head.tooLarge || base?.tooLarge || head.bytes.length > MAX_FETCH_BYTES || (base?.bytes.length ?? 0) > MAX_FETCH_BYTES) f.unfetched = `it is over the reviewer's limit of ${MAX_FETCH_BYTES / 1024 / 1024} MB a file`;
       else if (NUL(head.bytes) || (base && NUL(base.bytes))) f.binary = true;
       else {
         const dec = new TextDecoder();
@@ -612,7 +613,9 @@ async function stageContext(ctx, run, save) {
   if (c.step === "files") {
     for (; c.at < c.files.length && room(); c.at++) {
       const f = c.files[c.at];
-      const b = await soft(f.path, () => fx.blob(run.repo.full, f.sha));
+      // The size limit goes with the read: when the file list could not be read the size of a changed file is not known, and a blob of tens of megabytes must not be held in memory to find that out.
+      const b = await soft(f.path, () => fx.blob(run.repo.full, f.sha, { maxBytes: MAX_CONTEXT_FILE_CHARS * 4 }));
+      if (b?.tooLarge) { note(`${f.path} is too large to read whole`); continue; }
       if (!b || isBinary(b) || b.bytes.length > MAX_CONTEXT_FILE_CHARS * 4) continue;
       const text = redact(decode(b));
       if (text.length > MAX_CONTEXT_FILE_CHARS) { note(`${f.path} is too large to read whole`); continue; }
