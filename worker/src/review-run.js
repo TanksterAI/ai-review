@@ -514,6 +514,11 @@ const CONTEXT_CALLS_PER_STEP = 36;
 const TEST_FILE_CHARS = 8_000;
 const ctxKey = (id, kind, path = "") => `${RUN}${id}:ctx:${kind}${path ? `:${path}` : ""}`;
 
+// A request that got no answer at all (a dropped connection, a timeout), as opposed to a bug of ours: only the first is skipped as optional context.
+const noAnswer = (e) => e?.name === "AbortError" || e?.name === "TimeoutError" || (e instanceof TypeError && /fetch|network|connect|socket|reset|terminated|time(d )?-?out|econn|etimedout|eai_again|closed|abort/i.test(String(e.message)));
+// Reads that may get no answer once each before the rest are skipped without a second try: each such first failure throws, and the step's own failure handling gives a run up after six in a row.
+const MAX_FIRST_FAILURES = 3;
+
 const decode = (b) => new TextDecoder().decode(b.bytes);
 const isBinary = (b) => b.bytes.subarray(0, 8000).includes(0);
 
@@ -533,10 +538,12 @@ async function stageContext(ctx, run, save) {
         note(`${what} could not be read (GitHub ${e.status})`);
         return null;
       }
-      // No answer from GitHub at all (the connection): the first such failure throws, so the step is tried again (the step's own failure handling keeps these marks). The same read failing again is skipped, and from then on every read that gets no answer is skipped at once, so context, which is optional, never stops a review.
+      // Not a lost connection: a bug of ours is never skipped as if GitHub had not answered.
+      if (!noAnswer(e)) throw e;
+      // No answer from GitHub at all (the connection): the first such failure throws, so the step is tried again (the step's own failure handling keeps these marks). The same read failing again is skipped, and so is every read once a few have failed (MAX_FIRST_FAILURES), so context, which is optional, never stops a review.
       const at = `${c.step}:${c.at}:${what}`;
       c.failed ??= {};
-      if (c.degraded || c.failed[at]) {
+      if (c.degraded || c.failed[at] || Object.keys(c.failed).length >= MAX_FIRST_FAILURES) {
         c.degraded = true;
         note(`${what} could not be read (no answer from GitHub)`);
         return null;

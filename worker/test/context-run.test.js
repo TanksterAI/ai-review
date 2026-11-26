@@ -248,3 +248,26 @@ test("context: many reads failing for good in a row still leave the review runni
   assert.equal(s.github.posted.length, 1);
   assert.equal(s.github.statuses.at(-1).state, "success");
 });
+
+test("context: reads that each fail once and then work, one after another, do not use up the step's tries", async () => {
+  const extra = Array.from({ length: 10 }, (_, i) => file(`src/h${i}.js`, AUTH_PATCH.replace("checkToken", `fn${i}y`), { status: "modified", sha: "5".repeat(40) }));
+  const s = contextScenario({ extraFiles: extra });
+  const blob = s.github.blob;
+  let n = 0;
+  // Every other read gets no answer: each read fails once, then works when tried again.
+  s.github.blob = async (...a) => { if (++n % 2 === 1) throw new TypeError("fetch failed"); return blob.call(s.github, ...a); };
+  await runAll(s);
+  assert.equal(s.github.posted.length, 1);
+  assert.equal(s.github.statuses.at(-1).state, "success");
+});
+
+test("context: a bug of ours is not taken for a lost connection, and is not skipped", async () => {
+  for (const err of [new Error("bug"), new TypeError("x is not a function")]) {
+    const s = contextScenario();
+    s.github.searchCode = async () => { throw err; };
+    await runAll(s);
+    assert.equal(s.github.posted.length, 0, err.message);
+    assert.equal(s.github.statuses.at(-1).state, "error", err.message);
+    assert.match(s.github.statuses.at(-1).description, /context step kept failing/);
+  }
+});
