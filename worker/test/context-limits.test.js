@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, changedSymbols, excerpt, indexTests, parseTree, pickGuidelines, redact, testsFor } from "../src/context.js";
+import { MAX_GUIDE_BLOB_BYTES, MAX_TEST_BLOB_BYTES, batchContext, changedSymbols, excerpt, guideText, indexTests, parseTree, pickGuidelines, redact, testsFor } from "../src/context.js";
 import { buildPrompt } from "../src/review.js";
 import { verifierPrompt } from "../src/verify.js";
 
@@ -83,4 +83,14 @@ test("the counts of tests and callers are those shown, not those found", () => {
     assert.equal(counts.tests, tests, `tests at cap ${cap}`);
     assert.equal(counts.callers, text.includes("#### Uses of useA elsewhere in the repository\n") ? 1 : 0, `callers at cap ${cap}`);
   }
+});
+
+test("the guidelines stay within their own allowance, the newlines between files included", () => {
+  const two = [{ path: "CLAUDE.md", dir: "", text: "x" }, { path: "AGENTS.md", dir: "", text: "x" }];
+  const exact = guideText(two, ["src/a.js"], 1000).length;
+  assert.ok(guideText(two, ["src/a.js"], exact).includes("AGENTS.md"), "both fit at their exact length");
+  assert.ok(!guideText(two, ["src/a.js"], exact - 1).includes("AGENTS.md"), "one character less and the second no longer fits");
+  assert.equal(batchContext({ guidelines: two }, { included: ["src/a.js"] }, 120).guide.length <= 30, true);
+  const long = [{ path: "CLAUDE.md", dir: "", text: "a".repeat(300) }, { path: "AGENTS.md", dir: "", text: "b".repeat(900) }];
+  for (let cap = 0; cap <= 1400; cap++) assert.ok(guideText(long, ["src/a.js"], cap).length <= cap, `guide cap ${cap}`);
 });

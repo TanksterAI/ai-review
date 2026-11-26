@@ -192,16 +192,18 @@ export function guideText(guidelines, paths, cap) {
     if (g.dir && !paths.some((p) => p.startsWith(`${g.dir}/`))) continue;
     if (g.scope?.length && !paths.some((p) => g.scope.some((s) => globToRegExp(s).test(p)))) continue;
     const block = `## ${g.path}\n${g.text}\n`;
-    if (size + block.length > cap) {
+    // The newline that joins a block to the one before it is part of the cap too.
+    const join = parts.length ? 1 : 0;
+    if (size + join + block.length > cap) {
       // What is left, less the heading and the marker that says it was cut.
       const head = `## ${g.path}\n`;
       const tail = "\n[cut]\n";
-      const room = cap - size - head.length - tail.length;
+      const room = cap - size - join - head.length - tail.length;
       if (room > 200) parts.push(`${head}${g.text.slice(0, room)}${tail}`);
       break;
     }
     parts.push(block);
-    size += block.length;
+    size += join + block.length;
   }
   return parts.join("\n");
 }
