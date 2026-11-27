@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.js";
 import { handleBench, cleanChain } from "../src/bench.js";
+import { LATE, beforeDeadline } from "../src/providers.js";
 import { memoryKv, responsesResult, GROUNDED_PATCH, OWNER_ID } from "./helpers.js";
 
 const NOW = 1_794_500_000_000;
@@ -28,6 +29,7 @@ test("cleanChain accepts known providers and plain model ids only", () => {
   assert.equal(cleanChain("anthropic:claude-haiku-5-5, gemini:gemini-3.5-flash-lite"), "anthropic:claude-haiku-5-5,gemini:gemini-3.5-flash-lite");
   assert.equal(cleanChain("workers-ai:@cf/openai/gpt-oss-120b"), "workers-ai:@cf/openai/gpt-oss-120b");
   assert.equal(cleanChain("anthropic:claude-opus-5-5"), null); // no listed price, would be costed as Sonnet
+  assert.equal(cleanChain("workers-ai:@cf/qwen/qwen2.5-coder-32b-instruct"), null); // no neuron rate, would be costed at the fallback
   for (const bad of ["", "openai:gpt", "anthropic:", "anthropic:a b", "anthropic:x;y", "anthropic:a,,", 5, null, Array(9).fill("gemini:g").join(",")]) assert.equal(cleanChain(bad), null, String(bad));
 });
 
@@ -141,4 +143,29 @@ test("a finding the grounding gate drops is returned with its stage and reason, 
   assert.deepEqual([out.dropped[0].stage, out.dropped[0].path, out.dropped[0].title], ["grounding", "src/a.js", "Invented"]);
   assert.ok(out.dropped[0].reason.length > 0);
   assert.deepEqual(out.shown, []);
+});
+
+test("a call given up on at the deadline is handed to waitUntil so its spend still lands", async () => {
+  const kept = [];
+  const waitUntil = (p) => kept.push(p);
+  let finish;
+  const slow = new Promise((r) => { finish = r; });
+  const got = await beforeDeadline(slow, NOW + 1, { now: () => NOW, sleep: () => Promise.resolve(), waitUntil });
+  assert.equal(got, LATE);
+  assert.equal(kept.length, 1);
+  finish("late answer");
+  await Promise.all(kept); // resolves quietly once the call finishes
+  const failing = Promise.reject(new Error("boom"));
+  await beforeDeadline(failing, NOW + 1, { now: () => NOW, sleep: () => Promise.resolve(), waitUntil }).catch(() => {});
+  await Promise.all(kept); // a failing call never rejects the registered promise
+});
+
+test("the bench route passes waitUntil through, and a drafter still running is registered", async () => {
+  const kept = [];
+  const hang = { calls: [], run() { return new Promise(() => {}); } };
+  const e = env(hang);
+  // Every wait ends at once, so the deadline wins while the drafter never answers.
+  const res = await handleBench(req(body), e, { ...deps(), sleep: () => Promise.resolve(), waitUntil: (p) => kept.push(p) });
+  assert.equal(res.status, 503);
+  assert.ok(kept.length >= 1);
 });

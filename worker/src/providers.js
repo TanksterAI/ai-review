@@ -312,7 +312,11 @@ function anthropic(env, cfg, model, deps) {
 // passes. The timer is deps.sleep, so tests control it. Used for every model
 // call a review makes, drafting and verifying.
 export const LATE = Symbol("late");
-export function beforeDeadline(promise, deadline, { now, sleep }) {
+export function beforeDeadline(promise, deadline, { now, sleep, waitUntil }) {
+  // A call given up on at the deadline keeps running; where the runtime
+  // offers waitUntil it is told to let the call finish, so its spend still
+  // reaches the ledger after the response has gone.
+  if (waitUntil) waitUntil(Promise.resolve(promise).then(() => {}, () => {}));
   const left = deadline - now();
   return left <= 0 ? Promise.resolve(LATE) : Promise.race([promise, sleep(left).then(() => LATE)]);
 }

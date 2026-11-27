@@ -20,7 +20,7 @@
 
 import { buildPrompt, classifyFindings, prepareFiles } from "./review.js";
 import { draftWithChain } from "./draft.js";
-import { createSerial } from "./budget.js";
+import { RATES, createSerial } from "./budget.js";
 import { ANTHROPIC_PRICES, createProviders, draftChain, verifyOff } from "./providers.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
@@ -52,6 +52,9 @@ export function cleanChain(value) {
     // A model with no listed price would be priced and capped at another
     // model's rate, so the benchmark refuses it before any call is made.
     if (kind === "anthropic" && !Object.hasOwn(ANTHROPIC_PRICES, p.slice(kind.length + 1))) return null;
+    // Likewise a Workers AI model with no neuron rate would be costed at the
+    // fallback rate, which can sit well below its real price.
+    if (kind === "workers-ai" && !Object.hasOwn(RATES, p.slice(kind.length + 1))) return null;
   }
   return parts.join(",");
 }
@@ -127,7 +130,7 @@ export async function handleBench(request, env, deps = {}) {
   const { instructions, input: modelInput } = buildPrompt({ repository, title: input.title, body: input.body, prepared, tag: randomTag() });
   const chars = instructions.length + modelInput.length;
   const started = now();
-  const d = { now, sleep, fetch: fetchImpl, log: () => {}, serial: createSerial() };
+  const d = { now, sleep, fetch: fetchImpl, log: () => {}, serial: createSerial(), waitUntil: deps.waitUntil };
   const providers = createProviders(benchEnv, cfg, draftChain(benchEnv, cfg), d);
   const drafted = await draftWithChain({ providers, instructions, modelInput, chars, cfg, deps: d, started, repository, pr: 0 });
   if (!drafted.answer) {

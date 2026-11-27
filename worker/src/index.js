@@ -453,7 +453,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
 export default {
   async fetch(request, env, ctx) {
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (e) {
       // What broke, never what it said (report.js); the runtime still sees the error.
       const sent = report(env, e, "fetch");
@@ -464,7 +464,7 @@ export default {
   },
 };
 
-async function route(request, env) {
+async function route(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname === "/healthz" && request.method === "GET") {
     const cfg = config(env);
@@ -488,7 +488,7 @@ async function route(request, env) {
   }
   if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
   if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
-  if (url.pathname === "/v1/bench") return handleBench(request, env);
+  if (url.pathname === "/v1/bench") return handleBench(request, env, { waitUntil: (p) => ctx?.waitUntil?.(p) });
   if (url.pathname === "/v1/review") {
     if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
     return handleReview(request, env);
