@@ -27,6 +27,7 @@ const req = (b, token = "tok", method = "POST") => new Request("https://x/v1/ben
 test("cleanChain accepts known providers and plain model ids only", () => {
   assert.equal(cleanChain("anthropic:claude-haiku-5-5, gemini:gemini-3.5-flash-lite"), "anthropic:claude-haiku-5-5,gemini:gemini-3.5-flash-lite");
   assert.equal(cleanChain("workers-ai:@cf/openai/gpt-oss-120b"), "workers-ai:@cf/openai/gpt-oss-120b");
+  assert.equal(cleanChain("anthropic:claude-opus-5-5"), null); // no listed price, would be costed as Sonnet
   for (const bad of ["", "openai:gpt", "anthropic:", "anthropic:a b", "anthropic:x;y", "anthropic:a,,", 5, null, Array(9).fill("gemini:g").join(",")]) assert.equal(cleanChain(bad), null, String(bad));
 });
 
@@ -126,6 +127,18 @@ test("with verification on, the verifier's verdicts decide what is shown, and it
     assert.equal(res.status, 200, JSON.stringify(out));
     assert.equal(out.shown.length, expected, v);
     assert.equal(out.verified.hidden, 1 - expected);
+    assert.equal(out.hidden.length, 1 - expected);
+    if (!expected) assert.deepEqual([out.hidden[0].stage, out.hidden[0].path, out.hidden[0].line, out.hidden[0].status], ["verification", "src/a.js", 3, "refuted"]);
     assert.ok(out.verified.calls >= 1);
   }
+});
+
+test("a finding the grounding gate drops is returned with its stage and reason, not only counted", async () => {
+  const ungrounded = JSON.stringify({ summary: "x", findings: [{ path: "src/a.js", line: 3, severity: "major", category: "bug", title: "Invented", evidence: "this text is nowhere in the diff", body: "nope" }] });
+  const out = await (await handleBench(req(body), env(ai(ungrounded)), deps())).json();
+  assert.equal(out.drafted.dropped_by_grounding, 1);
+  assert.equal(out.dropped.length, 1);
+  assert.deepEqual([out.dropped[0].stage, out.dropped[0].path, out.dropped[0].title], ["grounding", "src/a.js", "Invented"]);
+  assert.ok(out.dropped[0].reason.length > 0);
+  assert.deepEqual(out.shown, []);
 });

@@ -21,7 +21,7 @@
 import { buildPrompt, classifyFindings, prepareFiles } from "./review.js";
 import { draftWithChain } from "./draft.js";
 import { createSerial } from "./budget.js";
-import { createProviders, draftChain, verifyOff } from "./providers.js";
+import { ANTHROPIC_PRICES, createProviders, draftChain, verifyOff } from "./providers.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { config } from "./config.js";
@@ -39,12 +39,20 @@ function randomTag() {
 }
 
 // "kind:model,kind:model" -> the string, or null if any entry is not a known
-// provider and a plain model id. At most 8 entries.
+// provider and a plain model id (an Anthropic one must have a listed price).
+// At most 8 entries.
 export function cleanChain(value) {
   if (typeof value !== "string") return null;
   const parts = value.split(",").map((s) => s.trim());
   if (parts.length === 0 || parts.length > 8) return null;
-  for (const p of parts) if (!ID.test(p) || !KINDS.includes(p.slice(0, p.indexOf(":")))) return null;
+  for (const p of parts) {
+    if (!ID.test(p)) return null;
+    const kind = p.slice(0, p.indexOf(":"));
+    if (!KINDS.includes(kind)) return null;
+    // A model with no listed price would be priced and capped at another
+    // model's rate, so the benchmark refuses it before any call is made.
+    if (kind === "anthropic" && !Object.hasOwn(ANTHROPIC_PRICES, p.slice(kind.length + 1))) return null;
+  }
   return parts.join(",");
 }
 
@@ -70,6 +78,7 @@ async function readLimited(request, max) {
 }
 
 const brief = (f) => ({ path: f.path, line: f.line ?? null, severity: f.severity, title: f.title });
+const gone = (stage, f, reason, status) => ({ stage, ...brief(f ?? {}), ...(status ? { status } : {}), reason: String(reason ?? "").slice(0, 300) });
 
 export async function handleBench(request, env, deps = {}) {
   if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
@@ -123,7 +132,7 @@ export async function handleBench(request, env, deps = {}) {
   const drafted = await draftWithChain({ providers, instructions, modelInput, chars, cfg, deps: d, started, repository, pr: 0 });
   if (!drafted.answer) {
     const why = drafted.outcomes.map((o) => `${o.id ?? ""} ${o.kind}: ${o.reason ?? ""}`.trim());
-    return json(drafted.timedOut || drafted.late ? 503 : 502, { status: "failed", reason: "no model in the chain gave an answer", outcomes: why, usage: { drafting: { usd: drafted.usd, neurons: drafted.neurons } } });
+    return json(drafted.timedOut || drafted.late ? 503 : 502, { status: "failed", reason: "no model in the chain gave an answer", outcomes: why, usage: { drafting: { usd: drafted.usd, neurons: drafted.neurons, ...(drafted.late ? { partial: true } : {}) } } });
   }
   const { answer, used } = drafted;
   const raw = Array.isArray(answer.findings) ? answer.findings : [];
@@ -134,6 +143,7 @@ export async function handleBench(request, env, deps = {}) {
     drafter: used.id,
     summary: typeof answer.summary === "string" ? answer.summary.slice(0, 300) : "",
     drafted: { raw: raw.length, kept_after_grounding: grounded.classified.inline.length + grounded.classified.general.length, dropped_by_grounding: grounded.dropped.length },
+    dropped: grounded.dropped.map((d) => gone("grounding", d.finding, d.reason)),
     usage: { drafting: { usd: drafted.usd, neurons: drafted.neurons } },
   };
   if (input.verify === false || verifyOff(benchEnv)) {
@@ -145,7 +155,10 @@ export async function handleBench(request, env, deps = {}) {
   if (verified.outcome.kind !== "ok") return json(200, { ...out, verified: { stopped: verified.outcome.kind, reason: verified.outcome.reason ?? "", calls: verified.calls, partial: true }, usage: { ...out.usage, verification: { usd: verified.usd, neurons: verified.neurons, partial: true } }, shown: [] });
   const { shown, hidden } = applyVerdicts(grounded.classified, grounded.dropped, verified.verdicts);
   out.shown = [...shown.inline, ...shown.general].map(brief);
-  out.verified = { calls: verified.calls, hidden: hidden.length, off: !!verified.off };
-  out.usage.verification = { usd: verified.usd, neurons: verified.neurons };
+  // applyVerdicts also lists the grounding drops; those are reported above.
+  const refused = hidden.filter((h) => h.status !== "dropped");
+  out.verified = { calls: verified.calls, hidden: refused.length, off: !!verified.off };
+  out.hidden = refused.map((h) => gone("verification", h, h.reason, h.status));
+  out.usage.verification = { usd: verified.usd, neurons: verified.neurons, ...(verified.late ? { partial: true } : {}) };
   return json(200, out);
 }
