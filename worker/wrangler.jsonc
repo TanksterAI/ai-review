@@ -12,6 +12,10 @@
     // ai-review-ledger: daily neuron spend and reviewed commits.
     { "binding": "LEDGER", "id": "REPLACED_AT_DEPLOY" }
   ],
+  // What the reviewer has been taught (src/memory.js; schema in migrations/). Free plan.
+  "d1_databases": [
+    { "binding": "MEMORY", "database_name": "ai-review-memory", "database_id": "da557de6-32af-4f12-8170-c0258d051b30" }
+  ],
   // v2: one Durable Object per pull request (SQLite-backed, on Workers Free).
   // AppSecrets: the GitHub App's id, slug, key and webhook secret, stored by
   // the one-time manifest flow (GET /v1/setup/github-app). No person handles them.

@@ -191,6 +191,15 @@ Before it drafts, a review reads what others have already said on the pull reque
 - **Never fatal:** if GitHub cannot be read, the review goes on from the diff alone and says so in "About this review". `REVIEW_CONTEXT=off` switches it off.
 - **Permissions:** read on checks, commit statuses and actions, as well as contents and pull requests (all already granted to the installation).
 
+## What the reviewer is taught
+
+A maintainer (anyone with write access, checked through the API each time) can teach it about their repository, in a comment of its own that is nothing else:
+
+- `@tankster-ai-review learn Never log request bodies in the webhook handler.` saves one lesson (one sentence, at most 400 characters, secrets redacted).
+- `@tankster-ai-review forget 3` removes lesson 3. `@tankster-ai-review learnings` lists them.
+
+Lessons live in a D1 database (`ai-review-memory`, free plan, found with FTS5; apply `worker/migrations/*.sql` in order) and are kept per repository, never shared across repositories, up to 200 each. Each review reads the ones whose words match the pull request's title, changed file names and description (best first, up to eight); if fewer than three match it adds the newest, unmarked, so a lesson can apply to a change it has no words in common with. They sit in a block of their own (at most 1,500 characters) shown to the drafter and the verifier as guidance from the maintainers, and the About section counts only the ones that matched. They are read even when GitHub's conversation cannot be, but `REVIEW_CONTEXT=off` turns them off with the rest. A lesson never makes the reviewer report a defect the code does not show, and never a reason to leave one out. Only a maintainer's `learn` is saved; nothing a model or another bot says is, and without the `MEMORY` binding the commands say teaching is not set up. Anyone with write access can `learn` or `forget`: a lesson steers every later review of the repository, so treat the commands as you would a merge right. The comment you type stays on GitHub as you wrote it; the stored lesson has secrets redacted.
+
 ## The MCP server (for agents)
 
 `POST /mcp` is a small MCP server (JSON-RPC over HTTP) so any agent can find out what the reviewer will do and ask it for something, without having to be taught. It is called with the caller's own GitHub token as a Bearer token; each call first checks that token can see the pull request, so a caller sees only what GitHub lets them see. Only `TanksterAI/*` repositories are served.

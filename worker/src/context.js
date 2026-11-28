@@ -112,7 +112,7 @@ const stateOf = (t) => (t.resolved ? "resolved" : t.outdated ? "outdated" : "ope
  * context as plain data, bounded (threads, comments, reviews, listed checks,
  * and bytes), ready to render and to keep.
  */
-export function buildContext({ conv = null, ci = null, ourLogin }) {
+export function buildContext({ conv = null, ci = null, lessons = [], ourLogin }) {
   // Open threads first, then the rest.
   const ranked = [...(conv?.threads ?? [])].sort((a, b) => Number(Boolean(a.resolved)) - Number(Boolean(b.resolved)));
   const threads = [];
@@ -145,7 +145,8 @@ export function buildContext({ conv = null, ci = null, ourLogin }) {
     if (quiet(kind, text)) continue;
     reviews.push({ by: who(r.login), kind, state: String(r.state ?? ""), text, at: r.at ?? null });
   }
-  const built = { threads, comments, reviews, ci: summariseCi(ci, ourLogin) };
+  const taught = (lessons ?? []).slice(0, 8).map((l) => ({ id: l.id, by: who(l.by), source: l.source === "confirmed" ? "confirmed" : "maintainer", text: snippet(l.text, 400), matched: l.matched !== false })).filter((l) => l.text);
+  const built = { lessons: taught, threads, comments, reviews, ci: summariseCi(ci, ourLogin) };
   // Never more than a Durable Object can hold: trim the least useful first.
   while (JSON.stringify(built).length > MAX_SAVED && (built.comments.length || built.reviews.length || built.threads.length > 5)) {
     if (built.comments.length > 5) built.comments.splice(0, Math.ceil(built.comments.length / 2));
@@ -189,6 +190,8 @@ function summariseCi(ci, ourLogin) {
 }
 
 const line = (s) => sanitize(s, 600, { inline: true });
+// What the lessons may take of the context budget.
+const LESSON_CHARS = 1500;
 
 /**
  * The context as fenced blocks for a prompt, within max characters in all
@@ -196,7 +199,7 @@ const line = (s) => sanitize(s, 600, { inline: true });
  * review's own account of itself.
  */
 export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
-  const stats = { threads: 0, comments: 0, reviews: 0, bots: [], failing: 0, pending: 0, passing: 0, ci: false, cut: false };
+  const stats = { lessons: 0, threads: 0, comments: 0, reviews: 0, bots: [], failing: 0, pending: 0, passing: 0, ci: false, cut: false };
   if (!built) return { text: "", stats };
 
   const ci = built.ci;
@@ -221,6 +224,19 @@ export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
     talk.push(s);
     return true;
   };
+  // What the maintainers taught it has its own small share, in its own block,
+  // so it can neither crowd out the talk nor be mistaken for it.
+  const taught = [];
+  let taughtUsed = 0;
+  for (const l of built.lessons ?? []) {
+    const s = line(`- lesson ${l.id} (${l.source === "maintainer" ? `from maintainer ${l.by}` : "a claim the code confirmed"}): ${l.text}`);
+    if (taughtUsed + s.length + 1 > LESSON_CHARS || used + s.length + 1 > max) { stats.cut = true; break; }
+    taughtUsed += s.length + 1;
+    used += s.length + 1;
+    taught.push(s);
+    // A lesson only counts as applied when its words matched this pull request.
+    if (l.matched !== false) stats.lessons++;
+  }
   const where = (t) => (t.path ? `${t.path}${t.line ? `:${t.line}` : ""}` : "no file");
   const replies = (rs) => { for (const r of rs) { if (!add(line(`    reply by ${r.kind} ${r.by}: ${r.text}`))) return false; seen(r.by, r.kind); } return true; };
   // What is said about a spot in the code: a bot's or a maintainer's is a
@@ -265,6 +281,7 @@ export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
   stats.bots = [...bots].sort();
 
   const blocks = [];
+  if (taught.length) blocks.push(fence("WHAT MAINTAINERS TAUGHT THIS REPOSITORY", tag, taught.join("\n")));
   if (talk.length) blocks.push(fence("OTHER PEOPLE AND BOTS ON THIS PULL REQUEST", tag, talk.join("\n")));
   if (checksText) blocks.push(checksText);
   return { text: blocks.join("\n\n"), stats };

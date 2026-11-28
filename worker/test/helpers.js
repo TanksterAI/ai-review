@@ -152,3 +152,23 @@ export function askedFindings(user) {
 export function testSleep(ms) {
   return ms >= 60_000 ? new Promise(() => {}) : Promise.resolve();
 }
+
+// A D1 look-alike over node:sqlite (FTS5 included), for the memory tests.
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync } from "node:fs";
+
+export function fakeD1() {
+  const db = new DatabaseSync(":memory:");
+  // Every migration, in order. Triggers hold semicolons: split on a semicolon that ends a statement line.
+  for (const f of ["0001_memory.sql", "0002_memory_update_trigger.sql"]) {
+    const sql = readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8");
+    for (const stmt of sql.split(/;\s*\n(?=CREATE|$)/).map((s) => s.trim()).filter(Boolean)) db.exec(`${stmt.replace(/;$/, "")};`);
+  }
+  const make = (text, args = []) => ({
+    bind: (...a) => make(text, a),
+    async all() { return { results: db.prepare(text).all(...args.map(clean)) }; },
+    async run() { const r = db.prepare(text).run(...args.map(clean)); return { meta: { last_row_id: Number(r.lastInsertRowid), changes: Number(r.changes) } }; },
+  });
+  const clean = (v) => (v === undefined ? null : v);
+  return { prepare: (t) => make(t), async batch(list) { return Promise.all(list.map((s) => s.run())); }, raw: db };
+}
