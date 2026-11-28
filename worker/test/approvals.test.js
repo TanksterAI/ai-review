@@ -101,6 +101,36 @@ test("approves each fully reviewed head once, and never a commit that is no long
   await decide(unknown);
   assert.equal(approvals(unknown.calls).length, 1);
 
+  // Approved at an older commit, but an App thread is open: no approval.
+  const blocked = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: "c".repeat(40) } });
+  await decide(blocked);
+  assert.equal(approvals(blocked.calls).length, 0);
+
+  // Approved at an older commit, and the head has no complete review yet: no
+  // approval, and the notice says pending.
+  const unreviewed = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40) }, reviewed: "b".repeat(40) });
+  await decide(unreviewed);
+  assert.equal(approvals(unreviewed.calls).length, 0);
+
+  // Approved at an older commit and a writer's resolve or approve forces a
+  // decision while the head (a bot's push, say) has no complete review: the
+  // renewal still waits for that review. A forced first approval is a
+  // writer's own call; renewing one over unreviewed commits never is.
+  const forced = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40) }, reviewed: "b".repeat(40) });
+  await decide(forced, { force: true, login: "rishitank" });
+  assert.equal(approvals(forced.calls).length, 0);
+
+  // Renewed once, then the same decision asked for three more times: still one.
+  const repeat = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40) } });
+  for (let i = 0; i < 4; i++) await decide(repeat);
+  assert.equal(approvals(repeat.calls).length, 1);
+
+  // GitHub's list was too long to read whole: the decision is unknown, so
+  // nothing is approved (never once per trigger).
+  const truncated = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40), truncated: true } });
+  await decide(truncated);
+  assert.equal(approvals(truncated.calls).length, 0);
+
   // A change request or a dismissed approval: approved again.
   for (const state of ["CHANGES_REQUESTED", "DISMISSED"]) {
     const m = await make({ decision: { state, commitId: "c".repeat(40) } });
@@ -126,6 +156,33 @@ test("a thread reopened after the approval asks for changes again; reopened befo
   const before = await make({ threads: [thread("t1", false)], decision: { state: "CHANGES_REQUESTED", commitId: HEAD } });
   await decide(before, { reopened: true });
   assert.equal(before.calls.some((c) => c[0] === "postReview"), false);
+});
+
+test("a reopened thread withdraws every approval of the App's that still stands, not only the latest", async () => {
+  // A renewal leaves the older approval standing too; both are dismissed.
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [55, 77] } });
+  const dismissed = [];
+  m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return true; };
+  await decide(m, { reopened: true });
+  assert.deepEqual(dismissed.sort(), [55, 77]);
+  assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 0);
+
+  // One refused: changes are requested, so nothing still reads as approved.
+  const r = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [55, 77] } });
+  r.fx.dismissReview = async (_r, _p, id) => id === 77;
+  await decide(r, { reopened: true });
+  assert.equal(r.calls.filter((c) => c[0] === "postReview").length, 1);
+});
+
+test("after a reopen dismisses the approval, the head is approved again only once its threads are resolved", async () => {
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
+  m.fx.dismissReview = async () => { m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 77 }; return true; };
+  await decide(m, { reopened: true });
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0, "still open");
+  m.w.threads[0].resolved = true;
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 1);
 });
 
 test("a stale approval is withdrawn by dismissing it, as CodeRabbit's; only if GitHub refuses are changes requested", async () => {

@@ -220,11 +220,28 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
   ];
   const app = fakeApp((m, path) => (path.endsWith("&page=1") ? page1 : page2));
   const d = await createEffects({}, { app }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
-  // With its id, so a stale approval can be dismissed.
-  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33 });
+  // With its id, so a stale approval can be dismissed, and the ids of every
+  // approval of the App's that still stands (here only 33).
+  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33, approvedIds: [33], truncated: false });
   assert.equal(app.log.calls.length, 2);
   const none = fakeApp(() => []);
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);
+});
+
+test("reviewDecision: every standing approval of the App's, and a list too long to read whole is marked truncated", async () => {
+  const bot = { login: "tankster-ai-review[bot]", type: "Bot" };
+  const reviews = [
+    { user: bot, state: "APPROVED", commit_id: "1".repeat(40), id: 11 },
+    { user: bot, state: "DISMISSED", commit_id: "2".repeat(40), id: 22 },
+    { user: bot, state: "APPROVED", commit_id: "3".repeat(40), id: 33 },
+  ];
+  const d = await createEffects({}, { app: fakeApp(() => reviews) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.deepEqual(d.approvedIds, [11, 33]);
+  assert.equal(d.truncated, false);
+  // Ten full pages: there may be more, so the answer is marked truncated.
+  const full = Array.from({ length: 100 }, (_, i) => ({ user: bot, state: "APPROVED", commit_id: "4".repeat(40), id: i }));
+  const t = await createEffects({}, { app: fakeApp(() => full) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.equal(t.truncated, true);
 });
 
 const thread = (over = {}) => ({

@@ -256,19 +256,28 @@ export function createEffects(env, deps = {}) {
 
     // The App's own review decision as GitHub counts it: its latest review
     // that approved, requested changes or was dismissed (comments change
-    // nothing). {state, commitId}, or null.
+    // nothing), with the ids of every approval of its own still standing (a
+    // renewed approval leaves the older one standing too, so a withdrawal
+    // dismisses them all). {state, commitId, id, approvedIds, truncated}, or
+    // null. truncated: ten full pages were read and there may be more, so the
+    // answer may be out of date.
     async reviewDecision(repoFull, pr, botLogin) {
       const name = nameOf(repoFull);
       const token = await app.installationToken([name], PR_SCOPE);
       let last = null;
+      const approvedIds = [];
+      let truncated = false;
       for (let page = 1; page <= 10; page++) {
         const list = await app.call("GET", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`, { token });
         for (const r of list ?? []) {
-          if (r?.user?.type === "Bot" && r.user.login === botLogin && DECISIONS.has(r.state)) last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
+          if (r?.user?.type !== "Bot" || r.user.login !== botLogin || !DECISIONS.has(r.state)) continue;
+          last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
+          if (r.state === "APPROVED" && Number.isSafeInteger(r.id)) approvedIds.push(r.id);
         }
         if (!list || list.length < 100) break;
+        if (page === 10) truncated = true;
       }
-      return last;
+      return last && { ...last, approvedIds, truncated };
     },
 
     // Withdraws one of the App's own reviews (an approval no longer true), as

@@ -1291,11 +1291,16 @@ export class PrState {
     }
     if (item.reopened) {
       if ((open.length || inBody.length) && decision?.state === "APPROVED") {
-        // As CodeRabbit's: the approval is withdrawn (dismissed). Only if
-        // GitHub refuses that is changes requested instead.
+        // As CodeRabbit's: the approval is withdrawn (dismissed). Every one of
+        // the App's approvals that still stands goes, since a renewal leaves
+        // the older one standing too. Only if GitHub refuses one is changes
+        // requested instead.
         const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
-        const dismissed = typeof fx.dismissReview === "function" && Number.isSafeInteger(decision.id)
-          ? await fx.dismissReview(key.repo, key.pr, decision.id, why) : false;
+        const ids = Array.isArray(decision.approvedIds) && decision.approvedIds.length ? decision.approvedIds : [decision.id];
+        let dismissed = typeof fx.dismissReview === "function" && ids.every((id) => Number.isSafeInteger(id));
+        for (const id of dismissed ? ids : []) {
+          if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
+        }
         if (!dismissed) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
       }
       // The summary's notice must not still say approved: it lists what is open.
@@ -1306,8 +1311,21 @@ export class PrState {
       await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
       return undefined;
     }
+    if (decision?.truncated) {
+      // Too many reviews to read whole: what GitHub counts is unknown, so
+      // nothing is approved (never once per trigger) and the notice stands.
+      return undefined;
+    }
     if (decision?.state === "APPROVED" && decision.commitId === head) {
       await this.noticeApproval(fx, key, { approved: head });
+      return undefined;
+    }
+    if (decision?.state === "APPROVED" && (await this.state()).lastCompleteReviewed !== head) {
+      // An approval of an older commit is renewed only over a complete review
+      // of the head, even when a writer's command forces the decision: the
+      // commits after it (a bot's push, say) are exactly what GitHub asks a
+      // fresh approval for. A forced first approval is the writer's own call.
+      await this.noticeApproval(fx, key, { pending: head, slug });
       return undefined;
     }
     const now = await fx.pullRequest(key.repo, key.pr);
