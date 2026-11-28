@@ -255,6 +255,9 @@ export async function verifyFindings({ classified, prepared, title = "", body = 
         ? { id: p.id, kind: "failed", reason: a.reason }
         : { id: p.id, kind: "deferred", reason: a.reason, resetAt: a.resetAt ?? nextUtcMidnight(now()) } };
     }
+    // The queue and the checks above take time: a call is never started once
+    // the deadline has passed, even by a fallback after an earlier failure.
+    if (deadline - now() <= 0) return { outcome: { id: p.id, kind: "unavailable", reason: NOT_IN_TIME.reason } };
     let r;
     spend.calls++;
     try {

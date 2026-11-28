@@ -20,6 +20,7 @@
 //   POST /v1/runner/session  runner.yml (OIDC) claims its job -> read-only token for one repo
 //   POST /v1/runner/review   runner.yml (OIDC) sends the diff -> the Worker reviews and posts
 //   GET  /v1/setup/github-app[/callback]  one-time App creation from a manifest
+//   POST /v1/bench  the owner's measuring stick: a chain over a diff, nothing posted (bench.js)
 // The App's private key and webhook secret come from the manifest flow and
 // live in the AppSecrets Durable Object (or Worker secrets, if set); no token
 // with more than read access ever leaves the Worker.
@@ -36,6 +37,7 @@ import { DEFAULT_SLUG, normalise, prKey, verifySignature } from "./webhook.js";
 import { objectOfJob } from "./pr-state.js";
 import { createEffects } from "./effects.js";
 import { handleMcp } from "./mcp.js";
+import { handleBench } from "./bench.js";
 import { appConfig, handleSetupCallback, handleSetupStart } from "./setup.js";
 import { report } from "./report.js";
 
@@ -451,7 +453,7 @@ export async function handleRunnerReview(request, env, deps = {}) {
 export default {
   async fetch(request, env, ctx) {
     try {
-      return await route(request, env);
+      return await route(request, env, ctx);
     } catch (e) {
       // What broke, never what it said (report.js); the runtime still sees the error.
       const sent = report(env, e, "fetch");
@@ -462,7 +464,7 @@ export default {
   },
 };
 
-async function route(request, env) {
+async function route(request, env, ctx) {
   const url = new URL(request.url);
   if (url.pathname === "/healthz" && request.method === "GET") {
     const cfg = config(env);
@@ -486,6 +488,7 @@ async function route(request, env) {
   }
   if (url.pathname === "/v1/runner/session" && request.method === "POST") return handleRunnerSession(request, env);
   if (url.pathname === "/v1/runner/review" && request.method === "POST") return handleRunnerReview(request, env);
+  if (url.pathname === "/v1/bench") return handleBench(request, env, { waitUntil: (p) => ctx?.waitUntil?.(p) });
   if (url.pathname === "/v1/review") {
     if (request.method !== "POST") return json(405, { status: "rejected", reason: "POST only" });
     return handleReview(request, env);
