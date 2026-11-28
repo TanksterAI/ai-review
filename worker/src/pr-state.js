@@ -1218,7 +1218,12 @@ export class PrState {
   // Approves the head when (as CodeRabbit's requirements) the latest commit has
   // a complete review (unless a writer's command forces it), none of the App's
   // own threads and no body-only finding is open, the App has not approved
-  // already, and the head is unchanged just before approving. A thread
+  // this head already, and the head is unchanged just before approving. An
+  // approval of an older commit is renewed at the head once that head has a
+  // complete review: GitHub does not count it for later commits pushed by a
+  // bot or a branch update (a ruleset's extra approval for unattributed
+  // changes), and no repository dismisses stale reviews, so the App keeps its
+  // own approval current. A thread
   // resolved by someone without write access still counts as open. A thread
   // reopened after an approval asks for changes again, whatever was reviewed.
   async decide(fx, item, slug) {
@@ -1301,8 +1306,8 @@ export class PrState {
       await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
       return undefined;
     }
-    if (decision?.state === "APPROVED") {
-      await this.noticeApproval(fx, key, { approved: decision.commitId ?? head });
+    if (decision?.state === "APPROVED" && decision.commitId === head) {
+      await this.noticeApproval(fx, key, { approved: head });
       return undefined;
     }
     const now = await fx.pullRequest(key.repo, key.pr);

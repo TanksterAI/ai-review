@@ -77,10 +77,29 @@ test("does not approve while a thread or a body-only finding is open, or the lat
   assert.equal(behind.calls.some((c) => c[0] === "ownThreads"), false, "nothing else is read");
 });
 
-test("approves once only, and never a commit that is no longer the head", async () => {
-  const already = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40) } });
+test("approves each fully reviewed head once, and never a commit that is no longer the head", async () => {
+  // Already approved at this head: nothing more.
+  const already = await make({ decision: { state: "APPROVED", commitId: HEAD } });
   await decide(already);
   assert.equal(approvals(already.calls).length, 0);
+
+  // Approved at an older commit, and the new head has a complete review with
+  // nothing open: approved again at the head. GitHub counts an approval only
+  // for the commits it covers when later ones were pushed by a bot or a branch
+  // update (a ruleset's "extra approval for unattributed changes"), and the
+  // organisation keeps no stale-review dismissal, so the reviewer keeps its
+  // own approval current, as CodeRabbit re-approves after an incremental review.
+  const older = await make({ decision: { state: "APPROVED", commitId: "c".repeat(40) } });
+  await decide(older);
+  const again = approvals(older.calls);
+  assert.equal(again.length, 1);
+  assert.equal(again[0][1].commitId, HEAD);
+
+  // Approved at an older commit whose GitHub record names no commit: treated as
+  // not this head, so the head is approved.
+  const unknown = await make({ decision: { state: "APPROVED", commitId: null } });
+  await decide(unknown);
+  assert.equal(approvals(unknown.calls).length, 1);
 
   // A change request or a dismissed approval: approved again.
   for (const state of ["CHANGES_REQUESTED", "DISMISSED"]) {
