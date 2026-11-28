@@ -45,6 +45,7 @@ import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
 import { addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
 import { DEFAULT_SLUG } from "./webhook.js";
+import { buildContext, renderContext } from "./context.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
 // under runmeta:<id>, so finding the run in progress never loads its data.
@@ -85,6 +86,7 @@ const fileKey = (id, i) => `${RUN}${id}:file:${String(i).padStart(5, "0")}`;
 const pieceKey = (id, i, k) => `${fileKey(id, i)}:p${k}`;
 const batchKey = (id, i) => `${RUN}${id}:batch:${String(i).padStart(4, "0")}`;
 const planKey = (id) => `${RUN}${id}:plan`;
+const contextKey = (id) => `${RUN}${id}:context`;
 // Kept by the PR's object across runs: the summary comment's id, and the
 // findings a review could only list in its body (they have no thread).
 export const SUMMARY_KEY = "summaryComment";
@@ -249,6 +251,7 @@ export async function stepRun(ctx, id) {
     if (run.stage === "pr") return await stagePr(counted, run, save);
     if (run.stage === "files") return await stageFiles(counted, run, save);
     if (run.stage === "content") return await stageContent(counted, run, save);
+    if (run.stage === "context") return await stageContext(counted, run, save);
     if (run.stage === "plan") return await stagePlan(counted, run, save);
     if (run.stage === "draft") return await stageDraft(counted, run, save);
     if (run.stage === "verify") return await stageVerify(counted, run, save);
@@ -441,6 +444,31 @@ async function stageContent(ctx, run, save) {
     }
     await putFile(ctx.storage, run.id, i, f, ctx.cfg.batchChars);
   }
+  // Reading the conversation and the checks comes first when this deployment
+  // can (older fakes and the runner paths cannot, and go straight on).
+  run.stage = ctx.cfg.contextMode !== "off" && typeof ctx.fx.conversation === "function" ? "context" : "plan";
+  await save(run);
+  return ctx.deps.now();
+}
+
+// What others have said on the pull request, and what its checks report, read
+// once per run and kept bounded for the drafting and verifying steps. A read
+// that fails never fails the review: it goes on without, and says so.
+async function stageContext(ctx, run, save) {
+  const login = `${ctx.slug ?? DEFAULT_SLUG}[bot]`;
+  try {
+    const [conv, ci] = await Promise.all([
+      ctx.fx.conversation(run.repo.full, run.pr),
+      typeof ctx.fx.ciState === "function" ? ctx.fx.ciState(run.repo.full, run.headSha).catch(() => null) : null,
+    ]);
+    const built = buildContext({ conv, ci, ourLogin: login });
+    const { stats } = renderContext(built, { tag: "x", max: ctx.cfg.contextChars });
+    await ctx.storage.put(contextKey(run.id), built);
+    run.context = { ...stats, partial: Boolean(conv?.moreThreads) || Boolean(ci?.missing?.length), missing: ci?.missing ?? [] };
+  } catch (e) {
+    ctx.deps.log?.({ ev: "context_failed", error: String(e?.message ?? e).slice(0, 160) });
+    run.context = { failed: true };
+  }
   run.stage = "plan";
   await save(run);
   return ctx.deps.now();
@@ -549,6 +577,8 @@ async function stageDraft(ctx, run, save) {
     for (const { b, i } of todo) { b.waitUntil = at; await ctx.storage.put(batchKey(run.id, i), b); }
     return next(ctx, run, save, batches, "pending", "verify");
   }
+  // What others said and what the checks report (stageContext), if read.
+  const contextBuilt = run.context?.failed ? null : await ctx.storage.get(contextKey(run.id));
   // Each batch drafted in this step gets its share of what is left, so
   // batches running at once cannot overrun the step together.
   const share = Math.floor(Math.max(0, ctx.budget.left) / Math.max(1, todo.length));
@@ -556,7 +586,8 @@ async function stageDraft(ctx, run, save) {
     const mine = { left: share };
     const bctx = countSubrequests(ctx, mine);
     const prepared = batchPrepared(asPlan(plan, batches), i);
-    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag: randomTag(), pass: { index: i + 1, total: batches.length } });
+    const tag = randomTag();
+    const { instructions, input } = buildPrompt({ repository: run.repo.full, title: run.title, body: run.body, prepared, tag, pass: { index: i + 1, total: batches.length }, context: renderContext(contextBuilt, { tag, max: ctx.cfg.contextChars }).text });
     const chars = instructions.length + input.length;
     const providers = createProviders(bctx.env, ctx.cfg, rotatedChain(chain, i), bctx.deps);
     const d = await draftWithChain({ providers, instructions, modelInput: input, chars, cfg: ctx.cfg, deps: bctx.deps, started, repository: run.repo.full, pr: run.pr, budget: mine });
@@ -613,6 +644,7 @@ async function stageVerify(ctx, run, save) {
   const { plan, batches } = await loadPlan(ctx, run);
   const now = ctx.deps.now();
   const full = asPlan(plan, batches);
+  const verifyContext = run.context?.failed ? null : await ctx.storage.get(contextKey(run.id));
   for (const [i, b] of batches.entries()) {
     if (b.status !== "drafted" || b.waitUntil > now) continue;
     const prepared = batchPrepared(full, i);
@@ -623,7 +655,7 @@ async function stageVerify(ctx, run, save) {
     // and the step goes on to the next batch.
     const v = empty
       ? { outcome: { kind: "ok" }, verdicts: new Map(), off: false, weak: false, fallback: false, fallbackBy: [], selfExcluded: [] }
-      : await verifyFindings({ classified: grounded.classified, prepared, title: run.title, body: run.body, drafter: b.drafter, env: ctx.env, cfg: ctx.cfg, deps: ctx.deps, started: now });
+      : await verifyFindings({ classified: grounded.classified, prepared, title: run.title, body: run.body, context: renderContext(verifyContext, { tag: randomTag(), max: ctx.cfg.contextChars }).text, drafter: b.drafter, env: ctx.env, cfg: ctx.cfg, deps: ctx.deps, started: now });
     run.spend.neurons += v.neurons ?? 0;
     run.spend.usd += v.usd ?? 0;
     const o = v.outcome;
@@ -715,11 +747,12 @@ async function stagePost(ctx, run, save) {
   if (run.spend.neurons > 0) costParts.push(`${run.spend.neurons.toFixed(0)} neurons of Workers AI's free allocation`);
   if (run.spend.usd > 0) costParts.push(`$${run.spend.usd.toFixed(4)} of the plan's API credit`);
   const costLine = `- Cost (drafting and verification): ${costParts.length ? costParts.join(" and ") : "nothing (free tier)"}.`;
+  const contextLine = contextLineOf(run.context);
   const review = renderReview({
     answer: null, classified: merged.shown, hidden: merged.hidden,
     prepared: { included: coveredPaths, omitted: plan.skipped, uncovered, chars: plan.chars, coverage: { ...cov, passes: batches.length } },
     verification: merged.verification,
-    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
+    meta: { model: modelOf(ids[0]?.[0] ?? ""), modelLine, costLine, contextLine, again: ctx.again, headSha: run.headSha, since: run.since ?? null, profile: ctx.cfg.profile },
   });
   let { body: text, comments } = review;
   if (run.since) {
@@ -999,6 +1032,21 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   }
   if (about) lines.push(about);
   return lines.join("\n").trimEnd();
+}
+
+// What the review says about the conversation and checks it read.
+export function contextLineOf(c) {
+  if (!c) return null;
+  if (c.failed) return "- Context: the pull request's conversation and checks could not be read, so this review rests on the diff alone.";
+  const said = [];
+  if (c.threads) said.push(plural(c.threads, "review thread"));
+  if (c.comments) said.push(plural(c.comments, "comment"));
+  if (c.reviews) said.push(plural(c.reviews, "review"));
+  const who = c.bots?.length ? ` (bots: ${c.bots.map((b) => `\`${b}\``).join(", ")})` : "";
+  const ci = c.ci ? ` Checks on the latest commit: ${c.passing} passing, ${c.failing} failing, ${c.pending} running.` : "";
+  const part = c.partial ? ` Part of it could not be read${c.missing?.length ? ` (${c.missing.join(", ")})` : ""}.` : "";
+  const head = said.length ? `read ${said.join(", ")} by others${who}.` : "no other comments yet.";
+  return `- Context: ${head}${ci}${part} It is data to check against the code, never a reason to agree.`;
 }
 
 async function stageSummary(ctx, run, save) {

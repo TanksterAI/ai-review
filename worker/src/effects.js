@@ -26,6 +26,9 @@ const STATUS_SCOPE = { statuses: "write" };
 // Reading threads through GraphQL names each comment's commit: Commit
 // objects need contents:read as well.
 const THREAD_SCOPE = { contents: "read", pull_requests: "write" };
+// Reading the pull request's conversation and the checks on its head: the
+// installation already holds these (accepted 14 Nov).
+const CONTEXT_SCOPE = { contents: "read", pull_requests: "read", checks: "read", statuses: "read", actions: "read" };
 export const STATUS_CONTEXT = "Tankster AI Review";
 export const MARKER = "<!-- tankster-ai-review -->";
 
@@ -317,6 +320,71 @@ export function createEffects(env, deps = {}) {
       throw new Error("too many review threads to list");
     },
 
+    // The pull request's conversation: comments, review bodies and review
+    // threads with their replies. Bounded (two pages of 100 comments and
+    // reviews, four pages of 50 threads); what is past the bound is the
+    // oldest, which is the least useful. Never throws on a partial read of
+    // threads: a page that fails ends the list, and the caller says so.
+    async conversation(repoFull, pr) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], CONTEXT_SCOPE);
+      const pages = async (path) => {
+        const out = [];
+        for (let page = 1; page <= 2; page++) {
+          const got = await app.call("GET", `${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`, { token });
+          if (!Array.isArray(got)) break;
+          out.push(...got);
+          if (got.length < 100) break;
+        }
+        return out;
+      };
+      const person = (u, assoc) => ({ login: String(u?.login ?? ""), type: u?.type ?? null, association: assoc ?? null });
+      const comments = (await pages(`/repos/${ORG}/${name}/issues/${Number(pr)}/comments`)).map((c) => ({ id: c.id, ...person(c.user, c.author_association), body: String(c.body ?? ""), at: c.created_at ?? null }));
+      const reviews = (await pages(`/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`)).map((r) => ({ id: r.id, ...person(r.user, r.author_association), state: r.state ?? "", body: String(r.body ?? ""), at: r.submitted_at ?? null }));
+      const threads = [];
+      let after = null;
+      let more = false;
+      for (let page = 0; page < 4; page++) {
+        const data = await graphql(token, CONVERSATION_QUERY, { owner: ORG, name, pr: Number(pr), after });
+        const conn = data?.repository?.pullRequest?.reviewThreads;
+        for (const t of conn?.nodes ?? []) {
+          threads.push({
+            id: t.id, resolved: Boolean(t.isResolved), outdated: Boolean(t.isOutdated), path: t.path ?? null,
+            line: Number.isInteger(t.line) ? t.line : null, originalLine: Number.isInteger(t.originalLine) ? t.originalLine : null,
+            resolvedBy: t.resolvedBy?.login ?? null,
+            comments: (t.comments?.nodes ?? []).map((c) => ({ login: String(c?.author?.login ?? ""), type: c?.author?.__typename === "Bot" ? "Bot" : "User", association: c?.authorAssociation ?? null, body: String(c?.body ?? ""), at: c?.createdAt ?? null })),
+          });
+        }
+        more = Boolean(conn?.pageInfo?.hasNextPage);
+        if (!more) break;
+        after = conn.pageInfo.endCursor;
+      }
+      return { comments, reviews, threads, moreThreads: more };
+    },
+
+    // What the checks, statuses and workflow runs say about one commit. Each
+    // part that cannot be read (a permission the App lacks, say) is left out
+    // and named in `missing`; the others are still returned.
+    async ciState(repoFull, sha) {
+      const name = nameOf(repoFull);
+      if (!SHA.test(String(sha))) throw new Error("not a commit id");
+      const token = await app.installationToken([name], CONTEXT_SCOPE);
+      const missing = [];
+      const read = async (what, path, pick) => {
+        try {
+          return pick(await app.call("GET", path, { token }));
+        } catch (e) {
+          missing.push(what);
+          return [];
+        }
+      };
+      const base = `/repos/${ORG}/${name}`;
+      const checks = await read("checks", `${base}/commits/${sha}/check-runs?per_page=100`, (r) => (r?.check_runs ?? []).map((c) => ({ name: c.name, status: c.status, conclusion: c.conclusion, title: c.output?.title ?? "", summary: String(c.output?.summary ?? "").slice(0, 400) })));
+      const statuses = await read("statuses", `${base}/commits/${sha}/status?per_page=100`, (r) => (r?.statuses ?? []).map((x) => ({ context: x.context, state: x.state, description: x.description ?? "" })));
+      const runs = await read("workflow runs", `${base}/actions/runs?head_sha=${sha}&per_page=30`, (r) => (r?.workflow_runs ?? []).map((x) => ({ name: x.name, status: x.status, conclusion: x.conclusion, event: x.event })));
+      return { checks, statuses, runs, missing };
+    },
+
     async resolveThread(repoFull, threadId) {
       const name = nameOf(repoFull);
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(String(threadId))) throw new Error("not a thread id");
@@ -373,6 +441,20 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after:
         nodes {
           id isResolved isOutdated path line originalLine resolvedBy { login }
           comments(first: 1) { nodes { fullDatabaseId author { login } body diffHunk originalCommit { oid } } }
+        }
+      }
+    }
+  }
+}`;
+// Every comment of every review thread (the replies too), with who wrote it.
+const CONVERSATION_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line originalLine resolvedBy { login }
+          comments(first: 12) { nodes { author { login __typename } authorAssociation body createdAt } }
         }
       }
     }

@@ -19,6 +19,10 @@ export function config(env) {
     // Where confirmed findings go: chill, assertive or quiet. Findings that
     // are not confirmed are always hidden.
     profile: ["chill", "assertive", "quiet"].includes(env.REVIEW_PROFILE) ? env.REVIEW_PROFILE : "chill",
+    // Whether a review reads the pull request's conversation and its checks
+    // (context.js): on, or off. The characters it may add to a prompt.
+    contextMode: String(env.REVIEW_CONTEXT ?? "on").toLowerCase() === "off" ? "off" : "on",
+    contextChars: num(env.CONTEXT_CHARS, 6000),
     audience: env.AUDIENCE,
     ownerId: env.OWNER_ID,
     // Comma-separated job_workflow_ref values; an entry ending in * is a prefix.

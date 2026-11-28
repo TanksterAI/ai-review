@@ -180,6 +180,17 @@ The review used to put the whole diff in one prompt of at most 90,000 characters
   - **Recovery.** Setup cannot be reopened once it has succeeded. If the key leaks or the App is deleted, set the Worker secrets `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` and `GITHUB_WEBHOOK_SECRET` (and `GITHUB_APP_SLUG` if it changed); they win over the stored App. Otherwise reopen setup with a code change. Each isolate caches the App's config for up to 5 minutes.
 - **Mentions.** The App's slug decides how it is mentioned (`@<slug>`), its login (`<slug>[bot]`) and the commands its replies name. `@tankster-ai-review` above assumes the default slug.
 
+## Reading the conversation and the checks
+
+Before it drafts, a review reads what others have already said on the pull request and what its checks report, so it does not repeat an open finding, can see why something was rejected, and knows whether CI is failing (`worker/src/context.js`, a step of the run between reading the files and planning).
+
+- **Read:** issue comments, review bodies, and every review thread with its replies, by people and by any bot; plus the check runs, commit statuses and workflow runs on the head commit. Two pages of 100 comments and reviews and four pages of 50 threads are read at most, and the review says when part could not be read.
+- **Trust:** each line is labelled by who wrote it (this App, a maintainer, a contributor, a bot). The label is a hint for the model, not a permission. Everything is fenced as data, never instructions, and is never evidence: another reviewer reporting a problem does not confirm it. The verifier is told so.
+- **Cleaned:** hidden HTML, collapsed sections and the "prompt for AI agents" blocks bots add are dropped (they are instructions by design), links and images are flattened, tokens, keys and private keys are redacted, rate-limit and acknowledgement notices are dropped, and each item is cut to a few hundred characters inside a total budget (`CONTEXT_CHARS`, 6,000 by default; maintainers' words first, then open findings by others, then resolved ones).
+- **Used by:** the drafter (do not repeat an open finding unless the cause differs; report a listed finding that is wrong, or a resolved one that is still true) and the verifier (a maintainer's explanation can refute a finding; another reviewer's agreement cannot confirm one).
+- **Never fatal:** if GitHub cannot be read, the review goes on from the diff alone and says so in "About this review". `REVIEW_CONTEXT=off` switches it off.
+- **Permissions:** read on checks, commit statuses and actions, as well as contents and pull requests (all already granted to the installation).
+
 ## The MCP server (for agents)
 
 `POST /mcp` is a small MCP server (JSON-RPC over HTTP) so any agent can find out what the reviewer will do and ask it for something, without having to be taught. It is called with the caller's own GitHub token as a Bearer token; each call first checks that token can see the pull request, so a caller sees only what GitHub lets them see. Only `TanksterAI/*` repositories are served.
