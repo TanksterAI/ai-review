@@ -23,6 +23,10 @@ export function config(env) {
     // (context.js): on, or off. The characters it may add to a prompt.
     contextMode: String(env.REVIEW_CONTEXT ?? "on").toLowerCase() === "off" ? "off" : "on",
     contextChars: num(env.CONTEXT_CHARS, 6000),
+    // Other reviewing bots whose threads this App resolves, once a later commit
+    // fixes what they pointed at (a fix a model judged, and a second model agreed
+    // on). Comma-separated GitHub logins as GraphQL names them; "off" for none.
+    peerResolve: String(env.PEER_RESOLVE ?? "coderabbitai").toLowerCase() === "off" ? [] : String(env.PEER_RESOLVE ?? "coderabbitai").split(",").map((x) => x.trim().replace(/\[bot\]$/i, "")).filter((x) => /^[A-Za-z0-9-]{1,39}$/.test(x)),
     audience: env.AUDIENCE,
     ownerId: env.OWNER_ID,
     // Comma-separated job_workflow_ref values; an entry ending in * is a prefix.

@@ -406,6 +406,14 @@ export function createEffects(env, deps = {}) {
       return data?.resolveReviewThread?.thread?.isResolved === true;
     },
 
+    // A reply in a review thread (any thread of this pull request), marked as ours.
+    async replyToThread(repoFull, pr, commentId, body) {
+      const name = nameOf(repoFull);
+      if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/comments/${commentId}/replies`, { token, body: { body: `${MARKER}\n${body}` } });
+    },
+
     async editReviewComment(repoFull, commentId, body) {
       const name = nameOf(repoFull);
       if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");

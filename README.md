@@ -191,6 +191,10 @@ Before it drafts, a review reads what others have already said on the pull reque
 - **Never fatal:** if GitHub cannot be read, the review goes on from the diff alone and says so in "About this review". `REVIEW_CONTEXT=off` switches it off.
 - **Permissions:** read on checks, commit statuses and actions, as well as contents and pull requests (all already granted to the installation).
 
+## Resolving other bots' threads
+
+When a later commit changes the code a CodeRabbit thread pointed at, the review judges whether the problem is fixed, exactly as it does for its own findings, but with a stricter bar: a model of one kind says fixed and a model of another kind agrees. It then replies in that thread saying which commit addressed it, and resolves it. The reply carries this App's marker; it is never posted twice. Only logins in `PEER_RESOLVE` (default `coderabbitai`; `off` for none) are touched, never a person's thread, and the bot's own text is cleaned first (its collapsed "prompt for AI agents" never reaches a model). These threads never count toward this App's approval, and the review's summary counts them apart from its own findings. Reopen a thread and the reviewer leaves it alone.
+
 ## What the reviewer is taught
 
 A maintainer (anyone with write access, checked through the API each time) can teach it about their repository, in a comment of its own that is nothing else:
