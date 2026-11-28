@@ -57,6 +57,14 @@ const DISMISS_PER_STEP = 20;
 // fallbacks, the summary's notice). Its reads come out of the same budget.
 const DECIDE_SUBREQUESTS = 45;
 const DECIDE_RESERVE = 8;
+// Room left, after the threads, for reading the App's reviews (up to ten
+// pages and a token): a permission check never eats into it.
+const REVIEW_READ = 11;
+// The reads before it: the threads (up to twenty pages) and that, again.
+const SNAPSHOT_READ = 20 + REVIEW_READ;
+// A permission answer is kept this long, so a decision held for want of
+// requests goes on from where it stopped rather than checking again.
+const WRITER_TTL_MS = 5 * 60_000;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -1260,13 +1268,24 @@ export class PrState {
     // new one is queued. Every reopen bumps reopenSeq together with its mark
     // and the lost acceptance; a snapshot taken across a bump is taken again.
     let open, inBody, decision, seqAtSnapshot, settled = false;
-    for (let tries = 0; tries < 3 && !settled; tries++) {
+    // Out of requests before the snapshot was whole: held, and taken again at
+    // the next alarm with the permission answers kept so far.
+    let short = false;
+    for (let tries = 0; tries < 3 && !settled && !short; tries++) {
+      // Taken again only if a whole one still fits this alarm.
+      if (tries > 0 && room() < SNAPSHOT_READ) { short = true; break; }
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
-      const writers = new Map();
+      const now = this.now();
+      const seen = Object.fromEntries(Object.entries((await this.ctx.storage.get("writersSeen")) ?? {}).filter(([, v]) => now - v.at < WRITER_TTL_MS));
       const isWriter = async (login) => {
-        if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
-        return writers.get(login);
+        if (seen[login]) return seen[login].w;
+        // No room for this check and the reviews after it: stop here.
+        if (room() < REVIEW_READ + 1) { short = true; return false; }
+        const w = Boolean(await fx.canWrite(key.repo, login));
+        seen[login] = { w, at: now };
+        await this.ctx.storage.put("writersSeen", seen);
+        return w;
       };
       // A thread resolved by someone without write access counts as open,
       // unless a review since found it fixed, or a writer's resolve/approve
@@ -1291,11 +1310,13 @@ export class PrState {
       // fallback) is judged: a body-listed finding's text starts with the
       // model's title, which could imitate a label. Never one kept as severe.
       const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
+      if (short) break;
       inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
       decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
       seqAtSnapshot = seq0;
       settled = ((await this.ctx.storage.get("reopenSeq")) ?? 0) === seq0;
     }
+    if (short) return { holdUntil: this.now() + 1000 };
     if (!settled) {
       // Reopens kept arriving: decide again from scratch, never from this snapshot.
       await this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
