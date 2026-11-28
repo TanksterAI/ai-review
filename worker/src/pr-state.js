@@ -1295,7 +1295,9 @@ export class PrState {
       // a partial withdrawal finds the latest already dismissed.
       const standing = Array.isArray(decision?.approvedIds) && decision.approvedIds.length
         ? decision.approvedIds : decision?.state === "APPROVED" ? [decision.id] : [];
-      if ((open.length || inBody.length) && (standing.length || (decision?.truncated && decision?.state === "APPROVED"))) {
+      // A truncated list may hide an approval, whatever the latest state, so
+      // it is withdrawn too; a complete list with none standing is a no-op.
+      if ((open.length || inBody.length) && (standing.length || decision?.truncated)) {
         // As CodeRabbit's: the approval is withdrawn (dismissed). Changes are
         // requested instead if GitHub refuses a dismissal, and also when the
         // review list was too long to read whole (an approval may be unlisted).
@@ -1304,7 +1306,7 @@ export class PrState {
         for (const id of dismissed ? standing : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
         }
-        if (!dismissed || decision.truncated) {
+        if (!dismissed || decision?.truncated) {
           const filed = await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
           // GitHub filed it only as a comment: an approval may still stand,
           // so fail and let the outbox try again within its limit.
@@ -1328,11 +1330,14 @@ export class PrState {
       await this.noticeApproval(fx, key, { approved: head });
       return undefined;
     }
-    if (decision?.state === "APPROVED" && (await this.state()).lastCompleteReviewed !== head) {
+    const stands = decision?.state === "APPROVED" || (Array.isArray(decision?.approvedIds) && decision.approvedIds.length > 0);
+    if (stands && (await this.state()).lastCompleteReviewed !== head) {
       // An approval of an older commit is renewed only over a complete review
       // of the head, even when a writer's command forces the decision: the
       // commits after it (a bot's push, say) are exactly what GitHub asks a
-      // fresh approval for. A forced first approval is the writer's own call.
+      // fresh approval for. Any approval of the App's still standing counts
+      // (the latest review may be a dismissal after a partial withdrawal). A
+      // forced first approval, with none standing, is the writer's own call.
       await this.noticeApproval(fx, key, { pending: head, slug });
       return undefined;
     }

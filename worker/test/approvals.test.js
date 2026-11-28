@@ -221,6 +221,38 @@ test("a review list too long to read whole with no decision of the App's in it a
   }
 });
 
+test("a reopen with a truncated list withdraws even when no approval is known, since one may be unlisted", async () => {
+  for (const decision of [
+    { state: null, commitId: null, id: null, approvedIds: [], truncated: true },
+    { state: "DISMISSED", commitId: HEAD, id: 77, approvedIds: [], truncated: true },
+  ]) {
+    const m = await make({ threads: [thread("t1", false)], decision });
+    m.fx.dismissReview = async () => true;
+    await decide(m, { reopened: true });
+    assert.equal(m.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1, String(decision.state));
+  }
+  // A complete list with no standing approval: nothing to withdraw.
+  const none = await make({ threads: [thread("t1", false)], decision: { state: "DISMISSED", commitId: HEAD, id: 77, approvedIds: [], truncated: false } });
+  await decide(none, { reopened: true });
+  assert.equal(none.calls.filter((c) => c[0] === "postReview").length, 0);
+});
+
+test("a forced decision never approves an unreviewed head while any approval of the App's still stands", async () => {
+  // The latest review was dismissed (a partial withdrawal) but 55 still stands:
+  // this is not a first approval, so the head's complete review is required.
+  const m = await make({ decision: { state: "DISMISSED", commitId: "c".repeat(40), id: 77, approvedIds: [55] }, reviewed: "b".repeat(40) });
+  await decide(m, { force: true, login: "rishitank" });
+  assert.equal(approvals(m.calls).length, 0);
+  // With nothing standing, a forced first approval is still the writer's call.
+  const first = await make({ decision: { state: "DISMISSED", commitId: "c".repeat(40), id: 77, approvedIds: [] }, reviewed: "b".repeat(40) });
+  await decide(first, { force: true, login: "rishitank" });
+  assert.equal(approvals(first.calls).length, 1);
+  // And once the head is reviewed in full, the renewal goes ahead.
+  const covered = await make({ decision: { state: "DISMISSED", commitId: "c".repeat(40), id: 77, approvedIds: [55] } });
+  await decide(covered);
+  assert.equal(approvals(covered.calls).length, 1);
+});
+
 test("after a reopen dismisses the approval, the head is approved again only once its threads are resolved", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
   m.fx.dismissReview = async () => { m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 77 }; return true; };
