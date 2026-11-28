@@ -981,6 +981,21 @@ test("a kept body finding settles a withdrawal before any permission is looked u
   assert.ok(gone, "withdrawn");
 });
 
+test("a withdrawal on unchecked resolvers still decides again after its confirmation, and re-approves when they are writers", async () => {
+  // The first alarm has no room to check them all, so it withdraws (the safe
+  // side) and holds to confirm; the next has room, finds every one a writer,
+  // and must still leave an ordinary decision behind to approve again.
+  const people = writersOf(1001);
+  const m = await make({ threads: resolvedBy(writersOf(6, "late")), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lim = limited(m, { writers: () => true, people });
+  let gone = false;
+  m.fx.dismissReview = async () => { gone = true; m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 7, approvedIds: [] }; return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  for (let i = 1; i <= 6 && approvals(m.calls).length === 0; i++) await step(m, lim, NOW + i * 2000);
+  assert.ok(gone, "withdrawn first");
+  assert.equal(approvals(m.calls).length, 1, "approved again once every resolver was checked");
+});
+
 test("one unlisted resolver on two threads is checked once", async () => {
   const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "late-1" }, { ...thread("t2", true), resolvedBy: "late-1" }] });
   const lim = limited(m, { writers: () => true, people: writersOf(1001) });

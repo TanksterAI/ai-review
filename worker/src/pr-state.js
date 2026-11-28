@@ -1464,6 +1464,10 @@ export class PrState {
         // batch, as its change request supersedes any approval still listed.
         if (dismissed && pending.length > 0 && (pending.length > tried || !decision?.truncated)) {
           await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+          // Withdrawn on an unchecked resolver: the ordinary decision is queued
+          // now, as the next alarm may check them all, find writers and so
+          // never come back to it.
+          if (guessed) await this.queueDecide({});
           return { holdUntil: this.now() + 1000 };
         }
         if (!dismissed || decision?.truncated) {
