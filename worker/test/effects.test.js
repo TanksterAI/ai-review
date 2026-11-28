@@ -172,11 +172,13 @@ test("postReview files the event it is given, also in its 422 fallback; COMMENT 
     return {};
   });
   const fx = createEffects({}, { app });
-  await fx.postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
+  const fell = await fx.postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
   assert.equal(app.log.calls[0].body.event, "REQUEST_CHANGES");
   assert.equal(app.log.calls[1].body.event, "REQUEST_CHANGES");
+  assert.equal(fell.event, "REQUEST_CHANGES");
   const plain = fakeApp(() => ({}));
-  await createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [] });
+  const done = await createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [] });
+  assert.equal(done.event, "COMMENT");
   assert.equal(plain.log.calls[0].body.event, "COMMENT");
   // Only the three review events GitHub knows.
   await assert.rejects(createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [], event: "MERGE" }));
@@ -326,8 +328,11 @@ test("a 422 for the decision itself still posts the findings, as a comment; a re
     if (opts.body.event !== "COMMENT") return err(422);
     return {};
   });
-  await createEffects({}, { app }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
+  const out = await createEffects({}, { app }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
   assert.deepEqual(app.log.calls.map((c) => c.body.event), ["REQUEST_CHANGES", "REQUEST_CHANGES", "COMMENT"]);
+  // It says which event was filed, so a caller that needed the decision
+  // (withdrawing an approval) can tell it was not.
+  assert.equal(out.event, "COMMENT");
   assert.equal(await createEffects({}, { app }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }), false);
   const boom = fakeApp(() => err(500));
   await assert.rejects(createEffects({}, { app: boom }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }));

@@ -200,7 +200,8 @@ export function createEffects(env, deps = {}) {
     },
 
     // event: COMMENT, or REQUEST_CHANGES while the review has findings (as
-    // CodeRabbit's Automatic Approvals do).
+    // CodeRabbit's Automatic Approvals do). Returns {inline, event}: event is
+    // what GitHub filed, COMMENT when it refused the decision itself.
     async postReview(repoFull, pr, { commitId, body, comments, event = "COMMENT" }) {
       const name = nameOf(repoFull);
       if (!REVIEW_EVENTS.has(event)) throw new Error("not a review event");
@@ -208,7 +209,7 @@ export function createEffects(env, deps = {}) {
       const path = `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`;
       try {
         await app.call("POST", path, { token, body: { commit_id: commitId, event, body, comments } });
-        return { inline: comments.length };
+        return { inline: comments.length, event };
       } catch (e) {
         if (e.status !== 422) throw e;
         // A comment position GitHub refuses, or the commit left the PR: keep
@@ -219,6 +220,7 @@ export function createEffects(env, deps = {}) {
         const text = [body, `Reviewed commit ${String(commitId).slice(0, 7)}.`, listed && `#### Findings (GitHub would not place them inline)\n\n${listed}`]
           .filter(Boolean)
           .join("\n\n");
+        let filed = event;
         try {
           await app.call("POST", path, { token, body: { event, body: text } });
         } catch (e2) {
@@ -226,8 +228,9 @@ export function createEffects(env, deps = {}) {
           // pull requests): the findings are still posted, as a comment.
           if (e2.status !== 422 || event === "COMMENT") throw e2;
           await app.call("POST", path, { token, body: { event: "COMMENT", body: text } });
+          filed = "COMMENT";
         }
-        return { inline: 0 };
+        return { inline: 0, event: filed };
       }
     },
 

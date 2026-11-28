@@ -1304,7 +1304,12 @@ export class PrState {
         for (const id of dismissed ? standing : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
         }
-        if (!dismissed || decision.truncated) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
+        if (!dismissed || decision.truncated) {
+          const filed = await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
+          // GitHub filed it only as a comment: an approval may still stand,
+          // so fail and let the outbox try again within its limit.
+          if (filed?.event && filed.event !== "REQUEST_CHANGES") throw new Error("the approval could not be withdrawn: GitHub filed the change request as a comment");
+        }
       }
       // The summary's notice must not still say approved: it lists what is open.
       if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });

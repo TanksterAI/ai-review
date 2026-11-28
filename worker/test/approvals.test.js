@@ -187,6 +187,25 @@ test("a reopen keeps withdrawing while any approval of the App's still stands, e
   }
 });
 
+test("a withdrawal whose change request GitHub files only as a comment is retried, not dropped", async () => {
+  // Dismissal refused, and GitHub refuses the decision so postReview falls
+  // back to a comment: the approval still stands, so the decision fails and
+  // the outbox tries it again (within its limit), rather than removing it.
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77] } });
+  m.fx.dismissReview = async () => false;
+  m.fx.postReview = async (_r, _p, review) => { m.calls.push(["postReview", review]); return { inline: 0, event: "COMMENT" }; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  // Each failed alarm throws (Cloudflare retries it) and leaves the item stored.
+  let thrown = 0;
+  for (let i = 0; i < 3; i++) {
+    m.obj.ctx.storage.alarm = null;
+    try { await m.obj.alarm(); } catch (e) { thrown++; assert.match(String(e.message), /could not be withdrawn/); }
+  }
+  assert.equal(thrown, 3);
+  assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 3, "tried again each time");
+  assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "still waiting to be retried");
+});
+
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77], truncated: true } });
   m.fx.dismissReview = async () => true;
