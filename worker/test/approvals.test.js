@@ -425,14 +425,14 @@ test("a withdrawal counts the alarm's requests: it dismisses only what fits and 
 });
 
 // A fake that enforces Workers Free's 50 requests an alarm on every call.
-function limited(m, { writers = () => false } = {}) {
+function limited(m, { writers = () => false, threadPages = 1 } = {}) {
   let used = 0;
   const spend = () => { used++; if (used > 50) throw new Error("Too many subrequests"); };
   const checked = [];
   m.fx.subrequests = () => used;
   const { pullRequest, ownThreads, reviewDecision, postReview } = m.fx;
   m.fx.pullRequest = async (...a) => { spend(); return pullRequest(...a); };
-  m.fx.ownThreads = async (...a) => { spend(); return ownThreads(...a); };
+  m.fx.ownThreads = async (...a) => { for (let i = 0; i < threadPages; i++) spend(); return ownThreads(...a); };
   m.fx.reviewDecision = async (...a) => { spend(); return reviewDecision(...a); };
   m.fx.postReview = async (...a) => { spend(); return postReview(...a); };
   m.fx.canWrite = async (_r, login) => { spend(); checked.push(login); return writers(login); };
@@ -440,15 +440,16 @@ function limited(m, { writers = () => false } = {}) {
   return { checked, reset: () => { used = 0; } };
 }
 
-async function run(m, lim, limit = 40) {
+async function run(m, lim, limit = 40, step = 2000) {
   let t = NOW;
   for (let i = 0; i < limit && ((await m.storage.get("outbox")) ?? []).length; i++) {
     lim.reset();
-    t += 2000;
+    t += step;
     m.setNow(t);
     m.obj.ctx.storage.alarm = null;
     await m.obj.alarm(); // a throw here (over 50) fails the test
   }
+  return t;
 }
 
 test("the snapshot's reads are budgeted too: 49 resolvers are checked over alarms, never over 50 requests in one", async () => {
@@ -462,8 +463,7 @@ test("the snapshot's reads are budgeted too: 49 resolvers are checked over alarm
   await m.obj.outbox({ type: "decide", reopened: true });
   await run(m, lim);
   assert.equal(((await m.storage.get("outbox")) ?? []).length, 0, "the decision finished");
-  assert.equal(new Set(lim.checked).size, 49);
-  assert.equal(lim.checked.length, 49, "each person checked once, the answers kept between alarms");
+  assert.equal(lim.checked.length, 0, "a thread known to be open needs no permission checks");
 
   // Not reopened, the 49 resolvers all writers: approved in the end, again
   // never over 50 in one alarm.
@@ -472,6 +472,16 @@ test("the snapshot's reads are budgeted too: 49 resolvers are checked over alarm
   await ok.obj.outbox({ type: "decide" });
   await run(ok, lim2);
   assert.equal(approvals(ok.calls).length, 1);
+  assert.equal(lim2.checked.length, 49, "each person checked once, the answers kept between alarms");
+
+  // An outsider among them: the first one found leaves its thread open and
+  // ends the checks (the decision is the same whoever resolved the rest).
+  const mixed = await make({ threads: threads.slice(1) });
+  const lim3 = limited(mixed, { writers: (l) => l !== "outsider-1" });
+  await mixed.obj.outbox({ type: "decide" });
+  await run(mixed, lim3);
+  assert.equal(approvals(mixed.calls).length, 0);
+  assert.equal(lim3.checked.length, 1);
 });
 
 test("a snapshot cut short reads no reviews, and one taken again after a reopen must fit whole, or it is held", async () => {
@@ -479,7 +489,7 @@ test("a snapshot cut short reads no reviews, and one taken again after a reopen 
   // not go on to read the reviews (it is held and starts again).
   const threads = Array.from({ length: 49 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `outsider-${i + 1}` }));
   const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
-  const lim = limited(m);
+  const lim = limited(m, { writers: () => true });
   let reads = 0;
   const rd = m.fx.reviewDecision;
   m.fx.reviewDecision = async (...a) => { reads++; return rd(...a); };
@@ -518,6 +528,51 @@ test("a snapshot cut short reads no reviews, and one taken again after a reopen 
   extra = 0;
   await run(r, rl);
   assert.equal(approvals(r.calls).length, 1, "decided at the next alarm");
+});
+
+test("with a thread known to be open, nobody's permission is checked: 999 resolvers and twenty pages still withdraw at once", async () => {
+  const threads = [...Array.from({ length: 999 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `outsider-${i + 1}` })), thread("t0", false)];
+  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const dismissed = [];
+  const lim = limited(m, { threadPages: 20 });
+  m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  await run(m, lim, 5);
+  assert.equal(lim.checked.length, 0, "no permission checks: the open thread decides it");
+  assert.deepEqual(dismissed, [7]);
+  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0);
+});
+
+test("a decision's permission answers do not expire while it is still being taken, however many alarms it needs", async () => {
+  // 400 resolvers, all writers, twenty pages of threads: a few checks fit an
+  // alarm, so it takes longer than the five minutes an answer is kept. The
+  // answers this decision gathered last until it ends, so it ends approved,
+  // each person checked once.
+  const threads = Array.from({ length: 400 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `writer-${i + 1}` }));
+  const m = await make({ threads });
+  const lim = limited(m, { writers: () => true, threadPages: 20 });
+  await m.obj.outbox({ type: "decide" });
+  const end = await run(m, lim, 400, 5000);
+  assert.ok(end - NOW > 5 * 60_000, "longer than five minutes");
+  assert.equal(approvals(m.calls).length, 1);
+  assert.equal(lim.checked.length, 400, "nobody checked twice");
+  // Ended: its answers are kept only for the usual five minutes now.
+  assert.equal(await m.storage.get("writersEpoch"), undefined);
+});
+
+test("a decision's answers are kept two hours at most, even if it never ended", async () => {
+  // An epoch left over (an item given up on mid-decision) does not keep its
+  // answers past two hours: they are checked again, and the epoch starts anew.
+  const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
+  const m = await make({ threads });
+  const lim = limited(m, { writers: () => true });
+  await m.storage.put("writersEpoch", NOW);
+  await m.storage.put("writersSeen", { someone: { w: true, at: NOW } });
+  m.setNow(NOW + 2 * 3600_000 + 60_000);
+  await m.obj.outbox({ type: "decide" });
+  let t = NOW + 2 * 3600_000 + 60_000;
+  for (let i = 0; i < 5 && ((await m.storage.get("outbox")) ?? []).length; i++) { lim.reset(); t += 2000; m.setNow(t); m.obj.ctx.storage.alarm = null; await m.obj.alarm(); }
+  assert.deepEqual(lim.checked, ["someone"]);
 });
 
 test("a permission answer is kept for a few minutes only, then checked again", async () => {

@@ -65,6 +65,9 @@ const SNAPSHOT_READ = 20 + REVIEW_READ;
 // A permission answer is kept this long, so a decision held for want of
 // requests goes on from where it stopped rather than checking again.
 const WRITER_TTL_MS = 5 * 60_000;
+// The answers a decision gathers last until it ends (it may take many alarms
+// when a great many people resolved threads), but never past this.
+const WRITER_MAX_MS = 2 * 3600_000;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -1242,7 +1245,15 @@ export class PrState {
   // own approval current. A thread
   // resolved by someone without write access still counts as open. A thread
   // reopened after an approval asks for changes again, whatever was reviewed.
+  // A decision held for want of requests keeps its permission answers until
+  // it ends: its epoch marks the answers it gathered.
   async decide(fx, item, slug) {
+    const out = await this.decideStep(fx, item, slug);
+    if (!out?.holdUntil) await this.ctx.storage.delete("writersEpoch");
+    return out;
+  }
+
+  async decideStep(fx, item, slug) {
     if (typeof fx.ownThreads !== "function" || typeof fx.reviewDecision !== "function") return undefined;
     // Requests made from here on (the reads too), against the alarm's budget.
     const counted = typeof fx.subrequests === "function";
@@ -1277,7 +1288,12 @@ export class PrState {
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
       const now = this.now();
-      const seen = Object.fromEntries(Object.entries((await this.ctx.storage.get("writersSeen")) ?? {}).filter(([, v]) => now - v.at < WRITER_TTL_MS));
+      let epoch = await this.ctx.storage.get("writersEpoch");
+      if (!(now - epoch < WRITER_MAX_MS)) { epoch = now; await this.ctx.storage.put("writersEpoch", epoch); }
+      // An epoch is at most two hours old (it starts again past that), so
+      // neither are the answers it keeps.
+      const fresh = (v) => now - v.at < WRITER_TTL_MS || v.at >= epoch;
+      const seen = Object.fromEntries(Object.entries((await this.ctx.storage.get("writersSeen")) ?? {}).filter(([, v]) => fresh(v)));
       const isWriter = async (login) => {
         if (seen[login]) return seen[login].w;
         // No room for this check and the reviews after it: stop here.
@@ -1291,19 +1307,25 @@ export class PrState {
       // unless a review since found it fixed, or a writer's resolve/approve
       // vouched for it (both recorded in ACCEPTED).
       const accepted = await acceptedSet(this.ctx.storage);
-      for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
-        // A nitpick never holds back approval (CodeRabbit's rule), open or not.
-        if (nitpickFinding(t.body)) continue;
+      const own = (await fx.ownThreads(key.repo, key.pr, slug)).filter((t) => !nitpickFinding(t.body)); // a nitpick never holds back approval (CodeRabbit's rule)
+      const byOthers = [];
+      for (const t of own) {
         if (!t.resolved) open.push(t);
-        // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
-        // only for the threads in its own view: one reopened since and then
-        // resolved by an outsider is open, forced or not.
-        else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
         // Resolved by the App while a person's reopen still stands (its mark
         // goes only when a writer resolves it): a command's race, not a fix.
         // The reviewer never resolves a reopened thread, and a command that
         // vouched for it accepted it.
         else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
+        else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id)) byOthers.push(t);
+      }
+      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
+      // only for the threads in its own view: one reopened since and then
+      // resolved by an outsider is open, forced or not. Checked only while
+      // nothing is known to be open: once one is, the outcome is the same
+      // (no approval, or a withdrawal) whoever resolved the rest.
+      for (const t of open.length ? [] : byOthers) {
+        if (!(await isWriter(t.resolvedBy))) open.push(t);
+        if (short || open.length) break;
       }
       // A kept finding that is a nitpick never blocks either. Only text that
       // carries the Worker's own comment header (its id line, as from the 422
