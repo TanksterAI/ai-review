@@ -35,7 +35,8 @@ export function cleanLesson(text) {
   return redact(String(text ?? "")).replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_LESSON_CHARS);
 }
 
-const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+// Letters and numbers of any script count, so lessons in other languages are never "the same".
+const norm = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 
 export function createMemory(db) {
   if (!db || typeof db.prepare !== "function") return null;
@@ -50,8 +51,12 @@ export function createMemory(db) {
       if (rows.some((r) => norm(r.text) === norm(clean))) return { ok: false, reason: "duplicate" };
       // The cap is checked inside the insert itself, so two pull requests of
       // one repository cannot both slip past it.
-      const res = await one("INSERT INTO lessons (repo, text, source, by, pr, created_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE (SELECT COUNT(*) FROM lessons WHERE repo = ?1) < ?7", repo, clean, source, String(by).slice(0, 80), Number.isSafeInteger(pr) ? pr : null, now.toISOString(), MAX_PER_REPO).run();
-      if ((res.meta?.changes ?? 0) === 0) return { ok: false, reason: "full" };
+      const res = await one("INSERT INTO lessons (repo, text, source, by, pr, created_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE (SELECT COUNT(*) FROM lessons WHERE repo = ?1) < ?7 AND NOT EXISTS (SELECT 1 FROM lessons WHERE repo = ?1 AND lower(text) = lower(?2))", repo, clean, source, String(by).slice(0, 80), Number.isSafeInteger(pr) ? pr : null, now.toISOString(), MAX_PER_REPO).run();
+      if ((res.meta?.changes ?? 0) === 0) {
+        // Refused inside the insert: the cap, or the same lesson saved a moment ago by another pull request.
+        const n = (await one("SELECT COUNT(*) AS n FROM lessons WHERE repo = ?1", repo).all()).results?.[0]?.n ?? 0;
+        return { ok: false, reason: n >= MAX_PER_REPO ? "full" : "duplicate" };
+      }
       return { ok: true, id: res.meta?.last_row_id ?? null, text: clean };
     },
 

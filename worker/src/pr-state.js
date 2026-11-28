@@ -620,7 +620,7 @@ export class PrState {
         // Lessons are the maintainers' words, shown in code spans so nothing in them pings or renders.
         reply = !rows.length
           ? "Nothing has been taught here yet. A maintainer can add a lesson with `learn <sentence>`."
-          : ["What I have been taught in this repository (`forget <number>` removes one):", "", ...rows.map((r) => `${r.id}. \`${codeSpan(r.text.slice(0, 140))}\` (${r.source === "maintainer" ? `by ${String(r.by).replace(/[^A-Za-z0-9-]/g, "")}` : "a claim the code confirmed"})`)].join("\n");
+          : ["What I have been taught in this repository (`forget <number>` removes one):", "", ...rows.map((r) => `- Lesson ${r.id}: \`${codeSpan(r.text.slice(0, 140))}\` (${r.source === "maintainer" ? `by ${String(r.by).replace(/[^A-Za-z0-9-]/g, "")}` : "a claim the code confirmed"})`)].join("\n");
       } else if (item.cmd === "forget") {
         const gone = await mem.forget({ repo, id: Number(item.arg) });
         reply = gone ? `Forgotten: lesson ${item.arg}.` : `There is no lesson ${item.arg} in this repository.`;

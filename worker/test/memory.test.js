@@ -34,9 +34,10 @@ test("relevant: finds lessons by the words of the change, stems them, keeps repo
   await m.add({ repo: R, text: "Database migrations must be reversible.", source: "maintainer", by: "a" });
   await m.add({ repo: R, text: "Never log request bodies in the webhook handler.", source: "maintainer", by: "a" });
   await m.add({ repo: "TanksterAI/other", text: "Migrations here are forward only.", source: "maintainer", by: "a" });
-  const got = await m.relevant({ repo: R, terms: searchTerms("Add migration for users", "worker/src/webhook.js"), limit: 1 });
+  // The newer, unrelated lesson must not win: only the index and stemming can find the older one.
+  const got = await m.relevant({ repo: R, terms: searchTerms("migration"), limit: 1, fill: 0 });
   assert.equal(got.length, 1);
-  assert.match(got[0].text, /migrations must be reversible|request bodies/);
+  assert.match(got[0].text, /migrations must be reversible/);
   const both = await m.relevant({ repo: R, terms: searchTerms("migrating things"), limit: 5 });
   assert.equal(both.length, 2, "fills up from the newest when few match");
   assert.ok(both.every((l) => !/forward only/.test(l.text)), "another repository's lessons never leak in");
@@ -102,4 +103,15 @@ test("the search index follows an edited lesson", async () => {
   await db.prepare("UPDATE lessons SET text = ?1 WHERE id = ?2").bind("Prefer composition over inheritance.", id).run();
   assert.equal((await m.relevant({ repo: R, terms: ["early"], fill: 0 })).length, 0);
   assert.equal((await m.relevant({ repo: R, terms: ["composition"], fill: 0 })).length, 1);
+});
+
+test("lessons in other scripts are distinct, and the same lesson twice at once is saved once", async () => {
+  const db = fakeD1();
+  const m = createMemory(db);
+  assert.equal((await m.add({ repo: R, text: "不要记录用户请求的正文。", source: "maintainer", by: "a" })).ok, true);
+  assert.equal((await m.add({ repo: R, text: "数据库迁移必须能够回滚。", source: "maintainer", by: "a" })).ok, true);
+  const same = await Promise.all([1, 2, 3].map(() => m.add({ repo: R, text: "Never log secrets in a stack trace.", source: "maintainer", by: "a" })));
+  assert.equal(same.filter((r) => r.ok).length >= 1, true);
+  assert.equal((await db.prepare("SELECT COUNT(*) n FROM lessons WHERE lower(text) = lower('Never log secrets in a stack trace.')").bind().all()).results[0].n, 1);
+  assert.ok(same.filter((r) => !r.ok).every((r) => r.reason === "duplicate"));
 });
