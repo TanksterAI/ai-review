@@ -448,7 +448,8 @@ function limited(m, { writers = () => false, threadPages = 1, reviewPages = 10, 
       spend();
       const pages = Math.min(10, Math.max(1, Math.ceil(people.length / 100)));
       for (let i = 0; i < pages; i++) spend();
-      return { logins: new Set(people.slice(0, 1000).filter(writers).map((l) => l.toLowerCase())), complete: people.length <= 1000 };
+      // As the reader: ten full pages (1,000) may hide more, so incomplete.
+      return { logins: new Set(people.slice(0, 1000).filter(writers).map((l) => l.toLowerCase())), complete: people.length < 1000 };
     };
   }
   return { checked, peak, listed, reset: () => { used = 0; } };
@@ -614,7 +615,8 @@ test("a withdrawal waits one alarm for the list rather than guess: no needless c
   // withdrawn by the second alarm, no per-person checks.
   const all = [...writersOf(999), "outsider"];
   const w = await make({ threads: resolvedBy(all), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
-  const lw = limited(w, { writers: (l) => l !== "outsider", threadPages: 20, people: all });
+  // The outsider is no collaborator: 999 listed, a whole list.
+  const lw = limited(w, { writers: () => true, threadPages: 20, people: writersOf(999) });
   let gone = false;
   w.fx.dismissReview = async () => { gone = true; return true; };
   const wpost = w.fx.postReview;
@@ -623,6 +625,26 @@ test("a withdrawal waits one alarm for the list rather than guess: no needless c
   await run(w, lw, 2, 40_000);
   assert.ok(gone, "withdrawn by the second alarm");
   assert.equal(lw.checked.length, 0);
+});
+
+test("a withdrawal reads the list once: alarms two hours apart never hold it again, it withdraws", async () => {
+  // CodeRabbit's case: twenty pages of threads, ten of collaborators, the
+  // reopened thread resolved again by an outsider, and every alarm at least
+  // two hours after the last. The first reads the list and is held; the
+  // next finds it expired and, rather than read it again (and hold again),
+  // checks within the alarm or counts the unchecked as outsiders.
+  const people = writersOf(999);
+  const threads = resolvedBy([...people, "outsider"]);
+  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lim = limited(m, { writers: () => true, threadPages: 20, people });
+  let gone = false;
+  m.fx.dismissReview = async () => { gone = true; return true; };
+  const post = m.fx.postReview;
+  m.fx.postReview = async (...a) => { if (a[2]?.event === "REQUEST_CHANGES") gone = true; return post(...a); };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  for (let i = 1; i <= 3 && !gone; i++) await step(m, lim, NOW + i * (2 * 3600_000 + 60_000));
+  assert.ok(gone, "withdrawn");
+  assert.equal(lim.listed.calls, 1, "the list read once");
 });
 
 test("past a list too long to read whole, a withdrawal with no room to check counts the resolver as an outsider, then decides again", async () => {

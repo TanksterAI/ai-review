@@ -1308,6 +1308,10 @@ export class PrState {
         if (listed === null) {
           const kept = await this.ctx.storage.get(listKey(item.id));
           if (kept && now - kept.at < WRITER_MAX_MS) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
+          // A withdrawal reads it once: one held for it and woken too late to
+          // use it (alarms hours apart) checks within the alarm instead, and
+          // counts the unchecked as outsiders, so it always ends.
+          else if (kept && item.reopened) listed = false;
           else if (typeof fx.writers === "function" && room() >= WRITERS_READ) {
             listed = await fx.writers(key.repo);
             await this.ctx.storage.put(listKey(item.id), { logins: [...listed.logins], complete: Boolean(listed.complete), at: now });
