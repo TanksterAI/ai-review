@@ -95,7 +95,13 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
     return token;
   }
 
+  // Requests sent so far (Workers Free allows 50 an invocation); a caller
+  // takes the difference across its own work.
+  let sent = 0;
+  const subrequests = () => sent;
+
   async function call(method, path, { token, body } = {}) {
+    sent++;
     const res = await fetcher(`${API}${path}`, {
       method,
       headers: {
@@ -134,5 +140,5 @@ export function createGithubApp({ appId, privateKeyPem, fetcher = fetch, now = (
     return out.token;
   }
 
-  return { appJwt, installation, installationToken, call };
+  return { appJwt, installation, installationToken, call, subrequests };
 }

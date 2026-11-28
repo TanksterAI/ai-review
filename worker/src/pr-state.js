@@ -52,6 +52,11 @@ const RESOLVE_PER_STEP = 20;
 // Approvals one alarm dismisses at most, for the same reason: the rest are
 // dismissed by the next alarms, each a hold rather than a failed attempt.
 const DISMISS_PER_STEP = 20;
+// What one decision may spend of an alarm's 50 subrequests, and the part of
+// it kept for what may follow the dismissals (a change request with its
+// fallbacks, the summary's notice). Its reads come out of the same budget.
+const DECIDE_SUBREQUESTS = 45;
+const DECIDE_RESERVE = 8;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -1231,6 +1236,10 @@ export class PrState {
   // reopened after an approval asks for changes again, whatever was reviewed.
   async decide(fx, item, slug) {
     if (typeof fx.ownThreads !== "function" || typeof fx.reviewDecision !== "function") return undefined;
+    // Requests made from here on (the reads too), against the alarm's budget.
+    const counted = typeof fx.subrequests === "function";
+    const base = counted ? fx.subrequests() : 0;
+    const room = () => DECIDE_SUBREQUESTS - DECIDE_RESERVE - (counted ? fx.subrequests() - base : 0);
     const key = await this.ctx.storage.get("key");
     const st = await this.state();
     if (!key || st.closed) return undefined;
@@ -1315,7 +1324,14 @@ export class PrState {
         // Newest first: the approval at the head is the one GitHub counts.
         const pending = [...standing].reverse().filter((id) => !done.has(id));
         if (standing.length && !pending.length) dismissed = false;
+        // The reads left no room for even one dismissal: changes are requested
+        // now (within the room kept), rather than a hold that cannot progress.
+        if (dismissed && pending.length && room() < 1) dismissed = false;
+        let tried = 0;
         for (const id of dismissed ? pending.slice(0, DISMISS_PER_STEP) : []) {
+          // Out of room: the rest go in the next alarms.
+          if (room() < 1) break;
+          tried++;
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
           else {
             // Kept at once: if a later call throws, the retry still knows it.
@@ -1329,7 +1345,7 @@ export class PrState {
         // more after its last batch, so the next alarm reads the list again and
         // requests changes if any still stands. A refusal above needs no wait:
         // the change request below covers them all.
-        if (dismissed && (pending.length > DISMISS_PER_STEP || (resumed && pending.length > 0))) {
+        if (dismissed && (pending.length > tried || (resumed && pending.length > 0))) {
           await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
           return { holdUntil: this.now() + 1000 };
         }

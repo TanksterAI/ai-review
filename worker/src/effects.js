@@ -58,6 +58,12 @@ export function createEffects(env, deps = {}) {
   return {
     app,
 
+    // The requests the App has sent (0 if it does not count them): a caller
+    // takes the difference to stay inside one invocation's 50.
+    subrequests() {
+      return typeof app.subrequests === "function" ? app.subrequests() : 0;
+    },
+
     // workflow_dispatch needs only actions:write on ai-review, not contents.
     async dispatch(jobId) {
       const token = await app.installationToken([RUNNER_REPO], { actions: "write" });

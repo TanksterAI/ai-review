@@ -365,6 +365,65 @@ test("approved at this head already: nothing is filed, and a withdrawal's record
   assert.equal(await m.storage.get("withdrawn"), undefined);
 });
 
+test("a withdrawal counts the alarm's requests: it dismisses only what fits and holds for the rest", async () => {
+  // The reads have already used 30 requests (thread and review pages): only
+  // what fits under the alarm's budget, with room kept for the change request
+  // and the notice, is dismissed, then it holds (no attempt used).
+  const ids = Array.from({ length: 30 }, (_, i) => i + 1);
+  const m = await make({ threads: [thread("t1", false)] });
+  // The App's count is the isolate's: other work before this decision is not
+  // this decision's to spend, so only the difference counts.
+  let used = 100;
+  m.fx.subrequests = () => used;
+  let standing = [...ids];
+  m.fx.reviewDecision = async () => { used += 30; return { state: standing.length ? "APPROVED" : "DISMISSED", commitId: HEAD, id: 30, approvedIds: [...standing] }; };
+  const perAlarm = [];
+  let n = 0;
+  m.fx.dismissReview = async (_r, _p, id) => { used++; n++; standing = standing.filter((x) => x !== id); return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  let t = NOW;
+  for (let i = 0; i < 20 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    n = 0;
+    used = 100 + i * 37;
+    t += 2000;
+    m.setNow(t);
+    m.obj.ctx.storage.alarm = null;
+    await m.obj.alarm();
+    if (n) perAlarm.push(n);
+  }
+  assert.deepEqual(standing, []);
+  assert.ok(perAlarm.every((x) => x <= 7), `within the budget each alarm: ${perAlarm}`);
+  assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 0);
+  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0);
+
+  // Ten standing, room for seven: a first batch cut short by the budget
+  // holds for the other three (it is not yet a resumed withdrawal).
+  const short = await make({ threads: [thread("t1", false)] });
+  let su = 0;
+  short.fx.subrequests = () => su;
+  let left = Array.from({ length: 10 }, (_, i) => i + 1);
+  short.fx.reviewDecision = async () => { su += 30; return { state: left.length ? "APPROVED" : "DISMISSED", commitId: HEAD, id: 10, approvedIds: [...left] }; };
+  short.fx.dismissReview = async (_r, _p, id) => { su++; left = left.filter((x) => x !== id); return true; };
+  await short.obj.outbox({ type: "decide", reopened: true });
+  short.setNow(NOW + 2000);
+  short.obj.ctx.storage.alarm = null;
+  await short.obj.alarm();
+  assert.equal(left.length, 3);
+  assert.ok(((await short.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "held for the rest");
+
+  // The reads alone leave no room for a dismissal: changes are requested at
+  // once (one call, within the room kept), never a hold that cannot progress.
+  const full = await make({ threads: [thread("t1", false)] });
+  let u = 0;
+  full.fx.subrequests = () => u;
+  full.fx.reviewDecision = async () => { u += 40; return { state: "APPROVED", commitId: HEAD, id: 3, approvedIds: [1, 2, 3] }; };
+  let tried = 0;
+  full.fx.dismissReview = async () => { tried++; return true; };
+  await decide(full, { reopened: true });
+  assert.equal(tried, 0);
+  assert.equal(full.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
+});
+
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77], truncated: true } });
   m.fx.dismissReview = async () => true;

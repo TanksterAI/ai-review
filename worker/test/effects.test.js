@@ -230,6 +230,16 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);
 });
 
+test("effects report the App's request count, or none when the App does not count", async () => {
+  let n = 3;
+  const app = { ...fakeApp(), subrequests: () => n };
+  const fx = createEffects({}, { app });
+  assert.equal(fx.subrequests(), 3);
+  n = 7;
+  assert.equal(fx.subrequests(), 7);
+  assert.equal(createEffects({}, { app: fakeApp() }).subrequests(), 0);
+});
+
 test("reviewDecision: every standing approval of the App's, and a list too long to read whole is marked truncated", async () => {
   const bot = { login: "tankster-ai-review[bot]", type: "Bot" };
   const reviews = [
