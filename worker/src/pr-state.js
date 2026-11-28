@@ -1383,22 +1383,24 @@ export class PrState {
         else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
         else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id)) byOthers.push(t);
       }
-      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
-      // only for the threads in its own view: one reopened since and then
-      // resolved by an outsider is open, forced or not. Checked only while
-      // nothing is known to be open: once one is, the outcome is the same
-      // (no approval, or a withdrawal) whoever resolved the rest.
-      for (const t of open.length ? [] : byOthers) {
-        if (!(await isWriter(t.resolvedBy))) open.push(t);
-        if (short || open.length) break;
-      }
       // A kept finding that is a nitpick never blocks either. Only text that
       // carries the Worker's own comment header (its id line, as from the 422
       // fallback) is judged: a body-listed finding's text starts with the
       // model's title, which could imitate a label. Never one kept as severe.
+      // Read before the permissions: a kept finding settles the outcome too.
       const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
-      if (short) break;
       inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
+      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
+      // only for the threads in its own view: one reopened since and then
+      // resolved by an outsider is open, forced or not. Checked only while
+      // nothing is known to be open, a thread or a kept finding: once one is,
+      // the outcome is the same (no approval, or a withdrawal) whoever
+      // resolved the rest.
+      for (const t of open.length || inBody.length ? [] : byOthers) {
+        if (!(await isWriter(t.resolvedBy))) open.push(t);
+        if (short || open.length) break;
+      }
+      if (short) break;
       decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
       seqAtSnapshot = seq0;
       usedRec = rec;
@@ -1432,7 +1434,6 @@ export class PrState {
         // but still lists as approved is never dismissed again (that would
         // hold forever); with nothing new to dismiss, changes are requested.
         const done = new Set((await this.ctx.storage.get("withdrawn")) ?? []);
-        const resumed = done.size > 0;
         // Newest first: the approval at the head is the one GitHub counts.
         const pending = [...standing].reverse().filter((id) => !done.has(id));
         if (standing.length && !pending.length) dismissed = false;
@@ -1444,7 +1445,9 @@ export class PrState {
           // Out of room: the rest go in the next alarms.
           if (room() < 1) break;
           tried++;
-          if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
+          // Refused: no more are tried (the change request below covers them
+          // all, and a later call that throws must not keep it from being filed).
+          if (!(await fx.dismissReview(key.repo, key.pr, id, why))) { dismissed = false; break; }
           else {
             // Kept at once: if a later call throws, the retry still knows it.
             done.add(id);
@@ -1453,11 +1456,13 @@ export class PrState {
         }
         // More than one alarm's subrequests: the rest go in the next alarms
         // (each one reads the approvals still standing again), and the notice
-        // says withheld meanwhile. A withdrawal spread over alarms holds once
-        // more after its last batch, so the next alarm reads the list again and
-        // requests changes if any still stands. A refusal above needs no wait:
-        // the change request below covers them all.
-        if (dismissed && (pending.length > tried || (resumed && pending.length > 0))) {
+        // says withheld meanwhile. Every batch, the last and a first-and-only
+        // one included, holds once more, so the next alarm reads the list
+        // again and requests changes if one it dismissed still stands (never
+        // dismissing it again). A refusal above needs no wait: the change
+        // request below covers them all; nor does a truncated list's last
+        // batch, as its change request supersedes any approval still listed.
+        if (dismissed && pending.length > 0 && (pending.length > tried || !decision?.truncated)) {
           await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
           return { holdUntil: this.now() + 1000 };
         }

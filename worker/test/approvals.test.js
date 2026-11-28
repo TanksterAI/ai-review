@@ -660,6 +660,8 @@ test("past a list too long to read whole, a withdrawal with no room to check cou
   await m.obj.outbox({ type: "decide", reopened: true });
   await step(m, lim, NOW + 1000);
   assert.ok(withdrawn, "withdrawn on the unchecked resolvers");
+  // The next alarm confirms the withdrawal, and queues the ordinary decision.
+  await step(m, lim, NOW + 3000);
   assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide" && !x.reopened), "an ordinary decision checks again");
   // An approval past the list never counts an unchecked resolver as a writer:
   // out of room, it is held, and a writer's approve is the way out.
@@ -928,6 +930,54 @@ test("the two hours are judged after every read: the last before approving, and 
   b.fx.reviewDecision = rdb;
   await step(b, lb, NOW + H2 + 5000);
   assert.deepEqual(lb.checked, ["late-1"], "checked again");
+  assert.ok(gone, "withdrawn");
+});
+
+test("a refused dismissal stops the batch, and the change request is filed in the same alarm", async () => {
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 8, approvedIds: [7, 8] } });
+  const tried = [];
+  m.fx.dismissReview = async (_r, _p, id) => { tried.push(id); if (id === 8) return false; throw Object.assign(new Error("502"), { status: 502 }); };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  m.obj.ctx.storage.alarm = null;
+  await m.obj.alarm();
+  assert.deepEqual(tried, [8], "nothing dismissed after the refusal");
+  assert.ok(m.calls.some((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES"), "changes requested at once");
+});
+
+test("a withdrawal done in one batch is confirmed by reading the approvals again", async () => {
+  for (const stale of [false, true]) {
+    const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+    const tried = [];
+    m.fx.dismissReview = async (_r, _p, id) => {
+      tried.push(id);
+      if (!stale) m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 7, approvedIds: [] };
+      return true;
+    };
+    const changes = () => m.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length;
+    await m.obj.outbox({ type: "decide", reopened: true });
+    m.obj.ctx.storage.alarm = null;
+    await m.obj.alarm();
+    assert.equal(changes(), 0);
+    assert.ok((await m.storage.get("outbox")).some((x) => x.type === "decide"), "held for the read");
+    m.setNow(NOW + 5000);
+    await drain(m.obj);
+    assert.deepEqual(tried, [7], "never dismissed twice");
+    assert.equal(changes(), stale ? 1 : 0, stale ? "still listed: changes requested" : "gone: nothing more to do");
+  }
+});
+
+test("a kept body finding settles a withdrawal before any permission is looked up", async () => {
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "someone" }], decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  await keepOpenFindings(m.storage, [{ id: "f1", path: "a.js", line: 3, text: "x", sha: HEAD }]);
+  let looked = 0;
+  m.fx.writers = async () => { looked++; throw Object.assign(new Error("502"), { status: 502 }); };
+  m.fx.canWrite = async () => { looked++; throw Object.assign(new Error("502"), { status: 502 }); };
+  let gone = false;
+  m.fx.dismissReview = async () => { gone = true; m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 7, approvedIds: [] }; return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  m.obj.ctx.storage.alarm = null;
+  await m.obj.alarm();
+  assert.equal(looked, 0, "no permission looked up");
   assert.ok(gone, "withdrawn");
 });
 
