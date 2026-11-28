@@ -650,6 +650,20 @@ test("answers left by another decision are never trusted", async () => {
   assert.equal(approvals(m.calls).length, 0, "the old answer (a writer) is not used");
 });
 
+test("a writer's approve vouches for every thread: no permission checks, so even 1,000 resolvers are approved at once", async () => {
+  // The way out where a decision is too big to check in time (CodeRabbit's
+  // case: 1,000 writers' resolves, twenty pages, alarms 40 seconds apart):
+  // approval is never given on an unchecked answer, so it waits, and a
+  // writer's approve vouches for the threads, which then need no checks.
+  const threads = Array.from({ length: 1000 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `writer-${i + 1}` }));
+  const m = await make({ threads });
+  const lim = limited(m, { writers: () => true, threadPages: 20 });
+  await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
+  await run(m, lim, 6, 40_000);
+  assert.equal(approvals(m.calls).length, 1);
+  assert.deepEqual(lim.checked, ["rishitank"], "only the command's own author is checked");
+});
+
 test("a decision that throws leaves no permission answers behind", async () => {
   const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
   const m = await make({ threads });
