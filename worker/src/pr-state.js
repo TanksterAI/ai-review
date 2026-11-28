@@ -1307,19 +1307,36 @@ export class PrState {
         // was too long to read whole (an approval may be unlisted).
         const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
         let dismissed = typeof fx.dismissReview === "function" && standing.every((id) => Number.isSafeInteger(id));
-        for (const id of dismissed ? standing.slice(0, DISMISS_PER_STEP) : []) {
+        // The ids this withdrawal has already dismissed: one GitHub accepted
+        // but still lists as approved is never dismissed again (that would
+        // hold forever); with nothing new to dismiss, changes are requested.
+        const done = new Set((await this.ctx.storage.get("withdrawn")) ?? []);
+        const resumed = done.size > 0;
+        // Newest first: the approval at the head is the one GitHub counts.
+        const pending = [...standing].reverse().filter((id) => !done.has(id));
+        if (standing.length && !pending.length) dismissed = false;
+        for (const id of dismissed ? pending.slice(0, DISMISS_PER_STEP) : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
+          else done.add(id);
         }
         // More than one alarm's subrequests: the rest go in the next alarms
-        // (each one reads the approvals still standing again). A refusal
-        // above needs no wait: the change request below covers them all.
-        if (dismissed && standing.length > DISMISS_PER_STEP) return { holdUntil: this.now() + 1000 };
+        // (each one reads the approvals still standing again), and the notice
+        // says withheld meanwhile. A withdrawal spread over alarms holds once
+        // more after its last batch, so the next alarm reads the list again and
+        // requests changes if any still stands. A refusal above needs no wait:
+        // the change request below covers them all.
+        if (dismissed && (pending.length > DISMISS_PER_STEP || (resumed && pending.length > 0))) {
+          await this.ctx.storage.put("withdrawn", [...done]);
+          await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+          return { holdUntil: this.now() + 1000 };
+        }
         if (!dismissed || decision?.truncated) {
           const filed = await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
           // GitHub filed it only as a comment: an approval may still stand,
           // so fail and let the outbox try again within its limit.
           if (filed?.event && filed.event !== "REQUEST_CHANGES") throw new Error("the approval could not be withdrawn: GitHub filed the change request as a comment");
         }
+        await this.ctx.storage.delete("withdrawn");
       }
       // The summary's notice must not still say approved: it lists what is open.
       if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
@@ -1361,6 +1378,8 @@ export class PrState {
     // again (it then finds no complete review of this head and says pending).
     if (((await this.state()).baseEpoch ?? 0) !== epoch0) { await again(); return undefined; }
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
+    // A new approval starts the next withdrawal's record afresh.
+    await this.ctx.storage.delete("withdrawn");
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
     return undefined;

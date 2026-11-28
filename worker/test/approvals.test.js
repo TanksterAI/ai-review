@@ -229,12 +229,13 @@ test("a withdrawal of many approvals is spread over alarms (Workers Free's 50 su
   assert.deepEqual(standing, [], "every approval withdrawn");
   assert.ok(perAlarm.every((x) => x <= 20), `at most 20 an alarm: ${perAlarm}`);
   assert.equal(perAlarm.length, 6);
+  // Its last batch is checked by one more read: nothing stands, so it ends.
   assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 0, "all dismissed: no change request");
   assert.equal(((await m.storage.get("outbox")) ?? []).length, 0);
 
   // A refusal within a batch requests changes at once: nothing waits.
   const r = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 120, approvedIds: ids } });
-  r.fx.dismissReview = async (_r, _p, id) => id !== 3;
+  r.fx.dismissReview = async (_r, _p, id) => id !== 118;
   await decide(r, { reopened: true });
   assert.equal(r.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
 
@@ -257,6 +258,63 @@ test("a withdrawal of many approvals is spread over alarms (Workers Free's 50 su
   assert.deepEqual(left, []);
   assert.equal(order.filter((x) => x === "post").length, 1);
   assert.equal(order.at(-1), "post", "changes requested after every known dismissal");
+});
+
+test("a withdrawal dismisses the newest approvals first, and the notice says withheld before the first hold", async () => {
+  const ids = Array.from({ length: 45 }, (_, i) => i + 1);
+  const m = await make({ threads: [thread("t1", false)] });
+  let standing = [...ids];
+  m.fx.reviewDecision = async () => ({ state: "APPROVED", commitId: HEAD, id: 45, approvedIds: [...standing] });
+  const order = [];
+  m.fx.dismissReview = async (_r, _p, id) => { order.push(id); standing = standing.filter((x) => x !== id); return true; };
+  const notices = [];
+  m.obj.noticeApproval = async (_fx, _key, n) => { notices.push({ n, dismissed: order.length }); };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  m.setNow(NOW + 60_000);
+  m.obj.ctx.storage.alarm = null;
+  await m.obj.alarm();
+  assert.deepEqual(order, ids.slice(-20).reverse(), "the newest twenty, newest first");
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].n.withheld, HEAD, "withheld at once, not left saying approved");
+});
+
+test("a withdrawal that GitHub accepts but whose approvals keep standing requests changes, never holds forever", async () => {
+  // The list still names the dismissed ids (it lags, or GitHub accepted a
+  // repeat): no progress, so changes are requested and the item ends.
+  const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 40, approvedIds: ids } });
+  let calls = 0;
+  m.fx.dismissReview = async () => { calls++; return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  let t = NOW;
+  for (let i = 0; i < 30 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    t += 2000;
+    m.setNow(t);
+    m.obj.ctx.storage.alarm = null;
+    await m.obj.alarm();
+  }
+  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0, "ended, not held forever");
+  assert.equal(calls, 40, "each approval dismissed once, never again");
+  assert.equal(m.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
+  assert.equal(await m.storage.get("withdrawn"), undefined, "the withdrawal's record is cleared");
+
+  // A single batch whose ids were all dismissed already (an earlier
+  // withdrawal was cut short): none is dismissed again; changes are requested.
+  const again = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [5, 7] } });
+  await again.storage.put("withdrawn", [5, 7]);
+  let repeat = 0;
+  again.fx.dismissReview = async () => { repeat++; return true; };
+  await decide(again, { reopened: true });
+  assert.equal(repeat, 0);
+  assert.equal(again.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
+
+  // An approval filed afterwards clears the record, so a later withdrawal
+  // starts afresh.
+  const fresh = await make({ threads: [thread("t1", true)] });
+  await fresh.storage.put("withdrawn", [1, 2]);
+  await decide(fresh);
+  assert.equal(approvals(fresh.calls).length, 1);
+  assert.equal(await fresh.storage.get("withdrawn"), undefined);
 });
 
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
