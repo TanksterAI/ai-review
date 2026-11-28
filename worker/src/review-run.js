@@ -459,12 +459,12 @@ async function stageContext(ctx, run, save) {
   try {
     const [conv, ci] = await Promise.all([
       ctx.fx.conversation(run.repo.full, run.pr),
-      typeof ctx.fx.ciState === "function" ? ctx.fx.ciState(run.repo.full, run.headSha).catch(() => null) : null,
+      typeof ctx.fx.ciState === "function" ? ctx.fx.ciState(run.repo.full, run.headSha).catch(() => ({ checks: [], statuses: [], runs: [], missing: ["checks and workflows"] })) : null,
     ]);
     const built = buildContext({ conv, ci, ourLogin: login });
     const { stats } = renderContext(built, { tag: "x", max: ctx.cfg.contextChars });
     await ctx.storage.put(contextKey(run.id), built);
-    run.context = { ...stats, partial: Boolean(conv?.moreThreads) || Boolean(ci?.missing?.length), missing: ci?.missing ?? [] };
+    run.context = { ...stats, partial: Boolean(conv?.moreThreads) || Boolean(conv?.moreTalk) || Boolean(ci?.truncated) || Boolean(ci?.missing?.length), missing: ci?.missing ?? [] };
   } catch (e) {
     ctx.deps.log?.({ ev: "context_failed", error: String(e?.message ?? e).slice(0, 160) });
     run.context = { failed: true };
