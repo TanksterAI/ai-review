@@ -13,14 +13,17 @@ export const MAX_LESSON_CHARS = 400;
 export const MAX_PER_REPO = 200;
 const SOURCES = new Set(["maintainer", "confirmed"]);
 
-// Words to look for, from titles and file paths: letters and digits, three or
-// more characters, each quoted so nothing in them is FTS syntax.
+// Words to look for, from titles, file paths and the description: letters and
+// digits, three or more characters, each quoted later so nothing in them is
+// FTS syntax. Earlier texts fill the cap first, so pass the title and the
+// file paths before the (often boilerplate) description.
+export const MAX_TERMS = 16;
 export function searchTerms(...texts) {
   const seen = new Set();
   for (const t of texts) {
     for (const w of String(t ?? "").toLowerCase().split(/[^a-z0-9]+/)) {
+      if (seen.size >= MAX_TERMS) return [...seen];
       if (w.length >= 3 && w.length <= 30 && !STOP.has(w)) seen.add(w);
-      if (seen.size >= 16) break;
     }
   }
   return [...seen];
@@ -43,31 +46,36 @@ export function createMemory(db) {
       const clean = cleanLesson(text);
       if (!SOURCES.has(source)) return { ok: false, reason: "source" };
       if (clean.length < 8) return { ok: false, reason: "empty" };
-      const rows = (await one("SELECT id, text FROM lessons WHERE repo = ?1", repo).all()).results ?? [];
+      const rows = (await one("SELECT text FROM lessons WHERE repo = ?1", repo).all()).results ?? [];
       if (rows.some((r) => norm(r.text) === norm(clean))) return { ok: false, reason: "duplicate" };
-      if (rows.length >= MAX_PER_REPO) return { ok: false, reason: "full" };
-      const res = await one("INSERT INTO lessons (repo, text, source, by, pr, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", repo, clean, source, String(by).slice(0, 80), Number.isSafeInteger(pr) ? pr : null, now.toISOString()).run();
+      // The cap is checked inside the insert itself, so two pull requests of
+      // one repository cannot both slip past it.
+      const res = await one("INSERT INTO lessons (repo, text, source, by, pr, created_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE (SELECT COUNT(*) FROM lessons WHERE repo = ?1) < ?7", repo, clean, source, String(by).slice(0, 80), Number.isSafeInteger(pr) ? pr : null, now.toISOString(), MAX_PER_REPO).run();
+      if ((res.meta?.changes ?? 0) === 0) return { ok: false, reason: "full" };
       return { ok: true, id: res.meta?.last_row_id ?? null, text: clean };
     },
 
-    // The lessons most relevant to these words, best first; if none match, the
-    // newest. Used lessons have their count raised, so the useful stay.
-    async relevant({ repo, terms = [], limit = 8 }) {
-      const q = terms.filter((t) => /^[a-z0-9]+$/.test(t)).slice(0, 16).map((t) => `"${t}"`).join(" OR ");
+    // The lessons that match these words, best first (only those get their
+    // count raised, so the useful stay). If too few match, the newest fill up
+    // to `fill` in all: they are marked `matched: false`, are never counted
+    // as used, and never raise any count.
+    async relevant({ repo, terms = [], limit = 8, fill = 3 }) {
+      const q = terms.filter((t) => /^[a-z0-9]+$/.test(t)).slice(0, MAX_TERMS).map((t) => `"${t}"`).join(" OR ");
       let rows = [];
       if (q) {
-        rows = (await one("SELECT l.id, l.text, l.source, l.by FROM lessons_fts f JOIN lessons l ON l.id = f.rowid WHERE lessons_fts MATCH ?1 AND l.repo = ?2 ORDER BY bm25(lessons_fts), l.hits DESC LIMIT ?3", q, repo, limit).all()).results ?? [];
+        rows = ((await one("SELECT l.id, l.text, l.source, l.by FROM lessons_fts f JOIN lessons l ON l.id = f.rowid WHERE lessons_fts MATCH ?1 AND l.repo = ?2 ORDER BY bm25(lessons_fts), l.hits DESC LIMIT ?3", q, repo, limit).all()).results ?? []).map((r) => ({ ...r, matched: true }));
+        if (rows.length) await db.batch(rows.map((r) => one("UPDATE lessons SET hits = hits + 1 WHERE id = ?1", r.id)));
       }
-      if (rows.length < limit) {
+      const want = Math.min(fill, limit);
+      if (rows.length < want) {
         const have = new Set(rows.map((r) => r.id));
-        const more = (await one("SELECT id, text, source, by FROM lessons WHERE repo = ?1 ORDER BY hits DESC, id DESC LIMIT ?2", repo, limit).all()).results ?? [];
-        for (const r of more) if (rows.length < limit && !have.has(r.id)) rows.push(r);
+        const more = (await one("SELECT id, text, source, by FROM lessons WHERE repo = ?1 ORDER BY id DESC LIMIT ?2", repo, want).all()).results ?? [];
+        for (const r of more) if (rows.length < want && !have.has(r.id)) rows.push({ ...r, matched: false });
       }
-      if (rows.length) await db.batch(rows.map((r) => one("UPDATE lessons SET hits = hits + 1 WHERE id = ?1", r.id)));
-      return rows.map((r) => ({ id: r.id, text: r.text, source: r.source, by: r.by }));
+      return rows.map((r) => ({ id: r.id, text: r.text, source: r.source, by: r.by, matched: r.matched }));
     },
 
-    async list({ repo, limit = 30 }) {
+    async list({ repo, limit = MAX_PER_REPO }) {
       return ((await one("SELECT id, text, source, by, hits FROM lessons WHERE repo = ?1 ORDER BY id DESC LIMIT ?2", repo, limit).all()).results ?? []);
     },
 

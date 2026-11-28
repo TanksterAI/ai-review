@@ -159,9 +159,11 @@ import { readFileSync } from "node:fs";
 
 export function fakeD1() {
   const db = new DatabaseSync(":memory:");
-  const sql = readFileSync(new URL("../migrations/0001_memory.sql", import.meta.url), "utf8");
-  // Triggers hold semicolons: split on a semicolon that ends a statement line.
-  for (const stmt of sql.split(/;\s*\n(?=CREATE|$)/).map((s) => s.trim()).filter(Boolean)) db.exec(`${stmt.replace(/;$/, "")};`);
+  // Every migration, in order. Triggers hold semicolons: split on a semicolon that ends a statement line.
+  for (const f of ["0001_memory.sql", "0002_memory_update_trigger.sql"]) {
+    const sql = readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8");
+    for (const stmt of sql.split(/;\s*\n(?=CREATE|$)/).map((s) => s.trim()).filter(Boolean)) db.exec(`${stmt.replace(/;$/, "")};`);
+  }
   const make = (text, args = []) => ({
     bind: (...a) => make(text, a),
     async all() { return { results: db.prepare(text).all(...args.map(clean)) }; },

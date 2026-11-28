@@ -8,6 +8,7 @@
 //     after the webhook has been acknowledged.
 
 import { createMemory } from "./memory.js";
+import { codeSpan } from "./review.js";
 import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
 import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
@@ -143,7 +144,7 @@ export function parseCommand(text, slug = DEFAULT_SLUG, { args = false } = {}) {
     const verb = teach[1].toLowerCase();
     const arg = teach[2].trim();
     if (verb === "forget") return /^#?\d{1,9}$/.test(arg) ? { cmd: "forget", arg: arg.replace("#", "") } : null;
-    return { cmd: "learn", arg: arg.slice(0, 600) };
+    return { cmd: "learn", arg: arg.slice(0, 2000) };
   }
   // Own keys only: "constructor" or "__proto__" is no alias.
   const cmd = Object.hasOwn(ALIASES, said) ? ALIASES[said] : COMMANDS.includes(said) ? said : null;
@@ -609,24 +610,30 @@ export class PrState {
     const say = (body) => fx.comment(item.repo.full, item.pr, body);
     if (!mem) return say("Teaching is not set up on this installation, so nothing was saved.");
     const repo = item.repo.full;
+    // The memory is read or written first, and the answer posted after: a
+    // failed comment must never be reported as a failed memory, and a retry
+    // of the comment must not repeat the change.
+    let reply;
     try {
       if (item.cmd === "learnings") {
         const rows = await mem.list({ repo });
-        if (!rows.length) return say("Nothing has been taught here yet. A maintainer can add a lesson with `learn <sentence>`.");
-        return say(["What I have been taught in this repository (`forget <number>` removes one):", "", ...rows.map((r) => `${r.id}. ${r.text} (${r.source === "maintainer" ? `by ${r.by}` : "a claim the code confirmed"})`)].join("\n"));
-      }
-      if (item.cmd === "forget") {
+        // Lessons are the maintainers' words, shown in code spans so nothing in them pings or renders.
+        reply = !rows.length
+          ? "Nothing has been taught here yet. A maintainer can add a lesson with `learn <sentence>`."
+          : ["What I have been taught in this repository (`forget <number>` removes one):", "", ...rows.map((r) => `${r.id}. \`${codeSpan(r.text.slice(0, 140))}\` (${r.source === "maintainer" ? `by ${String(r.by).replace(/[^A-Za-z0-9-]/g, "")}` : "a claim the code confirmed"})`)].join("\n");
+      } else if (item.cmd === "forget") {
         const gone = await mem.forget({ repo, id: Number(item.arg) });
-        return say(gone ? `Forgotten: lesson ${item.arg}.` : `There is no lesson ${item.arg} in this repository.`);
+        reply = gone ? `Forgotten: lesson ${item.arg}.` : `There is no lesson ${item.arg} in this repository.`;
+      } else {
+        const r = await mem.add({ repo, text: item.arg, source: "maintainer", by: item.login, pr: item.pr, now: new Date(this.now()) });
+        if (r.ok) reply = `Learned (lesson ${r.id}): \`${codeSpan(r.text)}\`\n\nI will weigh it in later reviews here; the code still decides. \`forget ${r.id}\` removes it.`;
+        else reply = `Not saved: ${{ empty: "that is too short to be a lesson", duplicate: "I already have that lesson", full: "this repository has as many lessons as I keep: forget one first", source: "that is not a source I accept" }[r.reason]}.`;
       }
-      const r = await mem.add({ repo, text: item.arg, source: "maintainer", by: item.login, pr: item.pr, now: new Date(this.now()) });
-      if (r.ok) return say(`Learned (lesson ${r.id}): ${r.text}\n\nI will weigh it in later reviews here; the code still decides. \`forget ${r.id}\` removes it.`);
-      const why = { empty: "that is too short to be a lesson", duplicate: "I already have that lesson", full: "this repository has as many lessons as I keep: forget one first", source: "that is not a source I accept" }[r.reason];
-      return say(`Not saved: ${why}.`);
     } catch (e) {
       await report(this.env, e, "teach");
-      return say("I could not reach my memory just now, so nothing was changed. Try again later.");
+      reply = "I could not reach my memory just now, so nothing was changed. Try again later.";
     }
+    return say(reply);
   }
 
   async save(st, out) {

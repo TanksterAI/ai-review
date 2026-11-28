@@ -1082,15 +1082,20 @@ test("lessons: what a maintainer taught is read, shown to the drafter, and named
   const { fakeD1 } = await import("./helpers.js");
   const { createMemory } = await import("../src/memory.js");
   const MEMORY = fakeD1();
-  await createMemory(MEMORY).add({ repo: "TanksterAI/ai-review", text: "Retries must always be bounded and logged.", source: "maintainer", by: "rishitank" });
+  await createMemory(MEMORY).add({ repo: "TanksterAI/ai-review", text: "Every feat must keep retries bounded and logged.", source: "maintainer", by: "rishitank" });
   const s = setup({ github: withContext(), env: { MEMORY } });
   s.job.repo = s.job.repo ?? repo;
   await runAll(s);
   const sent = s.models.calls.filter((c) => c.text);
   assert.ok(sent.length >= 1);
-  for (const c of sent) assert.match(c.text, /lesson 1 \(from maintainer rishitank\): Retries must always be bounded and logged\./);
+  for (const c of sent) assert.match(c.text, /lesson 1 \(from maintainer rishitank\): Every feat must keep retries bounded and logged\./);
   const body = s.github.posted.at(-1)?.body ?? s.github.summaries.at(-1).body;
-  assert.match(body, /Applied 1 lesson the maintainers taught it\./);
+  assert.match(body, /Applied 1 lesson the maintainers taught it, matched to this pull request\./);
+
+  // Lessons sit in a block of their own, and the verifier is told what they are.
+  assert.ok(sent.every((c) => /WHAT MAINTAINERS TAUGHT THIS REPOSITORY/.test(c.text)));
+  const verifier = s.models.calls.find((c) => /Blocks about other people, bots and checks/.test(c.system ?? c.text ?? ""));
+  if (verifier) assert.match(verifier.system ?? verifier.text, /A block of lessons holds guidance maintainers gave/);
 
   const broken = setup({ github: withContext(), env: { MEMORY: { prepare() { throw new Error("D1 down"); } } } });
   await runAll(broken);

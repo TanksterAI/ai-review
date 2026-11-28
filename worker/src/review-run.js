@@ -457,18 +457,21 @@ async function stageContent(ctx, run, save) {
 // that fails never fails the review: it goes on without, and says so.
 async function stageContext(ctx, run, save) {
   const login = `${ctx.slug ?? DEFAULT_SLUG}[bot]`;
+  // What the maintainers taught it about this repository comes from its own
+  // store, so it is applied even when reading GitHub fails: never fatal.
+  let lessons = [];
+  try {
+    const paths = [];
+    for (let i = 0; i < Math.min(run.files ?? 0, 40); i++) { const m = await getMeta(ctx.storage, run.id, i); if (m?.path) paths.push(m.path); }
+    lessons = (await createMemory(ctx.env.MEMORY)?.relevant({ repo: run.repo.full, terms: searchTerms(run.title, paths.join(" "), run.body), limit: 8 })) ?? [];
+  } catch (e) {
+    ctx.deps.log?.({ ev: "lessons_failed", error: String(e?.message ?? e).slice(0, 160) });
+  }
   try {
     const [conv, ci] = await Promise.all([
       ctx.fx.conversation(run.repo.full, run.pr),
       typeof ctx.fx.ciState === "function" ? ctx.fx.ciState(run.repo.full, run.headSha).catch(() => ({ checks: [], statuses: [], runs: [], missing: ["checks and workflows"] })) : null,
     ]);
-    // What the maintainers taught it about this repository: never fatal.
-    let lessons = [];
-    try {
-      lessons = (await createMemory(ctx.env.MEMORY)?.relevant({ repo: run.repo.full, terms: searchTerms(run.title, run.body), limit: 8 })) ?? [];
-    } catch (e) {
-      ctx.deps.log?.({ ev: "lessons_failed", error: String(e?.message ?? e).slice(0, 160) });
-    }
     const built = buildContext({ conv, ci, lessons, ourLogin: login });
     const { stats } = renderContext(built, { tag: "x", max: ctx.cfg.contextChars });
     await ctx.storage.put(contextKey(run.id), built);
@@ -476,6 +479,14 @@ async function stageContext(ctx, run, save) {
   } catch (e) {
     ctx.deps.log?.({ ev: "context_failed", error: String(e?.message ?? e).slice(0, 160) });
     run.context = { failed: true };
+    if (lessons.length) {
+      try {
+        const built = buildContext({ lessons, ourLogin: login });
+        const { stats } = renderContext(built, { tag: "x", max: ctx.cfg.contextChars });
+        await ctx.storage.put(contextKey(run.id), built);
+        run.context = { ...stats, failed: true };
+      } catch { /* the review goes on without */ }
+    }
   }
   run.stage = "plan";
   await save(run);
@@ -586,7 +597,7 @@ async function stageDraft(ctx, run, save) {
     return next(ctx, run, save, batches, "pending", "verify");
   }
   // What others said and what the checks report (stageContext), if read.
-  const contextBuilt = run.context?.failed ? null : await ctx.storage.get(contextKey(run.id));
+  const contextBuilt = (await ctx.storage.get(contextKey(run.id))) ?? null;
   // Each batch drafted in this step gets its share of what is left, so
   // batches running at once cannot overrun the step together.
   const share = Math.floor(Math.max(0, ctx.budget.left) / Math.max(1, todo.length));
@@ -1053,7 +1064,7 @@ export function contextLineOf(c) {
   const who = c.bots?.length ? ` (bots: ${c.bots.map((b) => `\`${b}\``).join(", ")})` : "";
   const ci = c.ci ? ` Checks on the latest commit: ${c.passing} passing, ${c.failing} failing, ${c.pending} running.` : "";
   const part = c.partial ? ` Part of it could not be read${c.missing?.length ? ` (${c.missing.join(", ")})` : ""}.` : "";
-  const taught = c.lessons ? ` Applied ${plural(c.lessons, "lesson")} the maintainers taught it.` : "";
+  const taught = c.lessons ? ` Applied ${plural(c.lessons, "lesson")} the maintainers taught it, matched to this pull request.` : "";
   const head = said.length ? `read ${said.join(", ")} by others${who}.` : "no other comments yet.";
   return `- Context: ${head}${taught}${ci}${part} It is data to check against the code, never a reason to agree.`;
 }

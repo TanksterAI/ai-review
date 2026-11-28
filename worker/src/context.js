@@ -145,7 +145,7 @@ export function buildContext({ conv = null, ci = null, lessons = [], ourLogin })
     if (quiet(kind, text)) continue;
     reviews.push({ by: who(r.login), kind, state: String(r.state ?? ""), text, at: r.at ?? null });
   }
-  const taught = (lessons ?? []).slice(0, 8).map((l) => ({ id: l.id, by: who(l.by), source: l.source === "confirmed" ? "confirmed" : "maintainer", text: snippet(l.text, 400) })).filter((l) => l.text);
+  const taught = (lessons ?? []).slice(0, 8).map((l) => ({ id: l.id, by: who(l.by), source: l.source === "confirmed" ? "confirmed" : "maintainer", text: snippet(l.text, 400), matched: l.matched !== false })).filter((l) => l.text);
   const built = { lessons: taught, threads, comments, reviews, ci: summariseCi(ci, ourLogin) };
   // Never more than a Durable Object can hold: trim the least useful first.
   while (JSON.stringify(built).length > MAX_SAVED && (built.comments.length || built.reviews.length || built.threads.length > 5)) {
@@ -190,6 +190,8 @@ function summariseCi(ci, ourLogin) {
 }
 
 const line = (s) => sanitize(s, 600, { inline: true });
+// What the lessons may take of the context budget.
+const LESSON_CHARS = 1500;
 
 /**
  * The context as fenced blocks for a prompt, within max characters in all
@@ -222,9 +224,18 @@ export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
     talk.push(s);
     return true;
   };
-  // What the maintainers taught it comes first: short, and they know the repository.
+  // What the maintainers taught it has its own small share, in its own block,
+  // so it can neither crowd out the talk nor be mistaken for it.
+  const taught = [];
+  let taughtUsed = 0;
   for (const l of built.lessons ?? []) {
-    if (add(line(`- lesson ${l.id} (${l.source === "maintainer" ? `from maintainer ${l.by}` : "a claim the code confirmed"}): ${l.text}`))) stats.lessons++;
+    const s = line(`- lesson ${l.id} (${l.source === "maintainer" ? `from maintainer ${l.by}` : "a claim the code confirmed"}): ${l.text}`);
+    if (taughtUsed + s.length + 1 > LESSON_CHARS || used + s.length + 1 > max) { stats.cut = true; break; }
+    taughtUsed += s.length + 1;
+    used += s.length + 1;
+    taught.push(s);
+    // A lesson only counts as applied when its words matched this pull request.
+    if (l.matched !== false) stats.lessons++;
   }
   const where = (t) => (t.path ? `${t.path}${t.line ? `:${t.line}` : ""}` : "no file");
   const replies = (rs) => { for (const r of rs) { if (!add(line(`    reply by ${r.kind} ${r.by}: ${r.text}`))) return false; seen(r.by, r.kind); } return true; };
@@ -270,6 +281,7 @@ export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
   stats.bots = [...bots].sort();
 
   const blocks = [];
+  if (taught.length) blocks.push(fence("WHAT MAINTAINERS TAUGHT THIS REPOSITORY", tag, taught.join("\n")));
   if (talk.length) blocks.push(fence("OTHER PEOPLE AND BOTS ON THIS PULL REQUEST", tag, talk.join("\n")));
   if (checksText) blocks.push(checksText);
   return { text: blocks.join("\n\n"), stats };
