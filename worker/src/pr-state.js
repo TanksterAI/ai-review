@@ -1330,7 +1330,6 @@ export class PrState {
         // requests changes if any still stands. A refusal above needs no wait:
         // the change request below covers them all.
         if (dismissed && (pending.length > DISMISS_PER_STEP || (resumed && pending.length > 0))) {
-          await this.ctx.storage.put("withdrawn", [...done]);
           await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
           return { holdUntil: this.now() + 1000 };
         }
@@ -1355,9 +1354,13 @@ export class PrState {
       // nothing is approved (never once per trigger) and the notice stands.
       return undefined;
     }
-    // Approved at this head already: by the latest review, or by any of the
-    // App's approvals still standing (the latest may be a later dismissal).
-    if ((decision?.state === "APPROVED" && decision.commitId === head) || (Array.isArray(decision?.approvedHeads) && decision.approvedHeads.includes(head))) {
+    // Approved at this head already, by its latest decision. Only that: GitHub
+    // keeps an approval a later change request overrode listed as approved,
+    // and does not say an older one counts again once a later is dismissed,
+    // so any other case is approved again (a duplicate costs nothing; a
+    // skipped approval blocks).
+    if (decision?.state === "APPROVED" && decision.commitId === head) {
+      await this.ctx.storage.delete("withdrawn");
       await this.noticeApproval(fx, key, { approved: head });
       return undefined;
     }

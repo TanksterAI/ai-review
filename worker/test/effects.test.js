@@ -224,7 +224,7 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
   const d = await createEffects({}, { app }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
   // With its id, so a stale approval can be dismissed, and the ids of every
   // approval of the App's that still stands (here only 33).
-  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33, approvedIds: [33], approvedHeads: ["3".repeat(40)], truncated: false });
+  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33, approvedIds: [33], truncated: false });
   assert.equal(app.log.calls.length, 2);
   const none = fakeApp(() => []);
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);
@@ -239,9 +239,6 @@ test("reviewDecision: every standing approval of the App's, and a list too long 
   ];
   const d = await createEffects({}, { app: fakeApp(() => reviews) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
   assert.deepEqual(d.approvedIds, [11, 33]);
-  // And the commit each standing approval names, so a head already approved
-  // is never approved again (the dismissed 22's commit is not among them).
-  assert.deepEqual(d.approvedHeads, ["1".repeat(40), "3".repeat(40)]);
   assert.equal(d.truncated, false);
   // Ten full pages: there may be more, so the answer is marked truncated.
   const full = Array.from({ length: 100 }, (_, i) => ({ user: bot, state: "APPROVED", commit_id: "4".repeat(40), id: i }));
@@ -251,7 +248,7 @@ test("reviewDecision: every standing approval of the App's, and a list too long 
   // as "never decided"), but an unknown state, marked truncated.
   const others = Array.from({ length: 100 }, (_, i) => ({ user: { login: "rishitank", type: "User" }, state: "APPROVED", commit_id: "5".repeat(40), id: i }));
   const u = await createEffects({}, { app: fakeApp(() => others) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
-  assert.deepEqual(u, { state: null, commitId: null, id: null, approvedIds: [], approvedHeads: [], truncated: true });
+  assert.deepEqual(u, { state: null, commitId: null, id: null, approvedIds: [], truncated: true });
 });
 
 const thread = (over = {}) => ({

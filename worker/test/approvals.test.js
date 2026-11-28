@@ -338,16 +338,31 @@ test("each dismissal is recorded as GitHub accepts it, so a call that throws mid
   assert.equal(seen.filter((id) => id === 40).length, 1, "40 was dismissed once, though the list still names it");
 });
 
-test("a head that a standing approval already covers is not approved again, even when the latest review is dismissed", async () => {
-  // A is approved and still stands; a later approval of B was dismissed.
-  // Back at A, with a complete review: nothing new is filed.
-  const m = await make({ decision: { state: "DISMISSED", commitId: "b".repeat(40), id: 9, approvedIds: [5], approvedHeads: [HEAD] } });
+test("an approval overridden by a later change request is not taken as covering the head: the head is approved again", async () => {
+  // GitHub keeps an overridden approval listed as APPROVED. A change request
+  // after it (a refused withdrawal) leaves the App's decision changes
+  // requested, so once the threads are resolved the head is approved again,
+  // forced or not, rather than the notice claiming an approval that GitHub
+  // no longer counts.
+  for (const force of [false, true]) {
+    const m = await make({ decision: { state: "CHANGES_REQUESTED", commitId: HEAD, id: 9, approvedIds: [5] } });
+    await decide(m, { force, login: "rishitank" });
+    assert.equal(approvals(m.calls).length, 1, `force=${force}`);
+  }
+  // A later approval of another head dismissed, an older one still listed:
+  // whether GitHub counts the older one again is not documented, so the head
+  // is approved again (a duplicate costs nothing; a skipped one blocks).
+  const back = await make({ decision: { state: "DISMISSED", commitId: "e".repeat(40), id: 9, approvedIds: [5] } });
+  await decide(back);
+  assert.equal(approvals(back.calls).length, 1);
+});
+
+test("approved at this head already: nothing is filed, and a withdrawal's record is cleared", async () => {
+  const m = await make({ decision: { state: "APPROVED", commitId: HEAD, id: 5, approvedIds: [5] } });
+  await m.storage.put("withdrawn", [1, 2]);
   await decide(m);
   assert.equal(approvals(m.calls).length, 0);
-  // Its approval dismissed too: the head is approved again.
-  const again = await make({ decision: { state: "DISMISSED", commitId: HEAD, id: 5, approvedIds: [], approvedHeads: [] } });
-  await decide(again);
-  assert.equal(approvals(again.calls).length, 1);
+  assert.equal(await m.storage.get("withdrawn"), undefined);
 });
 
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
