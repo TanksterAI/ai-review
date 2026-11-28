@@ -932,7 +932,8 @@ async function stageThreads(ctx, run, save) {
           ctx.deps.log?.({ ev: "peer_threads_failed", peer, error: String(e?.message ?? e).slice(0, 160) });
         }
         for (const t of theirs) {
-          if (t.resolved || !t.path || !t.originalCommit || t.originalCommit === run.headSha || reopened.has(t.id)) continue;
+          // A thread this App has already answered is left alone: if a person reopened it, that is theirs.
+          if (t.resolved || t.repliedByUs || !t.path || !t.originalCommit || t.originalCommit === run.headSha || reopened.has(t.id) || items.some((i) => i.threadId === t.id)) continue;
           const text = cleanBody(t.body).slice(0, 1500);
           if (!text) continue;
           items.push({ kind: "peer", id: `p:${t.id}`, threadId: t.id, commentId: t.commentId, body: text, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: true, state: "new", peer });
@@ -968,7 +969,8 @@ async function stageThreads(ctx, run, save) {
         if (!straight) { x.state = "open"; continue; }
         const f = files.find((y) => y.filename === x.path || y.previous_filename === x.path);
         if (!f) { x.state = files.length >= 300 ? "open" : "untouched"; continue; }
-        if (f.status === "removed") { x.state = "fixed"; continue; }
+        // A removed file may only have moved with the problem intact: another reviewer's thread needs the models to say so.
+        if (f.status === "removed") { x.state = x.kind === "peer" ? "open" : "fixed"; continue; }
         if (typeof f.patch !== "string") { x.state = "open"; continue; }
         const near = nearHunks(f.patch, x.line);
         if (!near.touched) { x.state = "untouched"; continue; }
@@ -1025,13 +1027,23 @@ async function stageThreads(ctx, run, save) {
     } else if (x.kind === "peer") {
       // Another bot's thread: a reply saying why, then resolved. Never two
       // replies: the reply is remembered before the thread is resolved.
-      if (!x.replied) {
-        await fx.replyToThread(run.repo.full, run.pr, x.commentId, peerNote(run.headSha, x.first));
-        x.replied = true;
-        await ctx.storage.put(threadsKey(run.id), th);
-        if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+      try {
+        if (!x.replied) {
+          await fx.replyToThread(run.repo.full, run.pr, x.commentId, peerNote(run.headSha, x.first));
+          x.replied = true;
+          await ctx.storage.put(threadsKey(run.id), th);
+          if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+        }
+        if (!(await fx.resolveThread(run.repo.full, x.threadId))) throw new Error("the thread did not resolve");
+      } catch (e) {
+        // One bad thread (deleted comment, no permission) must not stop the review:
+        // retried a couple of times in case it is transient, then left open.
+        x.fails = (x.fails ?? 0) + 1;
+        ctx.deps.log?.({ ev: "peer_apply_failed", peer: x.peer, fails: x.fails, error: String(e?.message ?? e).slice(0, 160) });
+        if (x.fails < 3) { await ctx.storage.put(threadsKey(run.id), th); throw e; }
+        x.state = "open";
+        continue;
       }
-      await fx.resolveThread(run.repo.full, x.threadId);
       // Not this App's own finding: counted apart, never in "earlier findings".
       th.peersResolved = (th.peersResolved ?? 0) + 1;
       x.state = "resolved";

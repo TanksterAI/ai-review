@@ -1129,8 +1129,8 @@ function twoOpinions(answer) {
   return fetch;
 }
 
-function peerSetup(models, { threads = [peerThread()], env = {} } = {}) {
-  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status: "modified", patch: NEAR_20 }] });
+function peerSetup(models, { threads = [peerThread()], env = {}, status = "modified" } = {}) {
+  const since = () => ({ status: "ahead", files: [{ filename: "worker/src/m3.js", status, patch: NEAR_20 }] });
   const github = threadsGithub({ files: SMALL, threads: [], since });
   github.ownThreads = async (_r, _p, login) => { github.calls.push(`ownThreads:${login}`); return login === "coderabbitai" ? threads : []; };
   github.replies = [];
@@ -1184,4 +1184,32 @@ test("peers: a reply that already went out is never posted twice when the resolv
   await runAll(s);
   assert.equal(s.github.replies.length, 1);
   assert.deepEqual(s.github.resolved, ["PRRT_p"]);
+});
+
+test("peers: a thread we already answered is left alone (a person may have reopened it), and a removed file needs the models", async () => {
+  const answered = peerSetup(twoOpinions(() => "fixed"), { threads: [peerThread({ repliedByUs: true })] });
+  await runAll(answered);
+  assert.deepEqual([answered.github.replies, answered.github.resolved], [[], []]);
+
+  const removed = peerSetup(twoOpinions(() => "fixed"), { status: "removed" });
+  await runAll(removed);
+  assert.deepEqual([removed.github.replies, removed.github.resolved], [[], []], "a removed file may have moved with the bug intact");
+});
+
+test("peers: one thread that cannot be answered never stops the review, and is left open", async () => {
+  const s = peerSetup(twoOpinions(() => "fixed"));
+  s.github.replyToThread = async () => { throw new Error("404 comment deleted"); };
+  await runAll(s);
+  assert.equal(s.done[0].gaveUp, false);
+  assert.deepEqual(s.github.resolved, []);
+});
+
+test("PEER_RESOLVE: trimmed, case-insensitive, no repeats, never our own App, off anywhere means none", async () => {
+  const { peerLogins } = await import("../src/config.js");
+  assert.deepEqual(peerLogins(undefined), ["coderabbitai"]);
+  assert.deepEqual(peerLogins(" CodeRabbitAI[bot] , coderabbitai,tankster-ai-review"), ["coderabbitai"]);
+  assert.deepEqual(peerLogins(" off"), []);
+  assert.deepEqual(peerLogins("off,coderabbitai"), []);
+  assert.deepEqual(peerLogins(""), []);
+  assert.deepEqual(peerLogins("a-b,c d,x".replace("c d", "cd")), ["a-b", "cd", "x"]);
 });
