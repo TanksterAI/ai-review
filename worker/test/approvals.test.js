@@ -206,6 +206,59 @@ test("a withdrawal whose change request GitHub files only as a comment is retrie
   assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "still waiting to be retried");
 });
 
+test("a withdrawal of many approvals is spread over alarms (Workers Free's 50 subrequests), and the holds use up no attempts", async () => {
+  // 120 standing approvals: at most 20 are dismissed an alarm, so six alarms,
+  // more than the outbox's five attempts; each one with progress is a hold.
+  const ids = Array.from({ length: 120 }, (_, i) => i + 1);
+  const m = await make({ threads: [thread("t1", false)] });
+  let standing = [...ids];
+  m.fx.reviewDecision = async () => ({ state: standing.length ? "APPROVED" : "DISMISSED", commitId: HEAD, id: 120, approvedIds: [...standing] });
+  const perAlarm = [];
+  let n = 0;
+  m.fx.dismissReview = async (_r, _p, id) => { n++; standing = standing.filter((x) => x !== id); return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  let t = NOW;
+  for (let i = 0; i < 20 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    n = 0;
+    t += 60_000;
+    m.setNow(t);
+    m.obj.ctx.storage.alarm = null;
+    await m.obj.alarm();
+    if (n) perAlarm.push(n);
+  }
+  assert.deepEqual(standing, [], "every approval withdrawn");
+  assert.ok(perAlarm.every((x) => x <= 20), `at most 20 an alarm: ${perAlarm}`);
+  assert.equal(perAlarm.length, 6);
+  assert.equal(m.calls.filter((c) => c[0] === "postReview").length, 0, "all dismissed: no change request");
+  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0);
+
+  // A refusal within a batch requests changes at once: nothing waits.
+  const r = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 120, approvedIds: ids } });
+  r.fx.dismissReview = async (_r, _p, id) => id !== 3;
+  await decide(r, { reopened: true });
+  assert.equal(r.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
+
+  // Truncated: the known approvals go first, then changes are requested.
+  const tr = await make({ threads: [thread("t1", false)] });
+  let left = [...ids];
+  tr.fx.reviewDecision = async () => ({ state: left.length ? "APPROVED" : "DISMISSED", commitId: HEAD, id: 120, approvedIds: [...left], truncated: true });
+  const order = [];
+  tr.fx.dismissReview = async (_r, _p, id) => { order.push("dismiss"); left = left.filter((x) => x !== id); return true; };
+  const post = tr.fx.postReview;
+  tr.fx.postReview = async (...a) => { order.push("post"); return post(...a); };
+  await tr.obj.outbox({ type: "decide", reopened: true });
+  t = NOW;
+  for (let i = 0; i < 20 && ((await tr.storage.get("outbox")) ?? []).length; i++) {
+    t += 60_000;
+    tr.setNow(t);
+    tr.obj.ctx.storage.alarm = null;
+    await tr.obj.alarm();
+  }
+  assert.deepEqual(left, []);
+  assert.equal(order.filter((x) => x === "post").length, 1);
+  assert.equal(order.at(-1), "post", "changes requested after every known dismissal");
+});
+
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77], truncated: true } });
   m.fx.dismissReview = async () => true;

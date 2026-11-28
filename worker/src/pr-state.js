@@ -49,6 +49,9 @@ const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "hel
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
 const RESOLVE_PER_STEP = 20;
+// Approvals one alarm dismisses at most, for the same reason: the rest are
+// dismissed by the next alarms, each a hold rather than a failed attempt.
+const DISMISS_PER_STEP = 20;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -63,7 +66,7 @@ export function helpText(slug = DEFAULT_SLUG) {
     "| `full review` | Review the whole pull request again |",
     "| `pause` (or `ignore`) | Stop automatic reviews on this pull request |",
     "| `resume` | Start automatic reviews again, and review the commits pushed while they were paused |",
-    "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's). As a reply in one of its threads, resolve that thread only |",
+    "| `resolve` | Resolve all of its review threads and approve. With no approval of its own standing, it does not wait for a review of the latest commit (as CodeRabbit's); renewing one waits for a complete review of the head. As a reply in one of its threads, resolve that thread only |",
     "| `approve` | The same as a top-level `resolve` |",
     "| `rate limit` | Say whether a review can run now, or when one can |",
     "| `help` | Show this list |",
@@ -1298,14 +1301,19 @@ export class PrState {
       // A truncated list may hide an approval, whatever the latest state, so
       // it is withdrawn too; a complete list with none standing is a no-op.
       if ((open.length || inBody.length) && (standing.length || decision?.truncated)) {
-        // As CodeRabbit's: the approval is withdrawn (dismissed). Changes are
-        // requested instead if GitHub refuses a dismissal, and also when the
-        // review list was too long to read whole (an approval may be unlisted).
+        // As CodeRabbit's: the approval is withdrawn (dismissed), up to 20 an
+        // alarm. Changes are requested instead if GitHub refuses a dismissal,
+        // and also, once the known ones are dismissed, when the review list
+        // was too long to read whole (an approval may be unlisted).
         const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
         let dismissed = typeof fx.dismissReview === "function" && standing.every((id) => Number.isSafeInteger(id));
-        for (const id of dismissed ? standing : []) {
+        for (const id of dismissed ? standing.slice(0, DISMISS_PER_STEP) : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
         }
+        // More than one alarm's subrequests: the rest go in the next alarms
+        // (each one reads the approvals still standing again). A refusal
+        // above needs no wait: the change request below covers them all.
+        if (dismissed && standing.length > DISMISS_PER_STEP) return { holdUntil: this.now() + 1000 };
         if (!dismissed || decision?.truncated) {
           const filed = await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
           // GitHub filed it only as a comment: an approval may still stand,
