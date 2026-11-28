@@ -174,6 +174,34 @@ test("a reopened thread withdraws every approval of the App's that still stands,
   assert.equal(r.calls.filter((c) => c[0] === "postReview").length, 1);
 });
 
+test("a reopen keeps withdrawing while any approval of the App's still stands, even when the latest is dismissed", async () => {
+  // A retry after a partial withdrawal: the latest review is dismissed, but 55
+  // still approves. It is dismissed, and a refusal still requests changes.
+  for (const [ok, posted] of [[true, 0], [false, 1]]) {
+    const m = await make({ threads: [thread("t1", false)], decision: { state: "DISMISSED", commitId: HEAD, id: 77, approvedIds: [55] } });
+    const dismissed = [];
+    m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return ok; };
+    await decide(m, { reopened: true });
+    assert.deepEqual(dismissed, [55]);
+    assert.equal(m.calls.filter((c) => c[0] === "postReview").length, posted, `ok=${ok}`);
+  }
+});
+
+test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77], truncated: true } });
+  m.fx.dismissReview = async () => true;
+  await decide(m, { reopened: true });
+  assert.equal(m.calls.filter((c) => c[0] === "postReview" && c[1].event === "REQUEST_CHANGES").length, 1);
+});
+
+test("a review list too long to read whole with no decision of the App's in it approves nothing, forced or not", async () => {
+  for (const force of [false, true]) {
+    const m = await make({ decision: { state: null, commitId: null, id: null, approvedIds: [], truncated: true } });
+    await decide(m, { force, login: "rishitank" });
+    assert.equal(approvals(m.calls).length, 0, `force=${force}`);
+  }
+});
+
 test("after a reopen dismisses the approval, the head is approved again only once its threads are resolved", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77 } });
   m.fx.dismissReview = async () => { m.w.decision = { state: "DISMISSED", commitId: HEAD, id: 77 }; return true; };

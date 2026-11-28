@@ -260,7 +260,8 @@ export function createEffects(env, deps = {}) {
     // renewed approval leaves the older one standing too, so a withdrawal
     // dismisses them all). {state, commitId, id, approvedIds, truncated}, or
     // null. truncated: ten full pages were read and there may be more, so the
-    // answer may be out of date.
+    // answer may be out of date; then state is null if none of the App's
+    // decisions was among them.
     async reviewDecision(repoFull, pr, botLogin) {
       const name = nameOf(repoFull);
       const token = await app.installationToken([name], PR_SCOPE);
@@ -277,7 +278,10 @@ export function createEffects(env, deps = {}) {
         if (!list || list.length < 100) break;
         if (page === 10) truncated = true;
       }
-      return last && { ...last, approvedIds, truncated };
+      // Nothing of the App's in ten full pages is not "never decided": the
+      // answer is unknown (state null), so a caller approves nothing.
+      if (!last) return truncated ? { state: null, commitId: null, id: null, approvedIds, truncated } : null;
+      return { ...last, approvedIds, truncated };
     },
 
     // Withdraws one of the App's own reviews (an approval no longer true), as

@@ -1290,18 +1290,21 @@ export class PrState {
       return undefined;
     }
     if (item.reopened) {
-      if ((open.length || inBody.length) && decision?.state === "APPROVED") {
-        // As CodeRabbit's: the approval is withdrawn (dismissed). Every one of
-        // the App's approvals that still stands goes, since a renewal leaves
-        // the older one standing too. Only if GitHub refuses one is changes
-        // requested instead.
+      // Every approval of the App's that still stands, not only the latest
+      // review: a renewal leaves the older one standing too, and a retry after
+      // a partial withdrawal finds the latest already dismissed.
+      const standing = Array.isArray(decision?.approvedIds) && decision.approvedIds.length
+        ? decision.approvedIds : decision?.state === "APPROVED" ? [decision.id] : [];
+      if ((open.length || inBody.length) && (standing.length || (decision?.truncated && decision?.state === "APPROVED"))) {
+        // As CodeRabbit's: the approval is withdrawn (dismissed). Changes are
+        // requested instead if GitHub refuses a dismissal, and also when the
+        // review list was too long to read whole (an approval may be unlisted).
         const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
-        const ids = Array.isArray(decision.approvedIds) && decision.approvedIds.length ? decision.approvedIds : [decision.id];
-        let dismissed = typeof fx.dismissReview === "function" && ids.every((id) => Number.isSafeInteger(id));
-        for (const id of dismissed ? ids : []) {
+        let dismissed = typeof fx.dismissReview === "function" && standing.every((id) => Number.isSafeInteger(id));
+        for (const id of dismissed ? standing : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
         }
-        if (!dismissed) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
+        if (!dismissed || decision.truncated) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
       }
       // The summary's notice must not still say approved: it lists what is open.
       if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });

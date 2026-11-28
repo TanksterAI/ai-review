@@ -242,6 +242,11 @@ test("reviewDecision: every standing approval of the App's, and a list too long 
   const full = Array.from({ length: 100 }, (_, i) => ({ user: bot, state: "APPROVED", commit_id: "4".repeat(40), id: i }));
   const t = await createEffects({}, { app: fakeApp(() => full) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
   assert.equal(t.truncated, true);
+  // Ten full pages with no decision of the App's: not null (that would read
+  // as "never decided"), but an unknown state, marked truncated.
+  const others = Array.from({ length: 100 }, (_, i) => ({ user: { login: "rishitank", type: "User" }, state: "APPROVED", commit_id: "5".repeat(40), id: i }));
+  const u = await createEffects({}, { app: fakeApp(() => others) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.deepEqual(u, { state: null, commitId: null, id: null, approvedIds: [], truncated: true });
 });
 
 const thread = (over = {}) => ({
