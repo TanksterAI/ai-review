@@ -23,9 +23,21 @@ export function config(env) {
     // (context.js): on, or off. The characters it may add to a prompt.
     contextMode: String(env.REVIEW_CONTEXT ?? "on").toLowerCase() === "off" ? "off" : "on",
     contextChars: num(env.CONTEXT_CHARS, 6000),
+    // Other reviewing bots whose threads this App resolves, once a later commit
+    // fixes what they pointed at (a fix a model judged, and a second model agreed
+    // on). Comma-separated GitHub logins as GraphQL names them; "off" for none.
+    peerResolve: peerLogins(env.PEER_RESOLVE),
     audience: env.AUDIENCE,
     ownerId: env.OWNER_ID,
     // Comma-separated job_workflow_ref values; an entry ending in * is a prefix.
     workflowRefs: String(env.WORKFLOW_REFS ?? "").split(",").map((x) => x.trim()).filter(Boolean),
   };
+}
+
+// PEER_RESOLVE: logins (case-insensitive, trimmed, no "[bot]"), no repeats, never
+// our own App; "off" anywhere in the list, or an empty list, means none.
+export function peerLogins(raw, own = "tankster-ai-review") {
+  const parts = String(raw ?? "coderabbitai").split(",").map((x) => x.trim().replace(/\[bot\]$/i, "").toLowerCase()).filter(Boolean);
+  if (parts.includes("off")) return [];
+  return [...new Set(parts)].filter((x) => /^[a-z0-9-]{1,39}$/.test(x) && x !== own);
 }

@@ -43,10 +43,10 @@ import { draftWithChain } from "./draft.js";
 import { groundFindings } from "./grounding.js";
 import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
-import { addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
+import { ADDRESSED_MARK, addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
 import { DEFAULT_SLUG } from "./webhook.js";
 import { createMemory, searchTerms } from "./memory.js";
-import { buildContext, renderContext } from "./context.js";
+import { buildContext, cleanBody, renderContext } from "./context.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
 // under runmeta:<id>, so finding the run in progress never loads its data.
@@ -919,7 +919,29 @@ async function stageThreads(ctx, run, save) {
       const key = f.key ?? occurrenceKey(f);
       items.push({ kind: "body", id: `b:${key}`, findingKey: key, path: f.path, line: f.line, body: f.text, original: "", since: f.sha, severe: Boolean(f.severe), state: "new" });
     }
-    th = { items, open: earlier + inBody.length, resolved: 0, unchecked: null };
+    // Other bots' open threads (CodeRabbit's, by default) that a later commit
+    // may have fixed: judged like our own, resolved only on two models' say.
+    // A peer's text is cleaned first: its agent prompts never reach a model.
+    let peers = 0;
+    if (typeof fx.replyToThread === "function") {
+      for (const peer of ctx.cfg.peerResolve ?? []) {
+        let theirs = [];
+        try {
+          theirs = await fx.ownThreads(run.repo.full, run.pr, peer);
+        } catch (e) {
+          ctx.deps.log?.({ ev: "peer_threads_failed", peer, error: String(e?.message ?? e).slice(0, 160) });
+        }
+        for (const t of theirs) {
+          // A thread this App has already answered is left alone: if a person reopened it, that is theirs.
+          if (t.resolved || t.repliedByUs || !t.path || !t.originalCommit || t.originalCommit === run.headSha || reopened.has(t.id) || items.some((i) => i.threadId === t.id)) continue;
+          const text = cleanBody(t.body).slice(0, 1500);
+          if (!text) continue;
+          items.push({ kind: "peer", id: `p:${t.id}`, threadId: t.id, commentId: t.commentId, body: text, path: t.path, line: t.originalLine, original: t.diffHunk, since: t.originalCommit, severe: true, state: "new", peer });
+          peers++;
+        }
+      }
+    }
+    th = { items, open: earlier + inBody.length, resolved: 0, unchecked: null, peers };
     if (!items.length) return done(th);
     return again(th);
   }
@@ -947,7 +969,8 @@ async function stageThreads(ctx, run, save) {
         if (!straight) { x.state = "open"; continue; }
         const f = files.find((y) => y.filename === x.path || y.previous_filename === x.path);
         if (!f) { x.state = files.length >= 300 ? "open" : "untouched"; continue; }
-        if (f.status === "removed") { x.state = "fixed"; continue; }
+        // A removed file may only have moved with the problem intact: another reviewer's thread needs the models to say so.
+        if (f.status === "removed") { x.state = x.kind === "peer" ? "open" : "fixed"; continue; }
         if (typeof f.patch !== "string") { x.state = "open"; continue; }
         const near = nearHunks(f.patch, x.line);
         if (!near.touched) { x.state = "untouched"; continue; }
@@ -1001,6 +1024,30 @@ async function stageThreads(ctx, run, save) {
       await fx.editReviewComment(run.repo.full, x.commentId, addressedNote(x.body, run.headSha, x.first));
       if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
       await fx.resolveThread(run.repo.full, x.threadId);
+    } else if (x.kind === "peer") {
+      // Another bot's thread: a reply saying why, then resolved. Never two
+      // replies: the reply is remembered before the thread is resolved.
+      try {
+        if (!x.replied) {
+          await fx.replyToThread(run.repo.full, run.pr, x.commentId, peerNote(run.headSha, x.first));
+          x.replied = true;
+          await ctx.storage.put(threadsKey(run.id), th);
+          if (await reopenedNow(x.threadId)) { x.state = "open"; continue; }
+        }
+        if (!(await fx.resolveThread(run.repo.full, x.threadId))) throw new Error("the thread did not resolve");
+      } catch (e) {
+        // One bad thread (deleted comment, no permission) must not stop the review:
+        // retried a couple of times in case it is transient, then left open.
+        x.fails = (x.fails ?? 0) + 1;
+        ctx.deps.log?.({ ev: "peer_apply_failed", peer: x.peer, fails: x.fails, error: String(e?.message ?? e).slice(0, 160) });
+        if (x.fails < 3) { await ctx.storage.put(threadsKey(run.id), th); throw e; }
+        x.state = "open";
+        continue;
+      }
+      // Not this App's own finding: counted apart, never in "earlier findings".
+      th.peersResolved = (th.peersResolved ?? 0) + 1;
+      x.state = "resolved";
+      continue;
     } else if (x.kind === "accept") {
       // Already resolved (by someone without write access): the note, and
       // it no longer holds back approval.
@@ -1015,6 +1062,13 @@ async function stageThreads(ctx, run, save) {
   }
   if (fixed.length > APPLIES_PER_STEP) return again(th);
   return done(th);
+}
+
+// The reply under another bot's thread when a later commit fixed what it said.
+export function peerNote(sha, first = null) {
+  const last = String(sha).slice(0, 7);
+  const from = first && first !== sha ? `commits ${String(first).slice(0, 7)} to ${last}` : `commit ${last}`;
+  return `${ADDRESSED_MARK} Addressed in ${from}. Tankster AI Review compared the code this comment pointed at before and after, and a second model agreed it is fixed. Reopen this thread if that is wrong.`;
 }
 
 // --- summary: the one comment, edited in place ------------------------------
@@ -1044,6 +1098,7 @@ export function summaryText({ headSha, summary, about, shown, actionable = shown
   if (threads) {
     const parts = [];
     if (threads.resolved) parts.push(`${plural(threads.resolved, "earlier finding")} addressed and resolved`);
+    if (threads.peersResolved) parts.push(`${plural(threads.peersResolved, "thread")} of other reviewers addressed and resolved`);
     const stillOpen = Math.max(0, threads.open - threads.resolved);
     if (stillOpen) parts.push(`${stillOpen} still open`);
     if (parts.length) lines.push(`Earlier findings: ${parts.join("; ")}.`, "");

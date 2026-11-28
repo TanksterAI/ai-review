@@ -304,7 +304,7 @@ export function createEffects(env, deps = {}) {
         const conn = data?.repository?.pullRequest?.reviewThreads;
         for (const t of conn?.nodes ?? []) {
           const c = t?.comments?.nodes?.[0];
-          if (!c || c.author?.login !== botLogin) continue;
+          if (!c || String(c.author?.login ?? "").toLowerCase() !== String(botLogin).toLowerCase()) continue;
           out.push({
             id: t.id, resolved: Boolean(t.isResolved), outdated: Boolean(t.isOutdated), path: t.path ?? null,
             line: Number.isInteger(t.line) ? t.line : null, originalLine: Number.isInteger(t.originalLine) ? t.originalLine : null,
@@ -313,6 +313,8 @@ export function createEffects(env, deps = {}) {
             commentId: commentIdOf(c.fullDatabaseId ?? c.databaseId), body: String(c.body ?? ""), diffHunk: String(c.diffHunk ?? ""),
             originalCommit: c.originalCommit?.oid ?? null, findingId: findingIdOf(c.body),
             resolvedBy: t.resolvedBy?.login ?? null,
+            // Has this App already answered in the thread (so a person may have reopened it)?
+            repliedByUs: (t.tail?.nodes ?? []).some((n) => String(n?.body ?? "").includes(MARKER)),
           });
         }
         if (!conn?.pageInfo?.hasNextPage) return out;
@@ -406,6 +408,14 @@ export function createEffects(env, deps = {}) {
       return data?.resolveReviewThread?.thread?.isResolved === true;
     },
 
+    // A reply in a review thread (any thread of this pull request), marked as ours.
+    async replyToThread(repoFull, pr, commentId, body) {
+      const name = nameOf(repoFull);
+      if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");
+      const token = await app.installationToken([name], PR_SCOPE);
+      await app.call("POST", `/repos/${ORG}/${name}/pulls/${Number(pr)}/comments/${commentId}/replies`, { token, body: { body: `${MARKER}\n${body}` } });
+    },
+
     async editReviewComment(repoFull, commentId, body) {
       const name = nameOf(repoFull);
       if (!Number.isSafeInteger(commentId)) throw new Error("not a comment id");
@@ -454,6 +464,7 @@ const THREADS_QUERY = `query($owner: String!, $name: String!, $pr: Int!, $after:
         nodes {
           id isResolved isOutdated path line originalLine resolvedBy { login }
           comments(first: 1) { nodes { fullDatabaseId author { login } body diffHunk originalCommit { oid } } }
+          tail: comments(last: 3) { nodes { body } }
         }
       }
     }
