@@ -270,6 +270,9 @@ export function createEffects(env, deps = {}) {
       const token = await app.installationToken([name], PR_SCOPE);
       let last = null;
       const approvedIds = [];
+      // The commit each standing approval names: a head one of them already
+      // covers is never approved again.
+      const approvedHeads = [];
       let truncated = false;
       for (let page = 1; page <= 10; page++) {
         const list = await app.call("GET", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`, { token });
@@ -277,14 +280,15 @@ export function createEffects(env, deps = {}) {
           if (r?.user?.type !== "Bot" || r.user.login !== botLogin || !DECISIONS.has(r.state)) continue;
           last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
           if (r.state === "APPROVED" && Number.isSafeInteger(r.id)) approvedIds.push(r.id);
+          if (r.state === "APPROVED" && typeof r.commit_id === "string") approvedHeads.push(r.commit_id);
         }
         if (!list || list.length < 100) break;
         if (page === 10) truncated = true;
       }
       // Nothing of the App's in ten full pages is not "never decided": the
       // answer is unknown (state null), so a caller approves nothing.
-      if (!last) return truncated ? { state: null, commitId: null, id: null, approvedIds, truncated } : null;
-      return { ...last, approvedIds, truncated };
+      if (!last) return truncated ? { state: null, commitId: null, id: null, approvedIds, approvedHeads, truncated } : null;
+      return { ...last, approvedIds, approvedHeads, truncated };
     },
 
     // Withdraws one of the App's own reviews (an approval no longer true), as

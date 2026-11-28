@@ -317,6 +317,39 @@ test("a withdrawal that GitHub accepts but whose approvals keep standing request
   assert.equal(await fresh.storage.get("withdrawn"), undefined);
 });
 
+test("each dismissal is recorded as GitHub accepts it, so a call that throws mid-batch never leads to a repeat", async () => {
+  const ids = Array.from({ length: 40 }, (_, i) => i + 1);
+  const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 40, approvedIds: ids } });
+  const seen = [];
+  let fail = true;
+  m.fx.dismissReview = async (_r, _p, id) => {
+    seen.push(id);
+    if (id === 39 && fail) { fail = false; throw new Error("network"); }
+    return true;
+  };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  let t = NOW;
+  for (let i = 0; i < 30 && ((await m.storage.get("outbox")) ?? []).length; i++) {
+    t += 2000;
+    m.setNow(t);
+    m.obj.ctx.storage.alarm = null;
+    try { await m.obj.alarm(); } catch { /* the throw is retried */ }
+  }
+  assert.equal(seen.filter((id) => id === 40).length, 1, "40 was dismissed once, though the list still names it");
+});
+
+test("a head that a standing approval already covers is not approved again, even when the latest review is dismissed", async () => {
+  // A is approved and still stands; a later approval of B was dismissed.
+  // Back at A, with a complete review: nothing new is filed.
+  const m = await make({ decision: { state: "DISMISSED", commitId: "b".repeat(40), id: 9, approvedIds: [5], approvedHeads: [HEAD] } });
+  await decide(m);
+  assert.equal(approvals(m.calls).length, 0);
+  // Its approval dismissed too: the head is approved again.
+  const again = await make({ decision: { state: "DISMISSED", commitId: HEAD, id: 5, approvedIds: [], approvedHeads: [] } });
+  await decide(again);
+  assert.equal(approvals(again.calls).length, 1);
+});
+
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {
   const m = await make({ threads: [thread("t1", false)], decision: { state: "APPROVED", commitId: HEAD, id: 77, approvedIds: [77], truncated: true } });
   m.fx.dismissReview = async () => true;

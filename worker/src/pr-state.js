@@ -1317,7 +1317,11 @@ export class PrState {
         if (standing.length && !pending.length) dismissed = false;
         for (const id of dismissed ? pending.slice(0, DISMISS_PER_STEP) : []) {
           if (!(await fx.dismissReview(key.repo, key.pr, id, why))) dismissed = false;
-          else done.add(id);
+          else {
+            // Kept at once: if a later call throws, the retry still knows it.
+            done.add(id);
+            await this.ctx.storage.put("withdrawn", [...done]);
+          }
         }
         // More than one alarm's subrequests: the rest go in the next alarms
         // (each one reads the approvals still standing again), and the notice
@@ -1351,7 +1355,9 @@ export class PrState {
       // nothing is approved (never once per trigger) and the notice stands.
       return undefined;
     }
-    if (decision?.state === "APPROVED" && decision.commitId === head) {
+    // Approved at this head already: by the latest review, or by any of the
+    // App's approvals still standing (the latest may be a later dismissal).
+    if ((decision?.state === "APPROVED" && decision.commitId === head) || (Array.isArray(decision?.approvedHeads) && decision.approvedHeads.includes(head))) {
       await this.noticeApproval(fx, key, { approved: head });
       return undefined;
     }
