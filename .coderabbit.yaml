@@ -1,0 +1,9 @@
+# CodeRabbit is advisory for this repository (Rishi, 28 Nov 2026).
+# It still reviews and comments, but posts COMMENTED reviews instead of
+# CHANGES_REQUESTED ones, so a free-tier rate limit can never leave a stale
+# change request that blocks the merge. The required gate is the
+# "Tankster AI Review" status plus the tests.
+language: en-GB
+reviews:
+  request_changes_workflow: false
+  high_level_summary: true
