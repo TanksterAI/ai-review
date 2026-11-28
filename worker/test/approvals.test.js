@@ -859,6 +859,42 @@ test("a list read starts the record afresh; a refusal keeps the record's first t
   assert.equal(approvals(b.calls).length, 1);
 });
 
+test("the two hours are judged when the record is used, and again just before approving", async () => {
+  const H2 = 2 * 3600_000;
+  const seeded = async (m) => {
+    await m.obj.outbox({ type: "decide" });
+    const [{ id }] = (await m.storage.get("outbox")).filter((x) => x.type === "decide");
+    // Refused list, answer kept: used as it stands while the record is fresh.
+    await m.storage.put(`writersList:${id}`, { at: NOW, refused: true, checked: { "late-1": true } });
+    return id;
+  };
+  // The record expires while the threads are read: judged at the lookup, so
+  // late-1 is checked again rather than trusted on the old answer.
+  const a = await make({ threads: resolvedBy(["late-1"]) });
+  const la = limited(a, { writers: () => true });
+  await seeded(a);
+  const ot = a.fx.ownThreads;
+  a.fx.ownThreads = async (...x) => { a.setNow(NOW + H2 + 1000); return ot(...x); };
+  await step(a, la, NOW + H2 - 1000);
+  assert.deepEqual(la.checked, ["late-1"], "checked again: expired at the lookup");
+
+  // The record is fresh at the lookup but expires before the approval: held,
+  // and the next alarm checks again before approving.
+  const b = await make({ threads: resolvedBy(["late-1"]) });
+  const lb = limited(b, { writers: () => true });
+  const idb = await seeded(b);
+  const rd = b.fx.reviewDecision;
+  b.fx.reviewDecision = async (...x) => { b.setNow(NOW + H2); return rd(...x); };  // exactly two hours: past it
+  await step(b, lb, NOW + H2 - 1000);
+  assert.deepEqual(lb.checked, [], "the kept answer used at the lookup");
+  assert.equal(approvals(b.calls).length, 0, "not approved on an answer past its two hours");
+  assert.ok((await b.storage.get("outbox")).some((x) => x.id === idb), "the decision is held");
+  b.fx.reviewDecision = rd;
+  await step(b, lb, NOW + H2 + 5000);
+  assert.deepEqual(lb.checked, ["late-1"], "checked again");
+  assert.equal(approvals(b.calls).length, 1);
+});
+
 test("one unlisted resolver on two threads is checked once", async () => {
   const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "late-1" }, { ...thread("t2", true), resolvedBy: "late-1" }] });
   const lim = limited(m, { writers: () => true, people: writersOf(1001) });

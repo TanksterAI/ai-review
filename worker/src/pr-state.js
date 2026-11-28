@@ -1289,12 +1289,14 @@ export class PrState {
     let short = false;
     // A withdrawal decided on a resolver it had no room to check.
     let guessed = false;
+    // The record of the snapshot the decision goes on with: its two hours are
+    // judged again just before approving (the reads in between take time).
+    let usedRec = null;
     for (let tries = 0; tries < 3 && !settled && !short; tries++) {
       // Taken again only if a whole one still fits this alarm.
       if (tries > 0 && room() < SNAPSHOT_READ) { short = true; break; }
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
-      const now = this.now();
       // Everyone with write access, read afresh by each decision (one page
       // for up to 100 collaborators): a resolver it names is a writer, and
       // one a whole list does not name is not. When the reviews no longer fit
@@ -1309,8 +1311,11 @@ export class PrState {
       const isWriter = async (login) => {
         if (listed === null) {
           const kept = await this.ctx.storage.get(listKey(item.id));
-          const fresh = kept && now - kept.at < WRITER_MAX_MS;
-          rec = fresh ? { checked: {}, ...kept } : { at: now, checked: {} };
+          // Judged when it is used, not when the snapshot began: the thread
+          // read before it takes time.
+          const at = this.now();
+          const fresh = kept && at - kept.at < WRITER_MAX_MS;
+          rec = fresh ? { checked: {}, ...kept } : { at, checked: {} };
           if (fresh && kept.logins) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
           // Refused once in this decision: not asked again (each alarm would
           // spend on it, and could leave no room for the checks).
@@ -1335,7 +1340,7 @@ export class PrState {
             // A list read now starts the record afresh: its two hours run
             // from now, so no earlier answer is carried past its own.
             if (listed) {
-              rec = { at: now, checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
+              rec = { at: this.now(), checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
               await save();
             }
           } else listed = false;
@@ -1393,6 +1398,7 @@ export class PrState {
       inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
       decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
       seqAtSnapshot = seq0;
+      usedRec = rec;
       settled = ((await this.ctx.storage.get("reopenSeq")) ?? 0) === seq0;
     }
     if (short) return { holdUntil: this.now() + 1000 };
@@ -1505,6 +1511,9 @@ export class PrState {
     // A retarget since the snapshot: the review is of the old base, so decide
     // again (it then finds no complete review of this head and says pending).
     if (((await this.state()).baseEpoch ?? 0) !== epoch0) { await again(); return undefined; }
+    // An answer past its two hours never approves: held, the next alarm
+    // starts the record afresh and checks again.
+    if (usedRec && this.now() - usedRec.at >= WRITER_MAX_MS) return { holdUntil: this.now() + 1000 };
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
     // A new approval starts the next withdrawal's record afresh.
     await this.ctx.storage.delete("withdrawn");
