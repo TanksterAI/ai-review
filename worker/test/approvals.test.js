@@ -452,7 +452,7 @@ function limited(m, { writers = () => false, threadPages = 1, reviewPages = 10, 
       return { logins: new Set(people.slice(0, 1000).filter(writers).map((l) => l.toLowerCase())), complete: people.length < 1000 };
     };
   }
-  return { checked, peak, listed, reset: () => { used = 0; } };
+  return { checked, peak, listed, spend, reset: () => { used = 0; } };
 }
 
 async function run(m, lim, limit = 40, step = 2000) {
@@ -777,6 +777,55 @@ test("a login named like an object's own member is checked, never taken from the
   }
 });
 
+test("a kept outsider's answer stays an outsider's after a hold", async () => {
+  // An outsider checked past an incomplete list; a reopen lands during the
+  // reviews, the snapshot taken again does not fit, so it is held; the next
+  // alarm reads the kept answer (false) and approves nothing.
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "outsider" }] });
+  const lim = limited(m, { writers: () => false, threadPages: 20, people: writersOf(1001) });
+  const rd = m.fx.reviewDecision;
+  let bumped = false;
+  m.fx.reviewDecision = async (...a) => {
+    if (!bumped && lim.checked.length) { bumped = true; await m.storage.put("reopenSeq", ((await m.storage.get("reopenSeq")) ?? 0) + 1); }
+    return rd(...a);
+  };
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 6);
+  assert.ok(bumped);
+  assert.deepEqual(lim.checked, ["outsider"], "checked once, the answer kept");
+  assert.equal(approvals(m.calls).length, 0);
+});
+
+test("per-person answers last two hours at most: past that, the list is read again and everyone checked again", async () => {
+  for (const later of [2 * 3600_000, 2 * 3600_000 + 60_000]) {
+    const people = writersOf(1001);
+    const m = await make({ threads: resolvedBy(writersOf(40, "late")) });
+    const lim = limited(m, { writers: () => true, threadPages: 20, people });
+    await m.obj.outbox({ type: "decide" });
+    await step(m, lim, NOW + 1000);
+    await step(m, lim, NOW + 2000);
+    const first = [...lim.checked];
+    assert.ok(first.length > 0 && first.length < 40, `some checked before the hold: ${first.length}`);
+    await step(m, lim, NOW + 1000 + later);
+    assert.equal(lim.listed.calls, 2, `the list read again after ${later} ms`);
+    await step(m, lim, NOW + 2000 + later);
+    assert.ok(lim.checked.slice(first.length).includes(first[0]), "the same people checked again");
+  }
+});
+
+test("past two hours a refused decision asks for the list again and checks everyone again", async () => {
+  const m = await make({ threads: resolvedBy(["late-1"]) });
+  const lim = limited(m, { writers: () => true });
+  let asked = 0;
+  m.fx.writers = async () => { asked++; const e = new Error("403"); e.status = 403; throw e; };
+  await m.obj.outbox({ type: "decide" });
+  const [{ id }] = (await m.storage.get("outbox")).filter((x) => x.type === "decide");
+  await m.storage.put(`writersList:${id}`, { at: NOW, refused: true, checked: { "late-1": true } });
+  await step(m, lim, NOW + 2 * 3600_000 + 1000);
+  assert.equal(asked, 1, "asked again");
+  assert.deepEqual(lim.checked, ["late-1"], "checked again, the old answer not trusted");
+});
+
 test("one unlisted resolver on two threads is checked once", async () => {
   const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "late-1" }, { ...thread("t2", true), resolvedBy: "late-1" }] });
   const lim = limited(m, { writers: () => true, people: writersOf(1001) });
@@ -786,14 +835,28 @@ test("one unlisted resolver on two threads is checked once", async () => {
   assert.equal(approvals(m.calls).length, 1);
 });
 
-test("if GitHub refuses the collaborators list, each resolver is checked on their own", async () => {
-  const m = await make({ threads: resolvedBy(["writer-1"]) });
-  const lim = limited(m, { writers: () => true });
-  m.fx.writers = async () => { const e = new Error("GitHub GET /collaborators failed: 403"); e.status = 403; throw e; };
-  await m.obj.outbox({ type: "decide" });
-  await run(m, lim, 3);
-  assert.deepEqual(lim.checked, ["writer-1"]);
-  assert.equal(approvals(m.calls).length, 1);
+test("if GitHub refuses the collaborators list, each resolver is checked on their own, and it is asked once a decision", async () => {
+  for (const status of [403, 404]) {
+    // The worst case: twenty pages of threads, a token with every call, the
+    // refusal costing two. Recorded, it is not asked for again, so the
+    // checks fit and the decision ends approved.
+    const m = await make({ threads: resolvedBy(writersOf(3)) });
+    const lim = limited(m, { writers: () => true, threadPages: 20 });
+    let asked = 0;
+    m.fx.writers = async () => {
+      asked++;
+      lim.spend(); // its token
+      lim.spend(); // the refused call
+      const e = new Error(`GitHub GET /collaborators failed: ${status}`);
+      e.status = status;
+      throw e;
+    };
+    await m.obj.outbox({ type: "decide" });
+    await run(m, lim, 10);
+    assert.equal(asked, 1, `asked once (${status})`);
+    assert.deepEqual(lim.checked.sort(), ["writer-1", "writer-2", "writer-3"]);
+    assert.equal(approvals(m.calls).length, 1, `approved (${status})`);
+  }
 
   // A failure that is not a refusal (a 502) is tried again, not taken as one.
   const f = await make({ threads: resolvedBy(["writer-1"]) });

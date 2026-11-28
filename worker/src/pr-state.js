@@ -1312,6 +1312,9 @@ export class PrState {
           const fresh = kept && now - kept.at < WRITER_MAX_MS;
           rec = fresh ? { checked: {}, ...kept } : { at: now, checked: {} };
           if (fresh && kept.logins) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
+          // Refused once in this decision: not asked again (each alarm would
+          // spend on it, and could leave no room for the checks).
+          else if (fresh && kept.refused) listed = false;
           // A withdrawal reads it once: one held for it and woken too late to
           // use it (alarms hours apart) checks within the alarm instead, and
           // counts the unchecked as outsiders, so it always ends.
@@ -1320,12 +1323,19 @@ export class PrState {
             try {
               listed = await fx.writers(key.repo);
             } catch (e) {
-              // Refused (the App lacks the permission): each one on their own.
+              // Refused (the App lacks the permission): each one on their own,
+              // and recorded so this decision does not ask again. A 403 may
+              // also be GitHub's rate limit: that too is safe, as each one is
+              // then checked on their own (and canWrite rethrows it).
               if (e?.status !== 403 && e?.status !== 404) throw e;
               listed = false;
+              rec = { ...rec, refused: true };
+              await save();
             }
+            // A list read now starts the record afresh: its two hours run
+            // from now, so no earlier answer is carried past its own.
             if (listed) {
-              rec = { at: now, checked: rec.checked, logins: [...listed.logins], complete: Boolean(listed.complete) };
+              rec = { at: now, checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
               await save();
             }
           } else listed = false;
