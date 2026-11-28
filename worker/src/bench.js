@@ -155,7 +155,13 @@ export async function handleBench(request, env, deps = {}) {
     return json(200, out);
   }
   const verified = await verifyFindings({ classified: grounded.classified, prepared, title: input.title, body: input.body, drafter: used, env: benchEnv, cfg, deps: d, started });
-  if (verified.outcome.kind !== "ok") return json(200, { ...out, verified: { stopped: verified.outcome.kind, reason: verified.outcome.reason ?? "", calls: verified.calls, partial: true }, usage: { ...out.usage, verification: { usd: verified.usd, neurons: verified.neurons, partial: true } }, shown: [] });
+  if (verified.outcome.kind !== "ok") {
+    // Verification stopped: nothing is shown, but each grounded finding is
+    // still listed, unconfirmed, with the stage and the reason it stopped at.
+    const reason = verified.outcome.reason ?? "";
+    const unconfirmed = [...grounded.classified.inline, ...grounded.classified.general].map((f) => gone("verification", f, reason || `verification stopped (${verified.outcome.kind})`, "unverified"));
+    return json(200, { ...out, verified: { stopped: verified.outcome.kind, reason, calls: verified.calls, partial: true }, usage: { ...out.usage, verification: { usd: verified.usd, neurons: verified.neurons, partial: true } }, shown: [], hidden: unconfirmed });
+  }
   const { shown, hidden } = applyVerdicts(grounded.classified, grounded.dropped, verified.verdicts);
   out.shown = [...shown.inline, ...shown.general].map(brief);
   // applyVerdicts also lists the grounding drops; those are reported above.

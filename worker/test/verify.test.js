@@ -457,3 +457,13 @@ test("the deadline counts from when the review started, and never passes REVIEW_
   assert.equal((await verifyFindings({ ...s2.args(), started: NOW - 20_000 })).outcome.kind, "unavailable");
   assert.equal(svc2.calls.length, 0);
 });
+
+test("no verifier call starts after the deadline, not even a fallback after a failed first try", async () => {
+  let t = NOW;
+  // The first provider fails and the clock passes the deadline meanwhile.
+  const svc = services({ anthropic: () => { t += 200_000; return { status: 500, body: {} }; }, gemini: all("confirmed"), ai: all("confirmed") });
+  const s = setup([major], { GEMINI_API_KEY: "k" }, svc, { now: () => t, sleep: () => new Promise(() => {}) });
+  const r = await s.run();
+  assert.equal(svc.calls.length, 1, "only the call made before the deadline");
+  assert.equal(r.outcome.kind, "unavailable");
+});

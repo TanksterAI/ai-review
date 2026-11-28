@@ -169,3 +169,19 @@ test("the bench route passes waitUntil through, and a drafter still running is r
   assert.equal(res.status, 503);
   assert.ok(kept.length >= 1);
 });
+
+test("when verification stops, the grounded findings are still listed as unconfirmed with the stage and reason", async () => {
+  const broken = async (url) => {
+    if (String(url).endsWith("/repos/TanksterAI/ai-review")) return github("admin")(url);
+    return { ok: false, status: 500, headers: { get: () => null }, async json() { return {}; } };
+  };
+  const e = env(ai(answer), { VERIFY: undefined, ANTHROPIC_API_KEY: "sk", VERIFY_CHAIN: "anthropic:claude-haiku-5-5", VERIFY_FALLBACK: "gemini:gemini-3.1-flash-lite" });
+  const res = await handleBench(req(body), e, { ...deps(), fetch: broken });
+  const out = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(out));
+  assert.notEqual(out.verified.stopped, undefined, JSON.stringify(out));
+  assert.deepEqual(out.shown, []);
+  assert.equal(out.hidden.length, 1);
+  assert.deepEqual([out.hidden[0].stage, out.hidden[0].path, out.hidden[0].line, out.hidden[0].status], ["verification", "src/a.js", 3, "unverified"]);
+  assert.ok(out.hidden[0].reason.length > 0);
+});
