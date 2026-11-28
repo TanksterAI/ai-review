@@ -60,13 +60,13 @@ const DECIDE_RESERVE = 8;
 // Room left, after the threads, for reading the App's reviews (up to ten
 // pages and a token): a permission check never eats into it.
 const REVIEW_READ = 11;
-// The reads before it: the threads (up to twenty pages) and that, again.
-const SNAPSHOT_READ = 20 + REVIEW_READ;
-// A permission answer is kept this long, so a decision held for want of
-// requests goes on from where it stopped rather than checking again.
-const WRITER_TTL_MS = 5 * 60_000;
-// The answers a decision gathers last until it ends (it may take many alarms
-// when a great many people resolved threads), but never past this.
+// One permission check: a token (if none is cached) and the lookup.
+const CHECK_COST = 2;
+// A whole snapshot: the threads (a token and up to twenty pages), then that.
+const SNAPSHOT_READ = 21 + REVIEW_READ;
+// A decision held for want of requests keeps the permission answers it
+// gathered, so it goes on from where it stopped; they belong to it alone (no
+// other decision trusts them) and go when it ends, but never last past this.
 const WRITER_MAX_MS = 2 * 3600_000;
 
 // After n failures in a row outside the run's own step: up to an hour.
@@ -630,7 +630,7 @@ export class PrState {
     // Failures here (before the run's own step, which counts its own) back
     // off, and six in a row give the run up: it must never wake for ever.
     // A decision or a resolve/approve command due now gets this invocation to
-    // itself: it may make two dozen GitHub calls, and a review step's would
+    // itself: it may make up to 45 GitHub calls, and a review step's would
     // share Workers Free's 50 subrequests. The review moves on at the next.
     const due = ((await this.ctx.storage.get("outbox")) ?? []).find((x) => !(x.notBefore > this.now()));
     const isHeavy = (x) => Boolean(x) && (x.type === "decide" || (x.type === "command" && (x.cmd === "resolve" || x.cmd === "approve")));
@@ -1246,11 +1246,15 @@ export class PrState {
   // resolved by someone without write access still counts as open. A thread
   // reopened after an approval asks for changes again, whatever was reviewed.
   // A decision held for want of requests keeps its permission answers until
-  // it ends: its epoch marks the answers it gathered.
+  // it ends, however it ends (a throw included): its epoch names it.
   async decide(fx, item, slug) {
-    const out = await this.decideStep(fx, item, slug);
-    if (!out?.holdUntil) await this.ctx.storage.delete("writersEpoch");
-    return out;
+    let out;
+    try {
+      out = await this.decideStep(fx, item, slug);
+      return out;
+    } finally {
+      if (!out?.holdUntil) await this.ctx.storage.delete(["writersEpoch", "writersSeen"]);
+    }
   }
 
   async decideStep(fx, item, slug) {
@@ -1288,16 +1292,22 @@ export class PrState {
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
       const now = this.now();
-      let epoch = await this.ctx.storage.get("writersEpoch");
-      if (!(now - epoch < WRITER_MAX_MS)) { epoch = now; await this.ctx.storage.put("writersEpoch", epoch); }
-      // An epoch is at most two hours old (it starts again past that), so
-      // neither are the answers it keeps.
-      const fresh = (v) => now - v.at < WRITER_TTL_MS || v.at >= epoch;
-      const seen = Object.fromEntries(Object.entries((await this.ctx.storage.get("writersSeen")) ?? {}).filter(([, v]) => fresh(v)));
+      // This decision's own answers, if it was held: another decision's, or
+      // ones more than two hours old, are never trusted.
+      const epoch = await this.ctx.storage.get("writersEpoch");
+      const ours = epoch?.id === item.id && now - epoch.at < WRITER_MAX_MS;
+      if (!ours) await this.ctx.storage.put("writersEpoch", { id: item.id, at: now });
+      const seen = ours ? ((await this.ctx.storage.get("writersSeen")) ?? {}) : {};
       const isWriter = async (login) => {
         if (seen[login]) return seen[login].w;
-        // No room for this check and the reviews after it: stop here.
-        if (room() < REVIEW_READ + 1) { short = true; return false; }
+        // No room for this check and the reviews after it. A withdrawal counts
+        // the resolver as an outsider (its safe side: the approval goes, and
+        // comes back once everyone can be checked); an approval stops here and
+        // is held (never approved on an unchecked answer).
+        if (room() < REVIEW_READ + CHECK_COST) {
+          if (!item.reopened) short = true;
+          return false;
+        }
         const w = Boolean(await fx.canWrite(key.repo, login));
         seen[login] = { w, at: now };
         await this.ctx.storage.put("writersSeen", seen);
