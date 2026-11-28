@@ -317,3 +317,80 @@ test("ownThreads never returns a partial list: past its page limit it fails", as
   await assert.rejects(createEffects({}, { app }).ownThreads("TanksterAI/x", 3, "tankster-ai-review"), /too many review threads/);
   assert.equal(app.log.calls.length, 20);
 });
+
+test("conversation: comments, reviews and every thread's replies, as who wrote them; bounded pages", async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: `u${i}`, type: "User" }, author_association: "NONE", body: `c${i}`, created_at: "t" }));
+  const app = fakeApp((m, path) => {
+    if (path === "/graphql") {
+      return { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+        id: "T1", isResolved: false, isOutdated: true, path: "a.js", line: null, originalLine: 7, resolvedBy: null,
+        head: { nodes: [{ id: "c1", author: { login: "coderabbitai", __typename: "Bot" }, authorAssociation: "NONE", body: "finding", createdAt: "t1" }] },
+        tail: { nodes: [
+          { id: "c1", author: { login: "coderabbitai", __typename: "Bot" }, authorAssociation: "NONE", body: "finding", createdAt: "t1" },
+          { id: "c2", author: { login: "rishitank", __typename: "User" }, authorAssociation: "OWNER", body: "fixed", createdAt: "t2" },
+          { id: "c3", author: null, authorAssociation: null, body: null, createdAt: null },
+        ] },
+      }] } } } } };
+    }
+    if (path.includes("/issues/3/comments")) return path.endsWith("page=1") ? page1 : [{ id: 200, user: { login: "last", type: "Bot" }, author_association: "NONE", body: "x", created_at: "t" }];
+    if (path.includes("/pulls/3/reviews")) return [{ id: 5, user: { login: "coderabbitai[bot]", type: "Bot" }, author_association: "NONE", state: "CHANGES_REQUESTED", body: "b", submitted_at: "t" }];
+    return err(404);
+  });
+  const conv = await createEffects({}, { app }).conversation("TanksterAI/x", 3);
+  assert.deepEqual(app.log.tokens[0], { repos: ["x"], permissions: { contents: "read", pull_requests: "read" } });
+  assert.equal(conv.comments.length, 101, "a second page is read when the first is full");
+  assert.deepEqual(conv.comments.at(-1), { id: 200, login: "last", type: "Bot", association: "NONE", body: "x", at: "t" });
+  assert.deepEqual(conv.reviews[0], { id: 5, login: "coderabbitai[bot]", type: "Bot", association: "NONE", state: "CHANGES_REQUESTED", body: "b", at: "t" });
+  const t = conv.threads[0];
+  assert.deepEqual([t.id, t.resolved, t.outdated, t.path, t.line, t.originalLine], ["T1", false, true, "a.js", null, 7]);
+  assert.deepEqual(t.comments.map((c) => [c.login, c.type, c.association, c.body]), [["coderabbitai", "Bot", "NONE", "finding"], ["rishitank", "User", "OWNER", "fixed"], ["", "User", null, ""]]);
+  assert.equal(conv.moreThreads, false);
+  assert.match(app.log.calls.find((c) => c.path === "/graphql").body.query, /__typename/);
+});
+
+test("conversation: threads past four pages are said to be more, not silently cut", async () => {
+  const page = { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true, endCursor: "c" }, nodes: [] } } } } };
+  const app = fakeApp((m, path) => (path === "/graphql" ? page : []));
+  const conv = await createEffects({}, { app }).conversation("TanksterAI/x", 3);
+  assert.equal(conv.moreThreads, true);
+  assert.equal(app.log.calls.filter((c) => c.path === "/graphql").length, 4);
+});
+
+test("ciState: checks, statuses and workflow runs of one commit; a part it cannot read is named, not fatal", async () => {
+  const sha = "a".repeat(40);
+  const app = fakeApp((m, path) => {
+    if (path.includes("/check-runs")) return { check_runs: [{ name: "test", status: "completed", conclusion: "failure", output: { title: "T", summary: "s".repeat(900) } }] };
+    if (path.includes("/status")) return err(403);
+    if (path.includes("/actions/runs")) return { workflow_runs: [{ name: "CI", status: "completed", conclusion: "success", event: "pull_request" }] };
+    return {};
+  });
+  const ci = await createEffects({}, { app }).ciState("TanksterAI/x", sha);
+  assert.deepEqual(ci.checks, [{ name: "test", status: "completed", conclusion: "failure", title: "T", summary: "s".repeat(400) }]);
+  assert.deepEqual(ci.statuses, []);
+  assert.deepEqual(ci.runs, [{ name: "CI", status: "completed", conclusion: "success", event: "pull_request" }]);
+  assert.deepEqual(ci.missing, ["statuses"]);
+  assert.ok(app.log.calls.some((c) => c.path === `/repos/TanksterAI/x/actions/runs?head_sha=${sha}&per_page=30`));
+  await assert.rejects(createEffects({}, { app }).ciState("TanksterAI/x", "main"), /commit id/);
+  await assert.rejects(createEffects({}, { app }).ciState("Other/x", sha), /TanksterAI/);
+});
+
+test("conversation: a thread page that fails keeps what was read and says it is partial", async () => {
+  const app = fakeApp((m, path) => (path === "/graphql" ? err(502) : path.includes("/issues/3/comments") ? [{ id: 1, user: { login: "a", type: "User" }, author_association: "NONE", body: "x", created_at: "t" }] : []));
+  const conv = await createEffects({}, { app }).conversation("TanksterAI/x", 3);
+  assert.equal(conv.comments.length, 1);
+  assert.equal(conv.moreThreads, true);
+});
+
+test("conversation: three full pages of comments are said to be more", async () => {
+  const full = Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: "u", type: "User" }, author_association: "NONE", body: "x", created_at: "t" }));
+  const app = fakeApp((m, path) => (path === "/graphql" ? { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } } } : path.includes("/issues/3/comments") ? full : []));
+  const conv = await createEffects({}, { app }).conversation("TanksterAI/x", 3);
+  assert.equal(conv.comments.length, 300);
+  assert.equal(conv.moreTalk, true);
+});
+
+test("ciState: the checks are read with a token of their own", async () => {
+  const app = fakeApp(() => ({}));
+  await createEffects({}, { app }).ciState("TanksterAI/x", "b".repeat(40));
+  assert.deepEqual(app.log.tokens[0].permissions, { contents: "read", checks: "read", statuses: "read", actions: "read" });
+});
