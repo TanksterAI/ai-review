@@ -730,6 +730,80 @@ test("a writer's approve vouches for every thread: no permission checks, so even
   assert.deepEqual(lim.checked, ["rishitank"], "only the command's own author is checked");
 });
 
+test("past an incomplete list, an approval's per-person answers are kept for the decision, so it moves on and ends", async () => {
+  // The independent review's case: more than 1,000 collaborators and forty
+  // unlisted writers, one page of threads. Each alarm checks those it has
+  // room for and keeps the answers; the next goes on from there; nobody is
+  // checked twice, and it is approved in the end, never over 50 requests.
+  const people = writersOf(1001);
+  const unlisted = writersOf(40, "late");
+  const m = await make({ threads: resolvedBy(unlisted) });
+  const lim = limited(m, { writers: () => true, people });
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 20);
+  assert.equal(approvals(m.calls).length, 1, "approved in the end");
+  assert.equal(new Set(lim.checked).size, lim.checked.length, "nobody checked twice");
+  assert.equal(lim.checked.length, 40);
+  assert.equal((await m.storage.list({ prefix: "writersList:" })).size, 0, "the record goes with the decision");
+  // Twenty pages of threads and two unlisted writers: the same.
+  const t = await make({ threads: resolvedBy(writersOf(2, "late")) });
+  const lt = limited(t, { writers: () => true, people, threadPages: 20 });
+  await t.obj.outbox({ type: "decide" });
+  await run(t, lt, 10);
+  assert.equal(approvals(t.calls).length, 1);
+  assert.deepEqual(lt.checked.sort(), ["late-1", "late-2"]);
+});
+
+test("an incomplete list kept across a hold stays incomplete: those it does not name are still checked after resuming", async () => {
+  const people = writersOf(1001);
+  const threads = resolvedBy([...writersOf(999), "late-1"]);
+  const m = await make({ threads });
+  const lim = limited(m, { writers: () => true, people, threadPages: 20 });
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 5);
+  assert.equal(lim.listed.calls, 1, "kept across the hold");
+  assert.deepEqual(lim.checked, ["late-1"], "checked after resuming, not taken for an outsider");
+  assert.equal(approvals(m.calls).length, 1);
+});
+
+test("a login named like an object's own member is checked, never taken from the prototype", async () => {
+  for (const login of ["constructor", "toString", "hasOwnProperty"]) {
+    const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: login }] });
+    const lim = limited(m, { writers: () => false, people: writersOf(1001) });
+    await m.obj.outbox({ type: "decide" });
+    await run(m, lim, 3);
+    assert.deepEqual(lim.checked, [login]);
+    assert.equal(approvals(m.calls).length, 0, `${login} is not a writer`);
+  }
+});
+
+test("one unlisted resolver on two threads is checked once", async () => {
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "late-1" }, { ...thread("t2", true), resolvedBy: "late-1" }] });
+  const lim = limited(m, { writers: () => true, people: writersOf(1001) });
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 3);
+  assert.deepEqual(lim.checked, ["late-1"]);
+  assert.equal(approvals(m.calls).length, 1);
+});
+
+test("if GitHub refuses the collaborators list, each resolver is checked on their own", async () => {
+  const m = await make({ threads: resolvedBy(["writer-1"]) });
+  const lim = limited(m, { writers: () => true });
+  m.fx.writers = async () => { const e = new Error("GitHub GET /collaborators failed: 403"); e.status = 403; throw e; };
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 3);
+  assert.deepEqual(lim.checked, ["writer-1"]);
+  assert.equal(approvals(m.calls).length, 1);
+
+  // A failure that is not a refusal (a 502) is tried again, not taken as one.
+  const f = await make({ threads: resolvedBy(["writer-1"]) });
+  const lf = limited(f, { writers: () => true });
+  f.fx.writers = async () => { const e = new Error("GitHub GET /collaborators failed: 502"); e.status = 502; throw e; };
+  await f.obj.outbox({ type: "decide" });
+  await assert.rejects(() => step(f, lf, NOW + 1000));
+  assert.equal(lf.checked.length, 0);
+});
+
 test("a list too long to read whole falls back to per-person checks only for those it did not name", async () => {
   const people = writersOf(1001);
   const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "writer-5" }, { ...thread("t2", true), resolvedBy: "writer-1001" }] });

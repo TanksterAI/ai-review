@@ -1301,38 +1301,54 @@ export class PrState {
       // after reading it, the decision keeps it (for itself alone, two hours
       // at most) and is held: the next alarm goes on with it.
       let listed = null;
-      // Past a list too long to read whole, a resolver is checked on their
-      // own, within this alarm only.
-      const checkedNow = new Map();
+      // This decision's own record (held, it goes on from it): the list it
+      // read, if any, and the people it checked on their own past a list too
+      // long to read whole. Two hours at most; gone when the decision ends.
+      let rec = null;
+      const save = async () => this.ctx.storage.put(listKey(item.id), rec);
       const isWriter = async (login) => {
         if (listed === null) {
           const kept = await this.ctx.storage.get(listKey(item.id));
-          if (kept && now - kept.at < WRITER_MAX_MS) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
+          const fresh = kept && now - kept.at < WRITER_MAX_MS;
+          rec = fresh ? { checked: {}, ...kept } : { at: now, checked: {} };
+          if (fresh && kept.logins) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
           // A withdrawal reads it once: one held for it and woken too late to
           // use it (alarms hours apart) checks within the alarm instead, and
           // counts the unchecked as outsiders, so it always ends.
           else if (kept && item.reopened) listed = false;
           else if (typeof fx.writers === "function" && room() >= WRITERS_READ) {
-            listed = await fx.writers(key.repo);
-            await this.ctx.storage.put(listKey(item.id), { logins: [...listed.logins], complete: Boolean(listed.complete), at: now });
+            try {
+              listed = await fx.writers(key.repo);
+            } catch (e) {
+              // Refused (the App lacks the permission): each one on their own.
+              if (e?.status !== 403 && e?.status !== 404) throw e;
+              listed = false;
+            }
+            if (listed) {
+              rec = { at: now, checked: rec.checked, logins: [...listed.logins], complete: Boolean(listed.complete) };
+              await save();
+            }
           } else listed = false;
           if (listed && room() < REVIEW_READ) { short = true; return false; }
         }
         if (listed && listed.logins.has(String(login).toLowerCase())) return true;
         if (listed?.complete) return false;
-        if (checkedNow.has(login)) return checkedNow.get(login);
+        // Own answers only: a login such as "constructor" must never read an
+        // object's inherited member as an answer.
+        if (Object.hasOwn(rec.checked, login)) return rec.checked[login] === true;
         // No room for this check and the reviews after it. A withdrawal counts
         // the resolver as an outsider (its safe side) and asks for an ordinary
         // decision after it, which checks again; an approval stops here and is
-        // held (never approved on an unchecked answer).
+        // held (never approved on an unchecked answer), and goes on next alarm
+        // from the answers it kept.
         if (room() < REVIEW_READ + CHECK_COST) {
           if (item.reopened) guessed = true;
           else short = true;
           return false;
         }
-        const w = Boolean(await fx.canWrite(key.repo, login));
-        checkedNow.set(login, w);
-        return w;
+        rec.checked[login] = Boolean(await fx.canWrite(key.repo, login));
+        await save();
+        return rec.checked[login];
       };
       // A thread resolved by someone without write access counts as open,
       // unless a review since found it fixed, or a writer's resolve/approve
