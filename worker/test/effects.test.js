@@ -57,6 +57,23 @@ test("only TanksterAI repositories are ever touched", async () => {
   }
 });
 
+test("writers: everyone with write access, from the collaborators list in pages of 100, marked incomplete past ten", async () => {
+  const people = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ login: `User-${from + i}`, permissions: { pull: true, push: (from + i) % 2 === 0 } }));
+  const one = fakeApp((m, path) => (path.includes("page=1") ? [...people(3), { login: "Boss", role_name: "admin", permissions: { admin: true } }, { login: "Lead", role_name: "maintain", permissions: { maintain: true } }] : []));
+  const w = await createEffects({}, { app: one }).writers("TanksterAI/x");
+  assert.equal(w.complete, true);
+  // Logins compared without case (GitHub's are case-insensitive).
+  assert.deepEqual([...w.logins].sort(), ["boss", "lead", "user-0", "user-2"]);
+  const call = one.log.calls[0];
+  assert.equal(call.method, "GET");
+  assert.match(call.path, /^\/repos\/TanksterAI\/x\/collaborators\?affiliation=all&per_page=100&page=1$/);
+  // Ten full pages: there may be more, so it is incomplete.
+  const many = fakeApp((m, path) => people(100, (Number(path.split("page=")[1]) - 1) * 100));
+  const big = await createEffects({}, { app: many }).writers("TanksterAI/x");
+  assert.equal(big.complete, false);
+  assert.equal(many.log.calls.length, 10);
+});
+
 test("canWrite: write, maintain and admin; not read, not unknown users, not odd logins", async () => {
   const levels = { a: "write", b: "maintain", c: "admin", d: "read", e: "triage" };
   const app = fakeApp((m, path) => {

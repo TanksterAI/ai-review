@@ -98,6 +98,25 @@ export function createEffects(env, deps = {}) {
       }
     },
 
+    // Everyone with write access to the repository (organization owners and
+    // members through teams included), from the collaborators list: 100 a
+    // page, ten pages at most. complete is false when ten full pages were
+    // read (there may be more). Logins in lower case (GitHub's ignore case).
+    async writers(repoFull) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], PR_SCOPE);
+      const logins = new Set();
+      for (let page = 1; page <= 10; page++) {
+        const list = await app.call("GET", `/repos/${ORG}/${name}/collaborators?affiliation=all&per_page=100&page=${page}`, { token });
+        for (const c of list ?? []) {
+          const p = c?.permissions ?? {};
+          if (typeof c?.login === "string" && (p.push === true || p.maintain === true || p.admin === true || WRITE_LEVELS.has(c.role_name))) logins.add(c.login.toLowerCase());
+        }
+        if (!list || list.length < 100) return { logins, complete: true };
+      }
+      return { logins, complete: false };
+    },
+
     async canWrite(repoFull, login) {
       if (!/^[A-Za-z0-9-]{1,39}$/.test(String(login))) return false;
       const name = nameOf(repoFull);

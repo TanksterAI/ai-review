@@ -425,7 +425,7 @@ test("a withdrawal counts the alarm's requests: it dismisses only what fits and 
 });
 
 // A fake that enforces Workers Free's 50 requests an alarm on every call.
-function limited(m, { writers = () => false, threadPages = 1, reviewPages = 10 } = {}) {
+function limited(m, { writers = () => false, threadPages = 1, reviewPages = 10, people = null } = {}) {
   let used = 0;
   const peak = { v: 0, beforeReviews: 0 };
   const spend = () => { used++; peak.v = Math.max(peak.v, used); if (used > 50) throw new Error("Too many subrequests"); };
@@ -440,7 +440,18 @@ function limited(m, { writers = () => false, threadPages = 1, reviewPages = 10 }
   m.fx.postReview = async (...a) => { spend(); spend(); return postReview(...a); };
   m.fx.canWrite = async (_r, login) => { spend(); spend(); checked.push(login); return writers(login); };
   m.fx.dismissReview = async () => { spend(); spend(); return true; };
-  return { checked, peak, reset: () => { used = 0; } };
+  // The collaborators list, as GitHub pages it (100 a page, ten at most).
+  const listed = { calls: 0 };
+  if (people) {
+    m.fx.writers = async () => {
+      listed.calls++;
+      spend();
+      const pages = Math.min(10, Math.max(1, Math.ceil(people.length / 100)));
+      for (let i = 0; i < pages; i++) spend();
+      return { logins: new Set(people.slice(0, 1000).filter(writers).map((l) => l.toLowerCase())), complete: people.length <= 1000 };
+    };
+  }
+  return { checked, peak, listed, reset: () => { used = 0; } };
 }
 
 async function run(m, lim, limit = 40, step = 2000) {
@@ -455,57 +466,216 @@ async function run(m, lim, limit = 40, step = 2000) {
   return t;
 }
 
-test("the snapshot's reads are budgeted too: 49 resolvers are checked over alarms, never over 50 requests in one", async () => {
-  // Reopened, with an approval standing: 49 threads resolved by 49 different
-  // people without write access, and one reopened. The permission checks are
-  // spread over alarms (each person checked once), then the approval is
-  // withdrawn, and no alarm sends more than 50 requests.
-  const threads = [thread("t0", false), ...Array.from({ length: 49 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `outsider-${i + 1}` }))];
-  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
-  const lim = limited(m);
+const writersOf = (n, prefix = "writer") => Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`);
+const resolvedBy = (logins) => logins.map((l, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: l }));
+const step = async (m, lim, t) => { lim.reset(); m.setNow(t); m.obj.ctx.storage.alarm = null; await m.obj.alarm(); };
+
+test("with the collaborators list, 1,000 writers' resolves need no per-person checks and never pass 50 requests", async () => {
+  // CodeRabbit's case: twenty pages of threads, 1,000 writers, alarms 40
+  // seconds apart. The worst case (twenty pages of threads, ten of
+  // collaborators) needs a second alarm, which uses the list the first kept.
+  const logins = writersOf(1000);
+  const m = await make({ threads: resolvedBy(logins) });
+  const lim = limited(m, { writers: () => true, threadPages: 20, people: logins });
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 2, 40_000);
+  assert.equal(approvals(m.calls).length, 1, "approved by the second alarm");
+  assert.equal(lim.checked.length, 0, "no per-person checks");
+  assert.equal(lim.listed.calls, 1, "the list read once, kept for the decision");
+  assert.ok(lim.peak.v <= 45, `a decision spends at most 45 of an alarm's 50: ${lim.peak.v}`);
+  // Never into the room kept for the reviews (11) or the reserve (8).
+  assert.ok(lim.peak.beforeReviews <= 26, `room kept for the reviews: ${lim.peak.beforeReviews}`);
+  assert.equal((await m.storage.list({ prefix: "writersList:" })).size, 0, "cleared when it ended");
+});
+
+test("every decision reads the list afresh: someone no longer listed (access revoked) is an outsider at once", async () => {
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "Writer-1" }] });
+  let people = ["writer-1"];
+  const lim = limited(m, { writers: () => true, people });
+  await m.obj.outbox({ type: "decide" });
+  await run(m, lim, 3);
+  assert.equal(approvals(m.calls).length, 1, "a writer (logins compared without case)");
+  // Revoked a minute later: the next decision reads the list again.
+  people.length = 0;
+  m.w.decision = { state: "APPROVED", commitId: "b".repeat(40), id: 1, approvedIds: [1] };
+  m.setNow(NOW + 60_000);
+  await m.obj.outbox({ type: "decide", force: true, login: "rishitank" });
+  await run(m, lim, 3);
+  assert.equal(lim.listed.calls, 2);
+  assert.equal(approvals(m.calls).length, 1, "not approved again");
+  assert.equal(lim.checked.filter((l) => l !== "rishitank").length, 0, "no per-person check needed");
+});
+
+test("a kept list belongs to its own decision, lasts two hours at most, outlives a throw, and goes when the decision is given up", async () => {
+  const logins = writersOf(1000);
+  // Another decision's list is never used.
+  const a = await make({ threads: resolvedBy(["someone"]) });
+  const la = limited(a, { writers: () => false, people: ["someone-else"] });
+  await a.storage.put("writersList:another", { logins: ["someone"], complete: true, at: NOW });
+  await a.obj.outbox({ type: "decide" });
+  await run(a, la, 3);
+  assert.equal(approvals(a.calls).length, 0, "someone is not in its own list");
+  assert.ok(await a.storage.get("writersList:another"), "and it leaves the other decision's list alone");
+
+  // Its own list, older than two hours: read again.
+  const b = await make({ threads: resolvedBy(["someone"]) });
+  const lb = limited(b, { writers: () => true, people: ["someone"] });
+  b.setNow(NOW + 3 * 3600_000);
+  await b.obj.outbox({ type: "decide" });
+  const [{ id }] = (await b.storage.get("outbox")).filter((x) => x.type === "decide");
+  await b.storage.put(`writersList:${id}`, { logins: [], complete: true, at: NOW });
+  for (let i = 1; i <= 3; i++) await step(b, lb, NOW + 3 * 3600_000 + i * 2000);
+  assert.equal(lb.listed.calls, 1, "read again");
+  assert.equal(approvals(b.calls).length, 1);
+
+  // Held with its list kept, then a throw: the retry (same item) keeps it.
+  const c = await make({ threads: resolvedBy(logins) });
+  const lc = limited(c, { writers: () => true, threadPages: 20, people: logins });
+  await c.obj.outbox({ type: "decide" });
+  await step(c, lc, NOW + 1000);
+  const rd = c.fx.reviewDecision;
+  let fail = true;
+  c.fx.reviewDecision = async (...x) => { if (fail) { fail = false; throw new Error("GitHub 502"); } return rd(...x); };
+  await assert.rejects(() => step(c, lc, NOW + 3000));
+  await step(c, lc, NOW + 5000);
+  assert.equal(lc.listed.calls, 1, "the list survived the throw");
+  assert.equal(approvals(c.calls).length, 1);
+
+  // Given up on (five failed attempts): its list goes with it.
+  const d = await make({ threads: resolvedBy(logins) });
+  const ld = limited(d, { writers: () => true, threadPages: 20, people: logins });
+  await d.obj.outbox({ type: "decide" });
+  await step(d, ld, NOW + 1000);
+  d.fx.reviewDecision = async () => { throw new Error("GitHub 502"); };
+  for (let i = 0; i < 6; i++) await step(d, ld, NOW + 2000 * (i + 2)).catch(() => {});
+  assert.equal(((await d.storage.get("outbox")) ?? []).filter((x) => x.type === "decide").length, 0);
+  assert.equal((await d.storage.list({ prefix: "writersList:" })).size, 0);
+});
+
+test("two decisions held at once never share or wipe each other's list", async () => {
+  const logins = writersOf(1000);
+  const m = await make({ threads: resolvedBy(logins) });
+  const lim = limited(m, { writers: () => true, threadPages: 20, people: logins });
+  await m.obj.outbox({ type: "decide" });
+  await m.obj.outbox({ type: "decide", force: true, login: "rishitank" });
+  await run(m, lim, 8);
+  assert.equal(((await m.storage.get("outbox")) ?? []).filter((x) => x.type === "decide").length, 0, "both finished");
+  assert.ok(lim.listed.calls <= 2, `each read its own list once: ${lim.listed.calls}`);
+});
+
+test("a decision never uses a list another one kept: revoked meanwhile, the second reads its own", async () => {
+  // A is held with its list kept (twenty pages of threads, ten of people);
+  // someone then loses write access; B, queued after, reads its own list.
+  const logins = [...writersOf(999), "someone"];
+  const m = await make({ threads: resolvedBy(logins) });
+  const people = [...logins];
+  const lim = limited(m, { writers: () => true, threadPages: 20, people });
+  await m.obj.outbox({ type: "decide" });
+  await step(m, lim, NOW + 1000);
+  assert.equal(lim.listed.calls, 1);
+  people.pop();
+  await m.obj.outbox({ type: "decide", force: true, login: "rishitank" });
+  await step(m, lim, NOW + 1500);
+  assert.equal(lim.listed.calls, 2, "the second decision read its own list");
+});
+
+test("the list is read only when it fits: no room, no list (an approval is held)", async () => {
+  const m = await make({ threads: resolvedBy(["writer-1"]) });
+  const lim = limited(m, { writers: () => true, people: ["writer-1"] });
+  let extra = 0;
+  const count = m.fx.subrequests;
+  m.fx.subrequests = () => count() + extra;
+  const own = m.fx.ownThreads;
+  m.fx.ownThreads = async (...a) => { extra = 25; return own(...a); };
+  await m.obj.outbox({ type: "decide" });
+  await step(m, lim, NOW + 1000);
+  assert.equal(lim.listed.calls, 0);
+  assert.equal(approvals(m.calls).length, 0);
+  assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "held");
+});
+
+test("a withdrawal waits one alarm for the list rather than guess: no needless change request when writers resolved it", async () => {
+  // The reopened thread resolved again by a writer, and 30 more by writers:
+  // everyone is a writer, so nothing is withdrawn.
+  const logins = writersOf(31);
+  const m = await make({ threads: resolvedBy(logins), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lim = limited(m, { writers: () => true, threadPages: 20, people: logins });
+  let withdrawn = false;
+  m.fx.dismissReview = async () => { withdrawn = true; return true; };
+  const post = m.fx.postReview;
+  m.fx.postReview = async (...a) => { if (a[2]?.event === "REQUEST_CHANGES") withdrawn = true; return post(...a); };
   await m.obj.outbox({ type: "decide", reopened: true });
-  await run(m, lim);
-  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0, "the decision finished");
-  assert.equal(lim.checked.length, 0, "a thread known to be open needs no permission checks");
+  await run(m, lim, 4);
+  assert.equal(withdrawn, false);
+  assert.equal(lim.checked.length, 0);
 
-  // Not reopened, the 49 resolvers all writers: approved in the end, again
-  // never over 50 in one alarm.
-  const ok = await make({ threads: threads.slice(1) });
-  const lim2 = limited(ok, { writers: () => true });
-  await ok.obj.outbox({ type: "decide" });
-  await run(ok, lim2);
-  assert.equal(approvals(ok.calls).length, 1);
-  assert.equal(lim2.checked.length, 49, "each person checked once, the answers kept between alarms");
+  // CodeRabbit's sequence: 999 writers' resolves then the reopened thread
+  // resolved again by an outsider, twenty pages, alarms 40 seconds apart:
+  // withdrawn by the second alarm, no per-person checks.
+  const all = [...writersOf(999), "outsider"];
+  const w = await make({ threads: resolvedBy(all), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lw = limited(w, { writers: (l) => l !== "outsider", threadPages: 20, people: all });
+  let gone = false;
+  w.fx.dismissReview = async () => { gone = true; return true; };
+  const wpost = w.fx.postReview;
+  w.fx.postReview = async (...a) => { if (a[2]?.event === "REQUEST_CHANGES") gone = true; return wpost(...a); };
+  await w.obj.outbox({ type: "decide", reopened: true });
+  await run(w, lw, 2, 40_000);
+  assert.ok(gone, "withdrawn by the second alarm");
+  assert.equal(lw.checked.length, 0);
+});
 
-  // An outsider among them: the first one found leaves its thread open and
-  // ends the checks (the decision is the same whoever resolved the rest).
-  const mixed = await make({ threads: threads.slice(1) });
-  const lim3 = limited(mixed, { writers: (l) => l !== "outsider-1" });
-  await mixed.obj.outbox({ type: "decide" });
-  await run(mixed, lim3);
-  assert.equal(approvals(mixed.calls).length, 0);
-  assert.equal(lim3.checked.length, 1);
+test("past a list too long to read whole, a withdrawal with no room to check counts the resolver as an outsider, then decides again", async () => {
+  // 1,001 collaborators (the list stops at ten pages), and many resolvers it
+  // does not name: the checks that fit run, the rest count as outsiders (the
+  // safe side), and an ordinary decision is queued to check again.
+  const people = writersOf(1001);
+  const unlisted = writersOf(40, "late");
+  const m = await make({ threads: resolvedBy(unlisted), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lim = limited(m, { writers: () => true, people });
+  let withdrawn = false;
+  m.fx.dismissReview = async () => { withdrawn = true; return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  await step(m, lim, NOW + 1000);
+  assert.ok(withdrawn, "withdrawn on the unchecked resolvers");
+  assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide" && !x.reopened), "an ordinary decision checks again");
+  // An approval past the list never counts an unchecked resolver as a writer:
+  // out of room, it is held, and a writer's approve is the way out.
+  const a = await make({ threads: resolvedBy(unlisted) });
+  const la = limited(a, { writers: () => true, people });
+  await a.obj.outbox({ type: "decide" });
+  await step(a, la, NOW + 1000);
+  assert.equal(approvals(a.calls).length, 0);
+  assert.ok(((await a.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "held");
+});
+
+test("with a thread known to be open, nobody's permission is checked: 999 resolvers and twenty pages still withdraw at once", async () => {
+  const threads = [...resolvedBy(writersOf(999, "outsider")), thread("t0", false)];
+  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const dismissed = [];
+  const lim = limited(m, { threadPages: 20, people: [] });
+  m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return true; };
+  await m.obj.outbox({ type: "decide", reopened: true });
+  await run(m, lim, 5);
+  assert.equal(lim.checked.length, 0);
+  assert.equal(lim.listed.calls, 0, "not even the list");
+  assert.deepEqual(dismissed, [7]);
 });
 
 test("a snapshot cut short reads no reviews, and one taken again after a reopen must fit whole, or it is held", async () => {
-  // Cut short: the alarm that runs out of room for permission checks does
-  // not go on to read the reviews (it is held and starts again).
-  const threads = Array.from({ length: 49 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `outsider-${i + 1}` }));
-  const m = await make({ threads, decision: { state: "APPROVED", commitId: "b".repeat(40), id: 7, approvedIds: [7] } });
-  const lim = limited(m, { writers: () => true });
+  const logins = writersOf(1000);
+  const m = await make({ threads: resolvedBy(logins) });
+  const lim = limited(m, { writers: () => true, threadPages: 20, people: logins });
   let reads = 0;
   const rd = m.fx.reviewDecision;
   m.fx.reviewDecision = async (...a) => { reads++; return rd(...a); };
   await m.obj.outbox({ type: "decide" });
-  lim.reset();
-  m.setNow(NOW + 2000);
-  m.obj.ctx.storage.alarm = null;
-  await m.obj.alarm();
+  await step(m, lim, NOW + 2000);
   assert.equal(reads, 0, "no reviews read by a snapshot cut short");
   assert.ok(((await m.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "held");
 
-  // A reopen during the first snapshot, with too little left for a second
-  // whole one: held, not taken again in this alarm; decided at the next.
+  // A reopen during the first snapshot, with room for less than a whole
+  // second one (21 + 11) but more than its reviews: held, decided next.
   const r = await make({});
   const rl = limited(r, { reviewPages: 1 });
   let first = true;
@@ -517,146 +687,20 @@ test("a snapshot cut short reads no reviews, and one taken again after a reopen 
     if (first) {
       first = false;
       await r.storage.put("reopenSeq", ((await r.storage.get("reopenSeq")) ?? 0) + 1);
-      extra = 10; // the pages of a long thread list: room for less than a whole snapshot, more than its reviews
+      extra = 9;
     }
     return own(...a);
   };
   await r.obj.outbox({ type: "decide" });
-  rl.reset();
-  r.setNow(NOW + 2000);
-  r.obj.ctx.storage.alarm = null;
-  await r.obj.alarm();
+  await step(r, rl, NOW + 2000);
   assert.equal(approvals(r.calls).length, 0, "held in the alarm whose budget a second snapshot would not fit");
-  assert.ok(((await r.storage.get("outbox")) ?? []).some((x) => x.type === "decide"));
   extra = 0;
   await run(r, rl);
   assert.equal(approvals(r.calls).length, 1, "decided at the next alarm");
 });
 
-test("with a thread known to be open, nobody's permission is checked: 999 resolvers and twenty pages still withdraw at once", async () => {
-  const threads = [...Array.from({ length: 999 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `outsider-${i + 1}` })), thread("t0", false)];
-  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
-  const dismissed = [];
-  const lim = limited(m, { threadPages: 20 });
-  m.fx.dismissReview = async (_r, _p, id) => { dismissed.push(id); return true; };
-  await m.obj.outbox({ type: "decide", reopened: true });
-  await run(m, lim, 5);
-  assert.equal(lim.checked.length, 0, "no permission checks: the open thread decides it");
-  assert.deepEqual(dismissed, [7]);
-  assert.equal(((await m.storage.get("outbox")) ?? []).length, 0);
-});
-
-test("a decision's permission answers do not expire while it is still being taken, however many alarms it needs", async () => {
-  // 400 resolvers, all writers, twenty pages of threads: a few checks fit an
-  // alarm, so it takes longer than the five minutes an answer is kept. The
-  // answers this decision gathered last until it ends, so it ends approved,
-  // each person checked once.
-  const threads = Array.from({ length: 400 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `writer-${i + 1}` }));
-  const m = await make({ threads });
-  const lim = limited(m, { writers: () => true, threadPages: 20 });
-  await m.obj.outbox({ type: "decide" });
-  const end = await run(m, lim, 400, 5000);
-  assert.ok(end - NOW > 5 * 60_000, "longer than five minutes");
-  assert.equal(approvals(m.calls).length, 1);
-  assert.equal(lim.checked.length, 400, "nobody checked twice");
-  assert.ok(lim.peak.v <= 45, `a decision spends at most 45 of an alarm's 50: ${lim.peak.v}`);
-  // The checks never eat into the room kept for the reviews (11) or the
-  // reserve (8): at most 45 - 8 - 11 spent before the reviews are read.
-  assert.ok(lim.peak.beforeReviews <= 26, `room kept for the reviews: ${lim.peak.beforeReviews}`);
-  // Ended: its answers are kept only for the usual five minutes now.
-  assert.equal(await m.storage.get("writersEpoch"), undefined);
-  assert.equal(await m.storage.get("writersSeen"), undefined);
-});
-
-test("a decision's answers are kept two hours at most, even if it never ended", async () => {
-  // An epoch left over (an item given up on mid-decision) does not keep its
-  // answers past two hours: they are checked again, and the epoch starts anew.
-  const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
-  const m = await make({ threads });
-  const lim = limited(m, { writers: () => true });
-  m.setNow(NOW + 2 * 3600_000 + 60_000);
-  await m.obj.outbox({ type: "decide" });
-  const [{ id }] = (await m.storage.get("outbox")).filter((x) => x.type === "decide");
-  await m.storage.put("writersEpoch", { id, at: NOW });
-  await m.storage.put("writersSeen", { someone: { w: true, at: NOW } });
-  let t = NOW + 2 * 3600_000 + 60_000;
-  for (let i = 0; i < 5 && ((await m.storage.get("outbox")) ?? []).length; i++) { lim.reset(); t += 2000; m.setNow(t); m.obj.ctx.storage.alarm = null; await m.obj.alarm(); }
-  assert.deepEqual(lim.checked, ["someone"]);
-});
-
-test("a withdrawal never waits on permission checks it has no room for: an unchecked resolver counts as an outsider", async () => {
-  // CodeRabbit's sequence: twenty pages of threads, 999 resolved by writers,
-  // then the reopened one resolved again by an outsider, alarms 40 seconds
-  // apart. The checks that fit run; the rest count as outsiders (the safe
-  // side for a withdrawal), so the approval is withdrawn in the first alarm.
-  const threads = [...Array.from({ length: 999 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `writer-${i + 1}` })), { ...thread("t0", true), resolvedBy: "outsider" }];
-  const m = await make({ threads, decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
-  const lim = limited(m, { writers: (l) => l !== "outsider", threadPages: 20 });
-  let withdrawn = false;
-  m.fx.dismissReview = async () => { withdrawn = true; return true; };
-  const post = m.fx.postReview;
-  m.fx.postReview = async (...a) => { if (a[2]?.event === "REQUEST_CHANGES") withdrawn = true; return post(...a); };
-  await m.obj.outbox({ type: "decide", reopened: true });
-  lim.reset();
-  m.setNow(NOW + 40_000);
-  m.obj.ctx.storage.alarm = null;
-  await m.obj.alarm();
-  assert.ok(withdrawn, "withdrawn (or changes requested) in the first alarm");
-  assert.ok(lim.checked.length <= 6, `only the checks that fit: ${lim.checked.length}`);
-
-  // An approval, by contrast, never counts an unchecked resolver as a writer:
-  // out of room, it is held (approving late is safe, approving wrongly is not).
-  const a = await make({ threads: threads.slice(0, 999) });
-  const la = limited(a, { writers: () => true, threadPages: 20 });
-  await a.obj.outbox({ type: "decide" });
-  la.reset();
-  a.setNow(NOW + 40_000);
-  a.obj.ctx.storage.alarm = null;
-  await a.obj.alarm();
-  assert.equal(approvals(a.calls).length, 0);
-  assert.ok(((await a.storage.get("outbox")) ?? []).some((x) => x.type === "decide"), "held");
-});
-
-test("permission answers belong to one decision: the next decision checks again, at once", async () => {
-  // Someone who lost write access a minute ago is checked again by the next
-  // decision, never trusted on the last one's answer.
-  const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
-  const m = await make({ threads });
-  let writer = true;
-  const lim = limited(m, { writers: () => writer });
-  await m.obj.outbox({ type: "decide" });
-  await run(m, lim);
-  assert.equal(approvals(m.calls).length, 1);
-  writer = false;
-  m.w.decision = { state: "APPROVED", commitId: "b".repeat(40), id: 1, approvedIds: [1] };
-  m.setNow(NOW + 60_000);
-  await m.obj.outbox({ type: "decide", force: true, login: "rishitank" });
-  await run(m, lim);
-  assert.equal(lim.checked.length, 2, "checked again by the second decision");
-  assert.equal(approvals(m.calls).length, 1, "not approved again on the old answer");
-  assert.equal(await m.storage.get("writersSeen"), undefined);
-});
-
-test("answers left by another decision are never trusted", async () => {
-  // Left behind (its item gone while held): a new decision checks again.
-  const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
-  const m = await make({ threads });
-  const lim = limited(m, { writers: () => false });
-  await m.storage.put("writersEpoch", { id: "another-decision", at: NOW });
-  await m.storage.put("writersSeen", { someone: { w: true, at: NOW } });
-  await m.obj.outbox({ type: "decide" });
-  await run(m, lim);
-  assert.deepEqual(lim.checked, ["someone"]);
-  assert.equal(approvals(m.calls).length, 0, "the old answer (a writer) is not used");
-});
-
 test("a writer's approve vouches for every thread: no permission checks, so even 1,000 resolvers are approved at once", async () => {
-  // The way out where a decision is too big to check in time (CodeRabbit's
-  // case: 1,000 writers' resolves, twenty pages, alarms 40 seconds apart):
-  // approval is never given on an unchecked answer, so it waits, and a
-  // writer's approve vouches for the threads, which then need no checks.
-  const threads = Array.from({ length: 1000 }, (_, i) => ({ ...thread(`t${i + 1}`, true), resolvedBy: `writer-${i + 1}` }));
-  const m = await make({ threads });
+  const m = await make({ threads: resolvedBy(writersOf(1000)) });
   const lim = limited(m, { writers: () => true, threadPages: 20 });
   await m.obj.onEvent({ delivery: "d1", ev: { kind: "command", where: "conversation", repo, pr: 39, sender: { login: "rishitank", bot: false }, text: "@tankster-ai-review approve" } });
   await run(m, lim, 6, 40_000);
@@ -664,18 +708,14 @@ test("a writer's approve vouches for every thread: no permission checks, so even
   assert.deepEqual(lim.checked, ["rishitank"], "only the command's own author is checked");
 });
 
-test("a decision that throws leaves no permission answers behind", async () => {
-  const threads = [{ ...thread("t1", true), resolvedBy: "someone" }];
-  const m = await make({ threads });
-  const lim = limited(m, { writers: () => true });
-  m.fx.reviewDecision = async () => { throw new Error("GitHub 502"); };
+test("a list too long to read whole falls back to per-person checks only for those it did not name", async () => {
+  const people = writersOf(1001);
+  const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "writer-5" }, { ...thread("t2", true), resolvedBy: "writer-1001" }] });
+  const lim = limited(m, { writers: () => true, people });
   await m.obj.outbox({ type: "decide" });
-  lim.reset();
-  m.setNow(NOW + 2000);
-  m.obj.ctx.storage.alarm = null;
-  await assert.rejects(() => m.obj.alarm());
-  assert.equal(await m.storage.get("writersEpoch"), undefined);
-  assert.equal(await m.storage.get("writersSeen"), undefined);
+  await run(m, lim, 3);
+  assert.deepEqual(lim.checked, ["writer-1001"], "only the one past the list is checked");
+  assert.equal(approvals(m.calls).length, 1);
 });
 
 test("a reopen with a review list too long to read whole also requests changes, since an approval may be unlisted", async () => {

@@ -62,12 +62,14 @@ const DECIDE_RESERVE = 8;
 const REVIEW_READ = 11;
 // One permission check: a token (if none is cached) and the lookup.
 const CHECK_COST = 2;
+// The collaborators list: a token and up to ten pages of 100.
+const WRITERS_READ = 11;
 // A whole snapshot: the threads (a token and up to twenty pages), then that.
 const SNAPSHOT_READ = 21 + REVIEW_READ;
-// A decision held for want of requests keeps the permission answers it
-// gathered, so it goes on from where it stopped; they belong to it alone (no
-// other decision trusts them) and go when it ends, but never last past this.
+// A held decision keeps the collaborators list it read, for itself alone
+// (keyed by its item), and never past this.
 const WRITER_MAX_MS = 2 * 3600_000;
+const listKey = (id) => `writersList:${id}`;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -686,6 +688,8 @@ export class PrState {
       } else if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
         await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
+        // A decision given up on: the list it kept goes with it.
+        if (item.type === "decide") await this.ctx.storage.delete(listKey(item.id));
         // A gate reset given up on says so on the PR: its commit may still show
         // the delayed success.
         if (item.type === "status" && item.gate) await this.outbox({ type: "comment", template: "gave_up", reason: `the status of commit ${String(item.sha).slice(0, 7)} could not be reset to pending, so treat it as not reviewed`, tries: item.attempts, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
@@ -1245,16 +1249,13 @@ export class PrState {
   // own approval current. A thread
   // resolved by someone without write access still counts as open. A thread
   // reopened after an approval asks for changes again, whatever was reviewed.
-  // A decision held for want of requests keeps its permission answers until
-  // it ends, however it ends (a throw included): its epoch names it.
+  // A decision held for want of requests keeps the collaborators list it
+  // read until it ends: a throw is not an end (the same item is tried again),
+  // and an item given up on drops it too (alarm).
   async decide(fx, item, slug) {
-    let out;
-    try {
-      out = await this.decideStep(fx, item, slug);
-      return out;
-    } finally {
-      if (!out?.holdUntil) await this.ctx.storage.delete(["writersEpoch", "writersSeen"]);
-    }
+    const out = await this.decideStep(fx, item, slug);
+    if (!out?.holdUntil) await this.ctx.storage.delete(listKey(item.id));
+    return out;
   }
 
   async decideStep(fx, item, slug) {
@@ -1286,31 +1287,47 @@ export class PrState {
     // Out of requests before the snapshot was whole: held, and taken again at
     // the next alarm with the permission answers kept so far.
     let short = false;
+    // A withdrawal decided on a resolver it had no room to check.
+    let guessed = false;
     for (let tries = 0; tries < 3 && !settled && !short; tries++) {
       // Taken again only if a whole one still fits this alarm.
       if (tries > 0 && room() < SNAPSHOT_READ) { short = true; break; }
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
       const now = this.now();
-      // This decision's own answers, if it was held: another decision's, or
-      // ones more than two hours old, are never trusted.
-      const epoch = await this.ctx.storage.get("writersEpoch");
-      const ours = epoch?.id === item.id && now - epoch.at < WRITER_MAX_MS;
-      if (!ours) await this.ctx.storage.put("writersEpoch", { id: item.id, at: now });
-      const seen = ours ? ((await this.ctx.storage.get("writersSeen")) ?? {}) : {};
+      // Everyone with write access, read afresh by each decision (one page
+      // for up to 100 collaborators): a resolver it names is a writer, and
+      // one a whole list does not name is not. When the reviews no longer fit
+      // after reading it, the decision keeps it (for itself alone, two hours
+      // at most) and is held: the next alarm goes on with it.
+      let listed = null;
+      // Past a list too long to read whole, a resolver is checked on their
+      // own, within this alarm only.
+      const checkedNow = new Map();
       const isWriter = async (login) => {
-        if (seen[login]) return seen[login].w;
+        if (listed === null) {
+          const kept = await this.ctx.storage.get(listKey(item.id));
+          if (kept && now - kept.at < WRITER_MAX_MS) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
+          else if (typeof fx.writers === "function" && room() >= WRITERS_READ) {
+            listed = await fx.writers(key.repo);
+            await this.ctx.storage.put(listKey(item.id), { logins: [...listed.logins], complete: Boolean(listed.complete), at: now });
+          } else listed = false;
+          if (listed && room() < REVIEW_READ) { short = true; return false; }
+        }
+        if (listed && listed.logins.has(String(login).toLowerCase())) return true;
+        if (listed?.complete) return false;
+        if (checkedNow.has(login)) return checkedNow.get(login);
         // No room for this check and the reviews after it. A withdrawal counts
-        // the resolver as an outsider (its safe side: the approval goes, and
-        // comes back once everyone can be checked); an approval stops here and
-        // is held (never approved on an unchecked answer).
+        // the resolver as an outsider (its safe side) and asks for an ordinary
+        // decision after it, which checks again; an approval stops here and is
+        // held (never approved on an unchecked answer).
         if (room() < REVIEW_READ + CHECK_COST) {
-          if (!item.reopened) short = true;
+          if (item.reopened) guessed = true;
+          else short = true;
           return false;
         }
         const w = Boolean(await fx.canWrite(key.repo, login));
-        seen[login] = { w, at: now };
-        await this.ctx.storage.put("writersSeen", seen);
+        checkedNow.set(login, w);
         return w;
       };
       // A thread resolved by someone without write access counts as open,
@@ -1412,6 +1429,9 @@ export class PrState {
       }
       // The summary's notice must not still say approved: it lists what is open.
       if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+      // Withdrawn on an unchecked resolver: an ordinary decision checks again
+      // and approves if everyone was a writer after all.
+      if (guessed) await this.queueDecide({});
       return undefined;
     }
     if (open.length || inBody.length) {
