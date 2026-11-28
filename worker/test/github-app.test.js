@@ -59,6 +59,16 @@ test("anything that is not a private key is refused", () => {
   assert.throws(() => createGithubApp({ appId: 1 }), GithubAppError);
 });
 
+test("the App counts every request it sends to GitHub (Workers Free allows 50 an invocation)", async () => {
+  const gh = fakeGithub();
+  const app = createGithubApp({ appId: 1, privateKeyPem: privateKey, fetcher: gh.fetcher, now: () => NOW });
+  assert.equal(app.subrequests(), 0);
+  await app.installationToken(["browser-relay"], { contents: "read" });
+  await app.installationToken(["browser-relay"], { contents: "read" }); // cached: no request
+  assert.equal(app.subrequests(), gh.calls.length);
+  assert.ok(gh.calls.length >= 2, "the installation lookup and the token");
+});
+
 test("a fresh token is minted every time and never cached or served from the cache", async () => {
   // Two runs on one repository: the first revokes its token when it ends, so
   // the second must never be handed the same one.

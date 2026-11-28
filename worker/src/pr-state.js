@@ -53,6 +53,27 @@ const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "hel
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
 const RESOLVE_PER_STEP = 20;
+// Approvals one alarm dismisses at most, for the same reason: the rest are
+// dismissed by the next alarms, each a hold rather than a failed attempt.
+const DISMISS_PER_STEP = 20;
+// What one decision may spend of an alarm's 50 subrequests, and the part of
+// it kept for what may follow the dismissals (a change request with its
+// fallbacks, the summary's notice). Its reads come out of the same budget.
+const DECIDE_SUBREQUESTS = 45;
+const DECIDE_RESERVE = 8;
+// Room left, after the threads, for reading the App's reviews (up to ten
+// pages and a token): a permission check never eats into it.
+const REVIEW_READ = 11;
+// One permission check: a token (if none is cached) and the lookup.
+const CHECK_COST = 2;
+// The collaborators list: a token and up to ten pages of 100.
+const WRITERS_READ = 11;
+// A whole snapshot: the threads (a token and up to twenty pages), then that.
+const SNAPSHOT_READ = 21 + REVIEW_READ;
+// A held decision keeps the collaborators list it read, for itself alone
+// (keyed by its item), and never past this.
+const WRITER_MAX_MS = 2 * 3600_000;
+const listKey = (id) => `writersList:${id}`;
 
 // After n failures in a row outside the run's own step: up to an hour.
 const runBackoffMs = (n) => Math.min(3600_000, RECHECK_MS * 2 ** Math.min(n - 1, 10));
@@ -67,7 +88,7 @@ export function helpText(slug = DEFAULT_SLUG) {
     "| `full review` | Review the whole pull request again |",
     "| `pause` (or `ignore`) | Stop automatic reviews on this pull request |",
     "| `resume` | Start automatic reviews again, and review the commits pushed while they were paused |",
-    "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's). As a reply in one of its threads, resolve that thread only |",
+    "| `resolve` | Resolve all of its review threads and approve. With no approval of its own standing, it does not wait for a review of the latest commit (as CodeRabbit's); renewing one waits for a complete review of the head. As a reply in one of its threads, resolve that thread only |",
     "| `approve` | The same as a top-level `resolve` |",
     "| `rate limit` | Say whether a review can run now, or when one can |",
     "| `learn <sentence>` | Teach it something about this repository, for its later reviews (people with write access) |",
@@ -663,7 +684,7 @@ export class PrState {
     // Failures here (before the run's own step, which counts its own) back
     // off, and six in a row give the run up: it must never wake for ever.
     // A decision or a resolve/approve command due now gets this invocation to
-    // itself: it may make two dozen GitHub calls, and a review step's would
+    // itself: it may make up to 45 GitHub calls, and a review step's would
     // share Workers Free's 50 subrequests. The review moves on at the next.
     const due = ((await this.ctx.storage.get("outbox")) ?? []).find((x) => !(x.notBefore > this.now()));
     const isHeavy = (x) => Boolean(x) && (x.type === "decide" || (x.type === "command" && (x.cmd === "resolve" || x.cmd === "approve")));
@@ -719,6 +740,8 @@ export class PrState {
       } else if (item.attempts >= MAX_ATTEMPTS) {
         console.log(JSON.stringify({ svc: "ai-review", ev: "outbox_dropped", type: item.type }));
         await this.ctx.storage.put("outbox", box.filter((x) => x.id !== item.id));
+        // A decision given up on: the list it kept goes with it.
+        if (item.type === "decide") await this.ctx.storage.delete(listKey(item.id));
         // A gate reset given up on says so on the PR: its commit may still show
         // the delayed success.
         if (item.type === "status" && item.gate) await this.outbox({ type: "comment", template: "gave_up", reason: `the status of commit ${String(item.sha).slice(0, 7)} could not be reset to pending, so treat it as not reviewed`, tries: item.attempts, replyTo: { login: "tankster-ai-review", kind: "gave_up" } });
@@ -1271,11 +1294,29 @@ export class PrState {
   // Approves the head when (as CodeRabbit's requirements) the latest commit has
   // a complete review (unless a writer's command forces it), none of the App's
   // own threads and no body-only finding is open, the App has not approved
-  // already, and the head is unchanged just before approving. A thread
+  // this head already, and the head is unchanged just before approving. An
+  // approval of an older commit is renewed at the head once that head has a
+  // complete review: GitHub does not count it for later commits pushed by a
+  // bot or a branch update (a ruleset's extra approval for unattributed
+  // changes), and no repository dismisses stale reviews, so the App keeps its
+  // own approval current. A thread
   // resolved by someone without write access still counts as open. A thread
   // reopened after an approval asks for changes again, whatever was reviewed.
+  // A decision held for want of requests keeps the collaborators list it
+  // read until it ends: a throw is not an end (the same item is tried again),
+  // and an item given up on drops it too (alarm).
   async decide(fx, item, slug) {
+    const out = await this.decideStep(fx, item, slug);
+    if (!out?.holdUntil) await this.ctx.storage.delete(listKey(item.id));
+    return out;
+  }
+
+  async decideStep(fx, item, slug) {
     if (typeof fx.ownThreads !== "function" || typeof fx.reviewDecision !== "function") return undefined;
+    // Requests made from here on (the reads too), against the alarm's budget.
+    const counted = typeof fx.subrequests === "function";
+    const base = counted ? fx.subrequests() : 0;
+    const room = () => DECIDE_SUBREQUESTS - DECIDE_RESERVE - (counted ? fx.subrequests() - base : 0);
     const key = await this.ctx.storage.get("key");
     const st = await this.state();
     if (!key || st.closed) return undefined;
@@ -1296,66 +1337,235 @@ export class PrState {
     // new one is queued. Every reopen bumps reopenSeq together with its mark
     // and the lost acceptance; a snapshot taken across a bump is taken again.
     let open, inBody, decision, seqAtSnapshot, settled = false;
-    for (let tries = 0; tries < 3 && !settled; tries++) {
+    // Out of requests before the snapshot was whole: held, and taken again at
+    // the next alarm with the permission answers kept so far.
+    let short = false;
+    // A withdrawal decided on a resolver it had no room to check.
+    let guessed = false;
+    // The record of the snapshot the decision goes on with: its two hours are
+    // judged again just before approving (the reads in between take time).
+    let usedRec = null;
+    for (let tries = 0; tries < 3 && !settled && !short; tries++) {
+      // Taken again only if a whole one still fits this alarm.
+      if (tries > 0 && room() < SNAPSHOT_READ) { short = true; break; }
       const seq0 = (await this.ctx.storage.get("reopenSeq")) ?? 0;
       open = [];
-      const writers = new Map();
+      // Everyone with write access, read afresh by each decision (one page
+      // for up to 100 collaborators): a resolver it names is a writer, and
+      // one a whole list does not name is not. When the reviews no longer fit
+      // after reading it, the decision keeps it (for itself alone, two hours
+      // at most) and is held: the next alarm goes on with it.
+      let listed = null;
+      // This decision's own record (held, it goes on from it): the list it
+      // read, if any, and the people it checked on their own past a list too
+      // long to read whole. Two hours at most; gone when the decision ends.
+      let rec = null;
+      const save = async () => this.ctx.storage.put(listKey(item.id), rec);
       const isWriter = async (login) => {
-        if (!writers.has(login)) writers.set(login, await fx.canWrite(key.repo, login));
-        return writers.get(login);
+        if (listed === null) {
+          const kept = await this.ctx.storage.get(listKey(item.id));
+          // Judged when it is used, not when the snapshot began: the thread
+          // read before it takes time.
+          const at = this.now();
+          const fresh = kept && at - kept.at < WRITER_MAX_MS;
+          rec = fresh ? { checked: {}, ...kept } : { at, checked: {} };
+          if (fresh && kept.logins) listed = { logins: new Set(kept.logins), complete: Boolean(kept.complete) };
+          // Refused once in this decision: not asked again (each alarm would
+          // spend on it, and could leave no room for the checks).
+          else if (fresh && kept.refused) listed = false;
+          // A withdrawal reads it once: one held for it and woken too late to
+          // use it (alarms hours apart) checks within the alarm instead, and
+          // counts the unchecked as outsiders, so it always ends.
+          else if (kept && item.reopened) listed = false;
+          else if (typeof fx.writers === "function" && room() >= WRITERS_READ) {
+            // Stamped when asked for, its safe side: GitHub served it no
+            // earlier than this.
+            const readAt = this.now();
+            try {
+              listed = await fx.writers(key.repo);
+            } catch (e) {
+              // Refused (the App lacks the permission): each one on their own,
+              // and recorded so this decision does not ask again. A 403 may
+              // also be GitHub's rate limit: that too is safe, as each one is
+              // then checked on their own (and canWrite rethrows it).
+              if (e?.status !== 403 && e?.status !== 404) throw e;
+              listed = false;
+              rec = { ...rec, refused: true };
+              await save();
+            }
+            // A list read now starts the record afresh: its two hours run
+            // from now, so no earlier answer is carried past its own.
+            if (listed) {
+              rec = { at: readAt, checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
+              await save();
+            }
+          } else listed = false;
+          if (listed && room() < REVIEW_READ) { short = true; return false; }
+        }
+        if (listed && listed.logins.has(String(login).toLowerCase())) return true;
+        if (listed?.complete) return false;
+        // Own answers only: a login such as "constructor" must never read an
+        // object's inherited member as an answer.
+        if (Object.hasOwn(rec.checked, login)) return rec.checked[login] === true;
+        // No room for this check and the reviews after it. A withdrawal counts
+        // the resolver as an outsider (its safe side) and asks for an ordinary
+        // decision after it, which checks again; an approval stops here and is
+        // held (never approved on an unchecked answer), and goes on next alarm
+        // from the answers it kept.
+        if (room() < REVIEW_READ + CHECK_COST) {
+          if (item.reopened) guessed = true;
+          else short = true;
+          return false;
+        }
+        rec.checked[login] = Boolean(await fx.canWrite(key.repo, login));
+        await save();
+        return rec.checked[login];
       };
       // A thread resolved by someone without write access counts as open,
       // unless a review since found it fixed, or a writer's resolve/approve
       // vouched for it (both recorded in ACCEPTED).
       const accepted = await acceptedSet(this.ctx.storage);
-      for (const t of await fx.ownThreads(key.repo, key.pr, slug)) {
-        // A nitpick never holds back approval (CodeRabbit's rule), open or not.
-        if (nitpickFinding(t.body)) continue;
+      const own = (await fx.ownThreads(key.repo, key.pr, slug)).filter((t) => !nitpickFinding(t.body)); // a nitpick never holds back approval (CodeRabbit's rule)
+      const byOthers = [];
+      for (const t of own) {
         if (!t.resolved) open.push(t);
-        // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
-        // only for the threads in its own view: one reopened since and then
-        // resolved by an outsider is open, forced or not.
-        else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id) && !(await isWriter(t.resolvedBy))) open.push(t);
         // Resolved by the App while a person's reopen still stands (its mark
         // goes only when a writer resolves it): a command's race, not a fix.
         // The reviewer never resolves a reopened thread, and a command that
         // vouched for it accepted it.
         else if (t.resolvedBy === slug && !accepted.has(t.id) && (await reopenMark(this.ctx.storage, t.id)) !== undefined) open.push(t);
+        else if (t.resolvedBy && t.resolvedBy !== slug && !accepted.has(t.id)) byOthers.push(t);
       }
       // A kept finding that is a nitpick never blocks either. Only text that
       // carries the Worker's own comment header (its id line, as from the 422
       // fallback) is judged: a body-listed finding's text starts with the
       // model's title, which could imitate a label. Never one kept as severe.
+      // Read before the permissions: a kept finding settles the outcome too.
       const isNit = (f) => !f.severe && Boolean(findingIdOf(f.text)) && nitpickFinding(f.text);
       inBody = (await listOpenFindings(this.ctx.storage)).filter((f) => !isNit(f));
+      // A writer's resolve/approve vouches through ACCEPTED (resolveAll),
+      // only for the threads in its own view: one reopened since and then
+      // resolved by an outsider is open, forced or not. Checked only while
+      // nothing is known to be open, a thread or a kept finding: once one is,
+      // the outcome is the same (no approval, or a withdrawal) whoever
+      // resolved the rest.
+      for (const t of open.length || inBody.length ? [] : byOthers) {
+        if (!(await isWriter(t.resolvedBy))) open.push(t);
+        if (short || open.length) break;
+      }
+      if (short) break;
       decision = await fx.reviewDecision(key.repo, key.pr, `${slug}[bot]`);
       seqAtSnapshot = seq0;
+      usedRec = rec;
       settled = ((await this.ctx.storage.get("reopenSeq")) ?? 0) === seq0;
     }
+    if (short) return { holdUntil: this.now() + 1000 };
+    // An answer that outlived its two hours during the reads decides nothing,
+    // a withdrawal included: held, the next alarm checks again.
+    if (usedRec && this.now() - usedRec.at >= WRITER_MAX_MS) return { holdUntil: this.now() + 1000 };
     if (!settled) {
       // Reopens kept arriving: decide again from scratch, never from this snapshot.
       await this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });
       return undefined;
     }
     if (item.reopened) {
-      if ((open.length || inBody.length) && decision?.state === "APPROVED") {
-        // As CodeRabbit's: the approval is withdrawn (dismissed). Only if
-        // GitHub refuses that is changes requested instead.
+      // Every approval of the App's that still stands, not only the latest
+      // review: a renewal leaves the older one standing too, and a retry after
+      // a partial withdrawal finds the latest already dismissed.
+      const standing = Array.isArray(decision?.approvedIds) && decision.approvedIds.length
+        ? decision.approvedIds : decision?.state === "APPROVED" ? [decision.id] : [];
+      // A truncated list may hide an approval, whatever the latest state, so
+      // it is withdrawn too; a complete list with none standing is a no-op.
+      if ((open.length || inBody.length) && (standing.length || decision?.truncated)) {
+        // As CodeRabbit's: the approval is withdrawn (dismissed), up to 20 an
+        // alarm. Changes are requested instead if GitHub refuses a dismissal,
+        // and also, once the known ones are dismissed, when the review list
+        // was too long to read whole (an approval may be unlisted).
         const why = "A review thread was reopened, so this pull request is no longer approved. It is approved again once its threads are resolved.";
-        const dismissed = typeof fx.dismissReview === "function" && Number.isSafeInteger(decision.id)
-          ? await fx.dismissReview(key.repo, key.pr, decision.id, why) : false;
-        if (!dismissed) await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
+        let dismissed = typeof fx.dismissReview === "function" && standing.every((id) => Number.isSafeInteger(id));
+        // The ids this withdrawal has already dismissed: one GitHub accepted
+        // but still lists as approved is never dismissed again (that would
+        // hold forever); with nothing new to dismiss, changes are requested.
+        const done = new Set((await this.ctx.storage.get("withdrawn")) ?? []);
+        // Newest first: the approval at the head is the one GitHub counts.
+        const pending = [...standing].reverse().filter((id) => !done.has(id));
+        if (standing.length && !pending.length) dismissed = false;
+        // The reads left no room for even one dismissal: changes are requested
+        // now (within the room kept), rather than a hold that cannot progress.
+        if (dismissed && pending.length && room() < 1) dismissed = false;
+        let tried = 0;
+        for (const id of dismissed ? pending.slice(0, DISMISS_PER_STEP) : []) {
+          // Out of room: the rest go in the next alarms.
+          if (room() < 1) break;
+          tried++;
+          // Refused: no more are tried (the change request below covers them
+          // all, and a later call that throws must not keep it from being filed).
+          if (!(await fx.dismissReview(key.repo, key.pr, id, why))) { dismissed = false; break; }
+          else {
+            // Kept at once: if a later call throws, the retry still knows it.
+            done.add(id);
+            await this.ctx.storage.put("withdrawn", [...done]);
+          }
+        }
+        // More than one alarm's subrequests: the rest go in the next alarms
+        // (each one reads the approvals still standing again), and the notice
+        // says withheld meanwhile. Every batch, the last and a first-and-only
+        // one included, holds once more, so the next alarm reads the list
+        // again and requests changes if one it dismissed still stands (never
+        // dismissing it again). A refusal above needs no wait: the change
+        // request below covers them all; nor does a truncated list's last
+        // batch, as its change request supersedes any approval still listed.
+        if (dismissed && pending.length > 0 && (pending.length > tried || !decision?.truncated)) {
+          await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+          // Withdrawn on an unchecked resolver: the ordinary decision is queued
+          // now, as the next alarm may check them all, find writers and so
+          // never come back to it.
+          if (guessed) await this.queueDecide({});
+          return { holdUntil: this.now() + 1000 };
+        }
+        if (!dismissed || decision?.truncated) {
+          const filed = await fx.postReview(key.repo, key.pr, { commitId: head, comments: [], event: "REQUEST_CHANGES", body: `${MARKER}\n${why}` });
+          // GitHub filed it only as a comment: an approval may still stand,
+          // so fail and let the outbox try again within its limit.
+          if (filed?.event && filed.event !== "REQUEST_CHANGES") throw new Error("the approval could not be withdrawn: GitHub filed the change request as a comment");
+        }
+        await this.ctx.storage.delete("withdrawn");
       }
       // The summary's notice must not still say approved: it lists what is open.
       if (open.length || inBody.length) await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
+      // Withdrawn on an unchecked resolver: an ordinary decision checks again
+      // and approves if everyone was a writer after all.
+      if (guessed) await this.queueDecide({});
       return undefined;
     }
     if (open.length || inBody.length) {
       await this.noticeApproval(fx, key, { withheld: head, open, inBody, slug });
       return undefined;
     }
-    if (decision?.state === "APPROVED") {
-      await this.noticeApproval(fx, key, { approved: decision.commitId ?? head });
+    if (decision?.truncated) {
+      // Too many reviews to read whole: what GitHub counts is unknown, so
+      // nothing is approved (never once per trigger) and the notice stands.
+      return undefined;
+    }
+    // Approved at this head already, by its latest decision. Only that: GitHub
+    // keeps an approval a later change request overrode listed as approved,
+    // and does not say an older one counts again once a later is dismissed,
+    // so any other case is approved again (a duplicate costs nothing; a
+    // skipped approval blocks).
+    if (decision?.state === "APPROVED" && decision.commitId === head) {
+      await this.ctx.storage.delete("withdrawn");
+      await this.noticeApproval(fx, key, { approved: head });
+      return undefined;
+    }
+    const stands = decision?.state === "APPROVED" || (Array.isArray(decision?.approvedIds) && decision.approvedIds.length > 0);
+    if (stands && (await this.state()).lastCompleteReviewed !== head) {
+      // An approval of an older commit is renewed only over a complete review
+      // of the head, even when a writer's command forces the decision: the
+      // commits after it (a bot's push, say) are exactly what GitHub asks a
+      // fresh approval for. Any approval of the App's still standing counts
+      // (the latest review may be a dismissal after a partial withdrawal). A
+      // forced first approval, with none standing, is the writer's own call.
+      await this.noticeApproval(fx, key, { pending: head, slug });
       return undefined;
     }
     const now = await fx.pullRequest(key.repo, key.pr);
@@ -1369,7 +1579,12 @@ export class PrState {
     // A retarget since the snapshot: the review is of the old base, so decide
     // again (it then finds no complete review of this head and says pending).
     if (((await this.state()).baseEpoch ?? 0) !== epoch0) { await again(); return undefined; }
+    // An answer past its two hours never approves: held, the next alarm
+    // starts the record afresh and checks again.
+    if (usedRec && this.now() - usedRec.at >= WRITER_MAX_MS) return { holdUntil: this.now() + 1000 };
     const ok = await fx.approve(key.repo, key.pr, { commitId: head, body: "" });
+    // A new approval starts the next withdrawal's record afresh.
+    await this.ctx.storage.delete("withdrawn");
     if (ok !== false) await this.noticeApproval(fx, key, { approved: head });
     console.log(JSON.stringify({ svc: "ai-review", ev: ok === false ? "approval_refused" : "approved", pr: key.pr, forced: Boolean(item.force) }));
     return undefined;

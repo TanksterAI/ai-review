@@ -57,6 +57,35 @@ test("only TanksterAI repositories are ever touched", async () => {
   }
 });
 
+test("writers: everyone with write access, from the collaborators list in pages of 100, marked incomplete past ten", async () => {
+  const people = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ login: `User-${from + i}`, permissions: { pull: true, push: (from + i) % 2 === 0 } }));
+  const one = fakeApp((m, path) => (path.includes("page=1") ? [
+    ...people(3),
+    // Each way GitHub says write access, alone: the admin or maintain flag,
+    // or the role name (a custom role built on write names its own).
+    { login: "Boss", permissions: { admin: true } },
+    { login: "Lead", permissions: { maintain: true } },
+    { login: "Role", role_name: "write" },
+    { login: "Reader", role_name: "read", permissions: { pull: true } },
+    { login: "Triager", role_name: "triage", permissions: { triage: true, pull: true } },
+  ] : []));
+  const w = await createEffects({}, { app: one }).writers("TanksterAI/x");
+  assert.equal(w.complete, true);
+  // Logins compared without case (GitHub's are case-insensitive).
+  assert.deepEqual([...w.logins].sort(), ["boss", "lead", "role", "user-0", "user-2"]);
+  // A missing page reads as the end, never as an error.
+  const none = fakeApp(() => null);
+  assert.deepEqual(await createEffects({}, { app: none }).writers("TanksterAI/x"), { logins: new Set(), complete: true });
+  const call = one.log.calls[0];
+  assert.equal(call.method, "GET");
+  assert.match(call.path, /^\/repos\/TanksterAI\/x\/collaborators\?affiliation=all&per_page=100&page=1$/);
+  // Ten full pages: there may be more, so it is incomplete.
+  const many = fakeApp((m, path) => people(100, (Number(path.split("page=")[1]) - 1) * 100));
+  const big = await createEffects({}, { app: many }).writers("TanksterAI/x");
+  assert.equal(big.complete, false);
+  assert.equal(many.log.calls.length, 10);
+});
+
 test("canWrite: write, maintain and admin; not read, not unknown users, not odd logins", async () => {
   const levels = { a: "write", b: "maintain", c: "admin", d: "read", e: "triage" };
   const app = fakeApp((m, path) => {
@@ -172,11 +201,13 @@ test("postReview files the event it is given, also in its 422 fallback; COMMENT 
     return {};
   });
   const fx = createEffects({}, { app });
-  await fx.postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
+  const fell = await fx.postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
   assert.equal(app.log.calls[0].body.event, "REQUEST_CHANGES");
   assert.equal(app.log.calls[1].body.event, "REQUEST_CHANGES");
+  assert.equal(fell.event, "REQUEST_CHANGES");
   const plain = fakeApp(() => ({}));
-  await createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [] });
+  const done = await createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [] });
+  assert.equal(done.event, "COMMENT");
   assert.equal(plain.log.calls[0].body.event, "COMMENT");
   // Only the three review events GitHub knows.
   await assert.rejects(createEffects({}, { app: plain }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [], event: "MERGE" }));
@@ -220,11 +251,43 @@ test("reviewDecision: the App's own latest approving, change-requesting or dismi
   ];
   const app = fakeApp((m, path) => (path.endsWith("&page=1") ? page1 : page2));
   const d = await createEffects({}, { app }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
-  // With its id, so a stale approval can be dismissed.
-  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33 });
+  // With its id, so a stale approval can be dismissed, and the ids of every
+  // approval of the App's that still stands (here only 33).
+  assert.deepEqual(d, { state: "APPROVED", commitId: "3".repeat(40), id: 33, approvedIds: [33], truncated: false });
   assert.equal(app.log.calls.length, 2);
   const none = fakeApp(() => []);
   assert.equal(await createEffects({}, { app: none }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]"), null);
+});
+
+test("effects report the App's request count, or none when the App does not count", async () => {
+  let n = 3;
+  const app = { ...fakeApp(), subrequests: () => n };
+  const fx = createEffects({}, { app });
+  assert.equal(fx.subrequests(), 3);
+  n = 7;
+  assert.equal(fx.subrequests(), 7);
+  assert.equal(createEffects({}, { app: fakeApp() }).subrequests(), 0);
+});
+
+test("reviewDecision: every standing approval of the App's, and a list too long to read whole is marked truncated", async () => {
+  const bot = { login: "tankster-ai-review[bot]", type: "Bot" };
+  const reviews = [
+    { user: bot, state: "APPROVED", commit_id: "1".repeat(40), id: 11 },
+    { user: bot, state: "DISMISSED", commit_id: "2".repeat(40), id: 22 },
+    { user: bot, state: "APPROVED", commit_id: "3".repeat(40), id: 33 },
+  ];
+  const d = await createEffects({}, { app: fakeApp(() => reviews) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.deepEqual(d.approvedIds, [11, 33]);
+  assert.equal(d.truncated, false);
+  // Ten full pages: there may be more, so the answer is marked truncated.
+  const full = Array.from({ length: 100 }, (_, i) => ({ user: bot, state: "APPROVED", commit_id: "4".repeat(40), id: i }));
+  const t = await createEffects({}, { app: fakeApp(() => full) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.equal(t.truncated, true);
+  // Ten full pages with no decision of the App's: not null (that would read
+  // as "never decided"), but an unknown state, marked truncated.
+  const others = Array.from({ length: 100 }, (_, i) => ({ user: { login: "rishitank", type: "User" }, state: "APPROVED", commit_id: "5".repeat(40), id: i }));
+  const u = await createEffects({}, { app: fakeApp(() => others) }).reviewDecision("TanksterAI/x", 3, "tankster-ai-review[bot]");
+  assert.deepEqual(u, { state: null, commitId: null, id: null, approvedIds: [], truncated: true });
 });
 
 const thread = (over = {}) => ({
@@ -304,8 +367,11 @@ test("a 422 for the decision itself still posts the findings, as a comment; a re
     if (opts.body.event !== "COMMENT") return err(422);
     return {};
   });
-  await createEffects({}, { app }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
+  const out = await createEffects({}, { app }).postReview("TanksterAI/x", 3, { commitId: SHA, body: "B", comments: [{ path: "a.js", line: 2, body: "t" }], event: "REQUEST_CHANGES" });
   assert.deepEqual(app.log.calls.map((c) => c.body.event), ["REQUEST_CHANGES", "REQUEST_CHANGES", "COMMENT"]);
+  // It says which event was filed, so a caller that needed the decision
+  // (withdrawing an approval) can tell it was not.
+  assert.equal(out.event, "COMMENT");
   assert.equal(await createEffects({}, { app }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }), false);
   const boom = fakeApp(() => err(500));
   await assert.rejects(createEffects({}, { app: boom }).approve("TanksterAI/x", 3, { commitId: SHA, body: "ok" }));

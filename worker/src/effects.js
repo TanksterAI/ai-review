@@ -64,6 +64,12 @@ export function createEffects(env, deps = {}) {
   return {
     app,
 
+    // The requests the App has sent (0 if it does not count them): a caller
+    // takes the difference to stay inside one invocation's 50.
+    subrequests() {
+      return typeof app.subrequests === "function" ? app.subrequests() : 0;
+    },
+
     // workflow_dispatch needs only actions:write on ai-review, not contents.
     async dispatch(jobId) {
       const token = await app.installationToken([RUNNER_REPO], { actions: "write" });
@@ -96,6 +102,25 @@ export function createEffects(env, deps = {}) {
         if (e.status === 404) return false;
         throw e;
       }
+    },
+
+    // Everyone with write access to the repository (organization owners and
+    // members through teams included), from the collaborators list: 100 a
+    // page, ten pages at most. complete is false when ten full pages were
+    // read (there may be more). Logins in lower case (GitHub's ignore case).
+    async writers(repoFull) {
+      const name = nameOf(repoFull);
+      const token = await app.installationToken([name], PR_SCOPE);
+      const logins = new Set();
+      for (let page = 1; page <= 10; page++) {
+        const list = await app.call("GET", `/repos/${ORG}/${name}/collaborators?affiliation=all&per_page=100&page=${page}`, { token });
+        for (const c of list ?? []) {
+          const p = c?.permissions ?? {};
+          if (typeof c?.login === "string" && (p.push === true || p.maintain === true || p.admin === true || WRITE_LEVELS.has(c.role_name))) logins.add(c.login.toLowerCase());
+        }
+        if (!list || list.length < 100) return { logins, complete: true };
+      }
+      return { logins, complete: false };
     },
 
     async canWrite(repoFull, login) {
@@ -206,7 +231,8 @@ export function createEffects(env, deps = {}) {
     },
 
     // event: COMMENT, or REQUEST_CHANGES while the review has findings (as
-    // CodeRabbit's Automatic Approvals do).
+    // CodeRabbit's Automatic Approvals do). Returns {inline, event}: event is
+    // what GitHub filed, COMMENT when it refused the decision itself.
     async postReview(repoFull, pr, { commitId, body, comments, event = "COMMENT" }) {
       const name = nameOf(repoFull);
       if (!REVIEW_EVENTS.has(event)) throw new Error("not a review event");
@@ -214,7 +240,7 @@ export function createEffects(env, deps = {}) {
       const path = `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews`;
       try {
         await app.call("POST", path, { token, body: { commit_id: commitId, event, body, comments } });
-        return { inline: comments.length };
+        return { inline: comments.length, event };
       } catch (e) {
         if (e.status !== 422) throw e;
         // A comment position GitHub refuses, or the commit left the PR: keep
@@ -225,6 +251,7 @@ export function createEffects(env, deps = {}) {
         const text = [body, `Reviewed commit ${String(commitId).slice(0, 7)}.`, listed && `#### Findings (GitHub would not place them inline)\n\n${listed}`]
           .filter(Boolean)
           .join("\n\n");
+        let filed = event;
         try {
           await app.call("POST", path, { token, body: { event, body: text } });
         } catch (e2) {
@@ -232,8 +259,9 @@ export function createEffects(env, deps = {}) {
           // pull requests): the findings are still posted, as a comment.
           if (e2.status !== 422 || event === "COMMENT") throw e2;
           await app.call("POST", path, { token, body: { event: "COMMENT", body: text } });
+          filed = "COMMENT";
         }
-        return { inline: 0 };
+        return { inline: 0, event: filed };
       }
     },
 
@@ -262,19 +290,33 @@ export function createEffects(env, deps = {}) {
 
     // The App's own review decision as GitHub counts it: its latest review
     // that approved, requested changes or was dismissed (comments change
-    // nothing). {state, commitId}, or null.
+    // nothing), with the ids of every approval of its own never dismissed (a
+    // renewed approval leaves the older one listed too, and GitHub keeps one a
+    // later change request overrode listed as approved, so a withdrawal
+    // dismisses them all). {state, commitId, id, approvedIds, truncated}, or
+    // null. truncated: ten full pages were read and there may be more, so the
+    // answer may be out of date; then state is null if none of the App's
+    // decisions was among them.
     async reviewDecision(repoFull, pr, botLogin) {
       const name = nameOf(repoFull);
       const token = await app.installationToken([name], PR_SCOPE);
       let last = null;
+      const approvedIds = [];
+      let truncated = false;
       for (let page = 1; page <= 10; page++) {
         const list = await app.call("GET", `/repos/${ORG}/${name}/pulls/${Number(pr)}/reviews?per_page=100&page=${page}`, { token });
         for (const r of list ?? []) {
-          if (r?.user?.type === "Bot" && r.user.login === botLogin && DECISIONS.has(r.state)) last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
+          if (r?.user?.type !== "Bot" || r.user.login !== botLogin || !DECISIONS.has(r.state)) continue;
+          last = { state: r.state, commitId: r.commit_id ?? null, id: r.id ?? null };
+          if (r.state === "APPROVED" && Number.isSafeInteger(r.id)) approvedIds.push(r.id);
         }
         if (!list || list.length < 100) break;
+        if (page === 10) truncated = true;
       }
-      return last;
+      // Nothing of the App's in ten full pages is not "never decided": the
+      // answer is unknown (state null), so a caller approves nothing.
+      if (!last) return truncated ? { state: null, commitId: null, id: null, approvedIds, truncated } : null;
+      return { ...last, approvedIds, truncated };
     },
 
     // Withdraws one of the App's own reviews (an approval no longer true), as
