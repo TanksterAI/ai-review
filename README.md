@@ -191,6 +191,15 @@ Before it drafts, a review reads what others have already said on the pull reque
 - **Never fatal:** if GitHub cannot be read, the review goes on from the diff alone and says so in "About this review". `REVIEW_CONTEXT=off` switches it off.
 - **Permissions:** read on checks, commit statuses and actions, as well as contents and pull requests (all already granted to the installation).
 
+## What the reviewer is taught
+
+A maintainer (anyone with write access, checked through the API each time) can teach it about their repository, in a comment of its own that is nothing else:
+
+- `@tankster-ai-review learn Never log request bodies in the webhook handler.` saves one lesson (one sentence, at most 400 characters, secrets redacted).
+- `@tankster-ai-review forget 3` removes lesson 3. `@tankster-ai-review learnings` lists them.
+
+Lessons live in a D1 database (`ai-review-memory`, free plan, found with FTS5) and are kept per repository, never shared across repositories. Each review reads the ones that fit the pull request's title and description (the newest and most used fill the rest, up to eight), shows them to the drafter and the verifier as data from the maintainers, and says in its About section how many it applied. A lesson never makes the reviewer report a defect the code does not show. Only a maintainer's `learn` is saved; nothing a model or another bot says is, and without the `MEMORY` binding the commands say teaching is not set up.
+
 ## The MCP server (for agents)
 
 `POST /mcp` is a small MCP server (JSON-RPC over HTTP) so any agent can find out what the reviewer will do and ask it for something, without having to be taught. It is called with the caller's own GitHub token as a Bearer token; each call first checks that token can see the pull request, so a caller sees only what GitHub lets them see. Only `TanksterAI/*` repositories are served.

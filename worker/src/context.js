@@ -112,7 +112,7 @@ const stateOf = (t) => (t.resolved ? "resolved" : t.outdated ? "outdated" : "ope
  * context as plain data, bounded (threads, comments, reviews, listed checks,
  * and bytes), ready to render and to keep.
  */
-export function buildContext({ conv = null, ci = null, ourLogin }) {
+export function buildContext({ conv = null, ci = null, lessons = [], ourLogin }) {
   // Open threads first, then the rest.
   const ranked = [...(conv?.threads ?? [])].sort((a, b) => Number(Boolean(a.resolved)) - Number(Boolean(b.resolved)));
   const threads = [];
@@ -145,7 +145,8 @@ export function buildContext({ conv = null, ci = null, ourLogin }) {
     if (quiet(kind, text)) continue;
     reviews.push({ by: who(r.login), kind, state: String(r.state ?? ""), text, at: r.at ?? null });
   }
-  const built = { threads, comments, reviews, ci: summariseCi(ci, ourLogin) };
+  const taught = (lessons ?? []).slice(0, 8).map((l) => ({ id: l.id, by: who(l.by), source: l.source === "confirmed" ? "confirmed" : "maintainer", text: snippet(l.text, 400) })).filter((l) => l.text);
+  const built = { lessons: taught, threads, comments, reviews, ci: summariseCi(ci, ourLogin) };
   // Never more than a Durable Object can hold: trim the least useful first.
   while (JSON.stringify(built).length > MAX_SAVED && (built.comments.length || built.reviews.length || built.threads.length > 5)) {
     if (built.comments.length > 5) built.comments.splice(0, Math.ceil(built.comments.length / 2));
@@ -196,7 +197,7 @@ const line = (s) => sanitize(s, 600, { inline: true });
  * review's own account of itself.
  */
 export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
-  const stats = { threads: 0, comments: 0, reviews: 0, bots: [], failing: 0, pending: 0, passing: 0, ci: false, cut: false };
+  const stats = { lessons: 0, threads: 0, comments: 0, reviews: 0, bots: [], failing: 0, pending: 0, passing: 0, ci: false, cut: false };
   if (!built) return { text: "", stats };
 
   const ci = built.ci;
@@ -221,6 +222,10 @@ export function renderContext(built, { tag, max = DEFAULT_CONTEXT_CHARS }) {
     talk.push(s);
     return true;
   };
+  // What the maintainers taught it comes first: short, and they know the repository.
+  for (const l of built.lessons ?? []) {
+    if (add(line(`- lesson ${l.id} (${l.source === "maintainer" ? `from maintainer ${l.by}` : "a claim the code confirmed"}): ${l.text}`))) stats.lessons++;
+  }
   const where = (t) => (t.path ? `${t.path}${t.line ? `:${t.line}` : ""}` : "no file");
   const replies = (rs) => { for (const r of rs) { if (!add(line(`    reply by ${r.kind} ${r.by}: ${r.text}`))) return false; seen(r.by, r.kind); } return true; };
   // What is said about a spot in the code: a bot's or a maintainer's is a

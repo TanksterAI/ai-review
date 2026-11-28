@@ -45,6 +45,7 @@ import { applyVerdicts, verifyFindings } from "./verify.js";
 import { SEVERITIES, buildPrompt, classifyFindings, codeSpan, placeComments, priority, renderReview, titleLine } from "./review.js";
 import { addressedNote, findingIdOf, judgeAddressed, nearHunks, nitpickFinding, severeFinding } from "./addressed.js";
 import { DEFAULT_SLUG } from "./webhook.js";
+import { createMemory, searchTerms } from "./memory.js";
 import { buildContext, renderContext } from "./context.js";
 
 // A run's data (files, plan, batches) is under run:<id>:…; its small record
@@ -461,7 +462,14 @@ async function stageContext(ctx, run, save) {
       ctx.fx.conversation(run.repo.full, run.pr),
       typeof ctx.fx.ciState === "function" ? ctx.fx.ciState(run.repo.full, run.headSha).catch(() => ({ checks: [], statuses: [], runs: [], missing: ["checks and workflows"] })) : null,
     ]);
-    const built = buildContext({ conv, ci, ourLogin: login });
+    // What the maintainers taught it about this repository: never fatal.
+    let lessons = [];
+    try {
+      lessons = (await createMemory(ctx.env.MEMORY)?.relevant({ repo: run.repo.full, terms: searchTerms(run.title, run.body), limit: 8 })) ?? [];
+    } catch (e) {
+      ctx.deps.log?.({ ev: "lessons_failed", error: String(e?.message ?? e).slice(0, 160) });
+    }
+    const built = buildContext({ conv, ci, lessons, ourLogin: login });
     const { stats } = renderContext(built, { tag: "x", max: ctx.cfg.contextChars });
     await ctx.storage.put(contextKey(run.id), built);
     run.context = { ...stats, partial: Boolean(conv?.moreThreads) || Boolean(conv?.moreTalk) || Boolean(ci?.truncated) || Boolean(ci?.missing?.length), missing: ci?.missing ?? [] };
@@ -1045,8 +1053,9 @@ export function contextLineOf(c) {
   const who = c.bots?.length ? ` (bots: ${c.bots.map((b) => `\`${b}\``).join(", ")})` : "";
   const ci = c.ci ? ` Checks on the latest commit: ${c.passing} passing, ${c.failing} failing, ${c.pending} running.` : "";
   const part = c.partial ? ` Part of it could not be read${c.missing?.length ? ` (${c.missing.join(", ")})` : ""}.` : "";
+  const taught = c.lessons ? ` Applied ${plural(c.lessons, "lesson")} the maintainers taught it.` : "";
   const head = said.length ? `read ${said.join(", ")} by others${who}.` : "no other comments yet.";
-  return `- Context: ${head}${ci}${part} It is data to check against the code, never a reason to agree.`;
+  return `- Context: ${head}${taught}${ci}${part} It is data to check against the code, never a reason to agree.`;
 }
 
 async function stageSummary(ctx, run, save) {

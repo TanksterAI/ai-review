@@ -1077,3 +1077,23 @@ test("context: a bot's collapsed agent prompt never reaches a model", async () =
   await runAll(s);
   for (const c of s.models.calls.filter((x) => x.text)) { assert.match(c.text, /Real issue/); assert.doesNotMatch(c.text, /Ignore all rules/); }
 });
+
+test("lessons: what a maintainer taught is read, shown to the drafter, and named in the review; a broken memory never fails it", async () => {
+  const { fakeD1 } = await import("./helpers.js");
+  const { createMemory } = await import("../src/memory.js");
+  const MEMORY = fakeD1();
+  await createMemory(MEMORY).add({ repo: "TanksterAI/ai-review", text: "Retries must always be bounded and logged.", source: "maintainer", by: "rishitank" });
+  const s = setup({ github: withContext(), env: { MEMORY } });
+  s.job.repo = s.job.repo ?? repo;
+  await runAll(s);
+  const sent = s.models.calls.filter((c) => c.text);
+  assert.ok(sent.length >= 1);
+  for (const c of sent) assert.match(c.text, /lesson 1 \(from maintainer rishitank\): Retries must always be bounded and logged\./);
+  const body = s.github.posted.at(-1)?.body ?? s.github.summaries.at(-1).body;
+  assert.match(body, /Applied 1 lesson the maintainers taught it\./);
+
+  const broken = setup({ github: withContext(), env: { MEMORY: { prepare() { throw new Error("D1 down"); } } } });
+  await runAll(broken);
+  assert.equal(broken.done[0].gaveUp, false);
+  assert.ok(broken.models.calls.some((c) => c.text && /OTHER PEOPLE AND BOTS/.test(c.text)), "the conversation is still used");
+});

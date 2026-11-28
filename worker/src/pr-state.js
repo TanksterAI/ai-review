@@ -7,6 +7,7 @@
 //   - performs side effects (dispatch a runner, post a comment) from its alarm,
 //     after the webhook has been acknowledged.
 
+import { createMemory } from "./memory.js";
 import { DEFAULT_SLUG, mentionOf } from "./webhook.js";
 import { appConfig } from "./setup.js";
 import { MARKER, createEffects } from "./effects.js";
@@ -33,18 +34,20 @@ const RECHECK_MS = 30_000;
 function seconds(v, fallback) {
   return /^\d+(\.\d+)?$/.test(String(v ?? "").trim()) ? Number(String(v).trim()) : fallback;
 }
-const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "rate limit", "help"];
+const COMMANDS = ["full review", "review", "pause", "resume", "resolve", "approve", "rate limit", "learnings", "help"];
 // As CodeRabbit's (reference/review-commands): these run only when they are
 // the whole comment, with no other text before or after. `review` and
 // `full review` need only be alone on their line.
-const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "rate limit", "help"]);
+const WHOLE_COMMENT = new Set(["pause", "resume", "resolve", "approve", "rate limit", "learnings", "help"]);
+// What a maintainer can teach the reviewer: `learn <sentence>` and `forget <number>`.
+const TEACHING = /^(learn|forget)\s+(\S.*)$/is;
 // `ignore` is CodeRabbit's other name for `pause`.
 const ALIASES = { ignore: "pause" };
 // As CodeRabbit's: `approve` works only as a top-level comment. `resolve` in
 // a reply in one of the App's threads resolves only that thread.
 // As CodeRabbit's: only resolve works as a reply in a review thread (it
 // resolves that thread); every other command goes in a PR comment.
-const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "help", "approve", "rate limit"]);
+const TOP_LEVEL_ONLY = new Set(["review", "full review", "pause", "resume", "help", "approve", "rate limit", "learnings", "learn", "forget"]);
 // Threads one alarm resolves at most (each is a subrequest; Workers Free
 // allows 50 an invocation, and the same alarm may also run a review step).
 // The rest are resolved by the next alarms.
@@ -66,6 +69,9 @@ export function helpText(slug = DEFAULT_SLUG) {
     "| `resolve` | Resolve all of its review threads and approve, without waiting for a review of the latest commit (as CodeRabbit's). As a reply in one of its threads, resolve that thread only |",
     "| `approve` | The same as a top-level `resolve` |",
     "| `rate limit` | Say whether a review can run now, or when one can |",
+    "| `learn <sentence>` | Teach it something about this repository, for its later reviews (people with write access) |",
+    "| `forget <number>` | Make it forget a lesson, by its number |",
+    "| `learnings` | List what it has been taught here |",
     "| `help` | Show this list |",
     "",
     "`review` and `full review` must be alone on their line; the others must be the whole comment.",
@@ -85,7 +91,7 @@ export function helpText(slug = DEFAULT_SLUG) {
 // reads them: a fence of three or more backticks or tildes, closed by a fence
 // of the same kind at least as long. A line indented four spaces or more
 // (code, in Markdown) neither opens a fence nor holds a command.
-export function parseCommand(text, slug = DEFAULT_SLUG) {
+export function parseCommand(text, slug = DEFAULT_SLUG, { args = false } = {}) {
   mentionOf(slug); // throws on a malformed slug before it reaches a pattern
   const raw = String(text ?? "").replace(/\r\n?/g, "\n");
   const lines = raw.split("\n");
@@ -128,7 +134,17 @@ export function parseCommand(text, slug = DEFAULT_SLUG) {
     if (handle.test(l) && handle.test(raw_)) { at = i; shown = l; break; }
   }
   if (at < 0) return null;
-  const said = handle.exec(shown)[1].trim().toLowerCase().replace(/\s+/g, " ");
+  const rest = handle.exec(shown)[1].trim();
+  const said = rest.toLowerCase().replace(/\s+/g, " ");
+  // `learn <sentence>` and `forget <number>`: the whole comment, one line.
+  const teach = args ? TEACHING.exec(rest) : null;
+  if (teach) {
+    if (lines.filter((l) => l.trim()).length !== 1 || shown.trim() !== lines[at].trim()) return null;
+    const verb = teach[1].toLowerCase();
+    const arg = teach[2].trim();
+    if (verb === "forget") return /^#?\d{1,9}$/.test(arg) ? { cmd: "forget", arg: arg.replace("#", "") } : null;
+    return { cmd: "learn", arg: arg.slice(0, 600) };
+  }
   // Own keys only: "constructor" or "__proto__" is no alias.
   const cmd = Object.hasOwn(ALIASES, said) ? ALIASES[said] : COMMANDS.includes(said) ? said : null;
   if (!cmd) return null;
@@ -561,7 +577,9 @@ export class PrState {
     }
 
     if (ev.kind === "command") {
-      const cmd = parseCommand(ev.text, ev.slug);
+      const parsed = parseCommand(ev.text, ev.slug, { args: true });
+      const cmd = typeof parsed === "object" && parsed ? parsed.cmd : parsed;
+      const arg = typeof parsed === "object" && parsed ? parsed.arg : null;
       // P1 has no chat: anything that is not a command gets no reply.
       if (!cmd || (TOP_LEVEL_ONLY.has(cmd) && ev.where === "thread")) return { action: "not_a_command" };
       if (cmd === "help") {
@@ -578,10 +596,37 @@ export class PrState {
       const seq = cmd === "resolve" || cmd === "approve" ? { seq: (await this.ctx.storage.get("reopenSeq")) ?? 0 } : {};
       // `resolve` as a reply in a thread: that thread only (its first comment).
       const thread = ev.where === "thread" && cmd === "resolve" ? { inThreadOf: Number(ev.inReplyTo ?? ev.commentId) } : {};
-      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr, ...seq, ...thread });
+      await this.outbox({ type: "command", cmd, slug: ev.slug, login: ev.sender.login, repo: ev.repo, pr: ev.pr, ...(arg ? { arg } : {}), ...seq, ...thread });
       return { action: "command", cmd };
     }
     return { action: "ignored" };
+  }
+
+  // `learn`, `forget`, `learnings`: the commenter's write access was checked
+  // through the API just before this. Lessons are kept per repository.
+  async teach(fx, item) {
+    const mem = createMemory(this.env.MEMORY);
+    const say = (body) => fx.comment(item.repo.full, item.pr, body);
+    if (!mem) return say("Teaching is not set up on this installation, so nothing was saved.");
+    const repo = item.repo.full;
+    try {
+      if (item.cmd === "learnings") {
+        const rows = await mem.list({ repo });
+        if (!rows.length) return say("Nothing has been taught here yet. A maintainer can add a lesson with `learn <sentence>`.");
+        return say(["What I have been taught in this repository (`forget <number>` removes one):", "", ...rows.map((r) => `${r.id}. ${r.text} (${r.source === "maintainer" ? `by ${r.by}` : "a claim the code confirmed"})`)].join("\n"));
+      }
+      if (item.cmd === "forget") {
+        const gone = await mem.forget({ repo, id: Number(item.arg) });
+        return say(gone ? `Forgotten: lesson ${item.arg}.` : `There is no lesson ${item.arg} in this repository.`);
+      }
+      const r = await mem.add({ repo, text: item.arg, source: "maintainer", by: item.login, pr: item.pr, now: new Date(this.now()) });
+      if (r.ok) return say(`Learned (lesson ${r.id}): ${r.text}\n\nI will weigh it in later reviews here; the code still decides. \`forget ${r.id}\` removes it.`);
+      const why = { empty: "that is too short to be a lesson", duplicate: "I already have that lesson", full: "this repository has as many lessons as I keep: forget one first", source: "that is not a source I accept" }[r.reason];
+      return say(`Not saved: ${why}.`);
+    } catch (e) {
+      await report(this.env, e, "teach");
+      return say("I could not reach my memory just now, so nothing was changed. Try again later.");
+    }
   }
 
   async save(st, out) {
@@ -875,6 +920,7 @@ export class PrState {
         }
         return undefined;
       }
+      if (item.cmd === "learn" || item.cmd === "forget" || item.cmd === "learnings") return this.teach(fx, item);
       const st = await this.state();
       if (item.cmd === "pause") {
         st.paused = true;
