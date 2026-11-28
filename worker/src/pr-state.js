@@ -1325,6 +1325,9 @@ export class PrState {
           // counts the unchecked as outsiders, so it always ends.
           else if (kept && item.reopened) listed = false;
           else if (typeof fx.writers === "function" && room() >= WRITERS_READ) {
+            // Stamped when asked for, its safe side: GitHub served it no
+            // earlier than this.
+            const readAt = this.now();
             try {
               listed = await fx.writers(key.repo);
             } catch (e) {
@@ -1340,7 +1343,7 @@ export class PrState {
             // A list read now starts the record afresh: its two hours run
             // from now, so no earlier answer is carried past its own.
             if (listed) {
-              rec = { at: this.now(), checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
+              rec = { at: readAt, checked: {}, logins: [...listed.logins], complete: Boolean(listed.complete) };
               await save();
             }
           } else listed = false;
@@ -1402,6 +1405,9 @@ export class PrState {
       settled = ((await this.ctx.storage.get("reopenSeq")) ?? 0) === seq0;
     }
     if (short) return { holdUntil: this.now() + 1000 };
+    // An answer that outlived its two hours during the reads decides nothing,
+    // a withdrawal included: held, the next alarm checks again.
+    if (usedRec && this.now() - usedRec.at >= WRITER_MAX_MS) return { holdUntil: this.now() + 1000 };
     if (!settled) {
       // Reopens kept arriving: decide again from scratch, never from this snapshot.
       await this.outbox({ type: "decide", reopened: Boolean(item.reopened), force: Boolean(item.force), login: item.login ?? null });

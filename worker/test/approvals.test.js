@@ -895,6 +895,42 @@ test("the two hours are judged when the record is used, and again just before ap
   assert.equal(approvals(b.calls).length, 1);
 });
 
+test("the two hours are judged after every read: the last before approving, and a withdrawal's", async () => {
+  const H2 = 2 * 3600_000;
+  const seeded = async (m, over = {}) => {
+    await m.obj.outbox({ type: "decide", ...over });
+    const [{ id }] = (await m.storage.get("outbox")).filter((x) => x.type === "decide");
+    await m.storage.put(`writersList:${id}`, { at: NOW, refused: true, checked: { "late-1": true } });
+  };
+  // Past two hours during the head's re-read, the last read before approving.
+  const a = await make({ threads: resolvedBy(["late-1"]) });
+  const la = limited(a, { writers: () => true });
+  await seeded(a);
+  let reviewed = false;
+  const rd = a.fx.reviewDecision;
+  a.fx.reviewDecision = async (...x) => { reviewed = true; return rd(...x); };
+  const pr = a.fx.pullRequest;
+  a.fx.pullRequest = async (...x) => { if (reviewed) a.setNow(NOW + H2); return pr(...x); };
+  await step(a, la, NOW + H2 - 1000);
+  assert.equal(approvals(a.calls).length, 0, "not approved after the last read");
+
+  // A withdrawal on an answer that expires during its reads: held, then the
+  // resolver is checked again (no longer a writer) and the approval goes.
+  const b = await make({ threads: resolvedBy(["late-1"]), decision: { state: "APPROVED", commitId: HEAD, id: 7, approvedIds: [7] } });
+  const lb = limited(b, { writers: (l) => l !== "late-1" });
+  let gone = false;
+  b.fx.dismissReview = async () => { gone = true; return true; };
+  await seeded(b, { reopened: true });
+  const rdb = b.fx.reviewDecision;
+  b.fx.reviewDecision = async (...x) => { b.setNow(NOW + H2); return rdb(...x); };
+  await step(b, lb, NOW + H2 - 1000);
+  assert.ok(!gone && lb.checked.length === 0, "held, not decided on the expired answer");
+  b.fx.reviewDecision = rdb;
+  await step(b, lb, NOW + H2 + 5000);
+  assert.deepEqual(lb.checked, ["late-1"], "checked again");
+  assert.ok(gone, "withdrawn");
+});
+
 test("one unlisted resolver on two threads is checked once", async () => {
   const m = await make({ threads: [{ ...thread("t1", true), resolvedBy: "late-1" }, { ...thread("t2", true), resolvedBy: "late-1" }] });
   const lim = limited(m, { writers: () => true, people: writersOf(1001) });
