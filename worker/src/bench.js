@@ -11,8 +11,11 @@
 // the App's repository (BENCH_REPO, default TanksterAI/ai-review), which must
 // itself belong to the owning organisation (OWNER_ID is the organisation's id,
 // not a user's). The token is only used to read that permission. Spend goes through the
-// same daily ledger and caps as reviews, so a benchmark can never spend more
-// than a day's review budget.
+// same daily ledger and caps as reviews. The ledger is read before a call and
+// written after it, so one benchmark at a time stays within the day's budget,
+// but simultaneous benchmarks (or a benchmark beside a review) can each pass the
+// check and together overshoot it, as concurrent reviews can (see budget.js).
+// Run them one at a time.
 //
 //   body: {files: [{filename, status, patch, additions, deletions}], title?, body?,
 //          chain?: "kind:model,kind:model", verify_chain?: "kind:model", verify?: false}
